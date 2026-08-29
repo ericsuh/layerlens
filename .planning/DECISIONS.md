@@ -168,16 +168,26 @@ edge. This requires hashing every regular file's content during the single index
 (SHA-256 while streaming; CPU-bound but one-pass). Whether mode/uid/gid participate is a
 knob — see Open questions.
 
-> **RESOLVED 2026-08-29** (user decision, `RESEARCH.md` Q5). The knob is settled as
+> **RESOLVED 2026-08-29, then REVISED same day** (user decisions, `RESEARCH.md` Q5 then
+> **Q9**). **Current rule: tarsum-v1 field selection — content + mode + uid/gid +
+> typeflag + linkname + size + devmajor/devminor + sorted xattrs, excluding mtime.**
+> This is literally the field set Docker/BuildKit uses for its build cache, verified
+> against `moby/buildkit` `cache/contenthash/{filehash,tarsum}.go`: `v1TarHeaderSelect`
+> takes the v0 list and copies it *"excluding the 'mtime' header"*. The delta from the
+> first resolution is that **uid/gid are now included** — we follow Docker rather than
+> our own judgment call. The superseded first answer was:
 > **content + mode bits; mtime and uid/gid excluded**. The normalized changeset digest
 > hashes sorted entries of `(path, typeflag, mode bits, symlink/link target,
 > content-sha256, whiteout marker)`. Excluding mtime is mandatory — it is the very thing
 > that makes two byte-identical rebuilds produce different DiffIDs, which is the
-> phenomenon this tool exists to expose. Including mode bits is mandatory — two layers
-> are not interchangeable if one ships a non-executable binary. uid/gid are excluded as a
-> deliberate trade-off, since build-context ownership varies with the builder's
-> environment while the resulting image behaves identically. This supersedes the
-> "(path, typeflag, mode, uid, gid, ...)" sketch in the paragraph above.
+> phenomenon this tool exists to expose — and Docker's build cache excludes it too.
+> Including mode bits is mandatory — two layers are not interchangeable if one ships a
+> non-executable binary.
+>
+> This makes the two features map onto Docker's two real caches: the **shared trunk** is
+> layer-store semantics (ChainID over DiffIDs, byte-exact, mtime included), and the
+> **could-be-shared edges** are build-cache semantics (tarsum v1, mtime excluded). The
+> sketch in the paragraph above is therefore correct as written.
 
 ### A5. Dockerfile instruction recovery — config `history` with `empty_layer` offset
 

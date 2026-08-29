@@ -78,7 +78,12 @@ Round 1 above as *anonymous-only* and *vendored OCI fixtures*.
 
 ### Q5. Does "could-be-shared" require matching file metadata, or just content?
 
-**Answer: content + permission bits; ignore mtime and uid/gid.**
+**Answer (superseded, see Q9): content + permission bits; ignore mtime and uid/gid.**
+
+> **SUPERSEDED 2026-08-29 by Q9 below.** The user subsequently directed us to adopt
+> whatever semantics Docker itself uses for caching. Docker's build cache *includes*
+> uid/gid, so uid/gid are now part of the comparison. The mtime exclusion below still
+> holds — Docker excludes mtime too.
 
 Two layers are candidates for sharing when their normalized changesets match on
 `(path, kind, content sha256, mode bits, link target)`. Modification times and
@@ -133,3 +138,87 @@ uid/gid are excluded from the comparison.
 Known-compatible with typescript-eslint 8.68 and the rest of the chosen toolchain.
 The project's risk budget belongs in the Docker/OCI analysis, not in the build
 pipeline. Revisit only if typecheck time becomes a real problem.
+
+## Round 3 — the Step 5 design/architecture review (2026-08-29)
+
+The user approved `DESIGN.md` and `ARCHITECTURE.md` with the following directions.
+
+### Q9. What field set defines "same changes" — replacing the Q5 answer
+
+**Answer: "choose the semantics that Docker uses for layer caching."**
+
+This was verified against Docker/BuildKit source rather than assumed. **Docker has two
+distinct caches with two distinct rules, and layerlens has one feature riding on each:**
+
+| Docker mechanism | What it decides | Rule | layerlens feature |
+|---|---|---|---|
+| **Layer store** (ChainID over DiffIDs) | Whether a layer blob is already present and can be skipped on pull / shared between images | Byte-exact over the uncompressed layer tar — **mtime included** | The **shared trunk** |
+| **Build cache** (BuildKit `contenthash`, tarsum v1) | Whether a `COPY`/`ADD`/`RUN` step must re-execute | Field-selected hash — **mtime deliberately excluded** | The **could-be-shared dotted edges** and the tree's *modified* rule |
+
+**Verified source** (fetched 2026-08-29 from `moby/buildkit@master`):
+
+- `cache/contenthash/filehash.go` — `NewFileHash`/`NewFromStat` build a `tar.Header`
+  (setting `Uid`, `Gid`, `Devmajor`, `Devminor`, and `SCHILY.xattr.*` PAX records) and
+  hash it with `WriteV1TarsumHeaders`, then stream the file content into the same hash.
+- `cache/contenthash/tarsum.go` — `v1TarHeaderSelect` takes the v0 field list
+  `{name, mode, uid, gid, size, mtime, typeflag, linkname, uname, gname, devmajor,
+  devminor}` and, in its own words, copies it *"excluding the 'mtime' header (the 5th
+  element)"*, then appends sorted xattrs.
+
+**Decision: the normalized changeset digest and the tree's "modified" predicate both use
+tarsum-v1 field selection**, i.e. hash over:
+
+`name (path), mode, uid, gid, size, typeflag, linkname, uname, gname, devmajor,
+devminor, sorted xattrs, + file content sha256` — **excluding mtime**.
+
+**Delta from Q5: uid/gid are now INCLUDED.** Q5 had excluded them as a judgment call;
+Docker includes them, and the user asked us to follow Docker. mtime stays excluded, which
+is both what Docker does and what makes the tool's core insight work.
+
+**Why this is the right frame.** It gives the two features a crisp, honest, and
+*explainable* meaning that we can put in the UI copy:
+
+- Trunk: *"Docker already has these layers — they will not be pulled again."*
+- Dotted edge: *"These layers are byte-different, so Docker's layer store treats them as
+  distinct — but their contents are equivalent under Docker's own build-cache rule. A
+  better-ordered Dockerfile or a correct `.dockerignore` could have made them the same
+  layer."*
+
+That second sentence is the entire product thesis, and it is now backed by Docker's
+actual algorithm rather than a heuristic we invented.
+
+**Implementation note:** we apply tarsum-v1 *field selection* to entries in a layer tar.
+BuildKit applies it to build-context files. The field set transfers directly; the framing
+in the UI must say "equivalent under Docker's build-cache rule", never "this is a cache
+hit".
+
+### Q10. Registry allowlist — Artifact Registry
+
+**Answer: allowlist both `gcr.io` (+ regional mirrors) and `*.pkg.dev`.**
+
+Artifact Registry superseded GCR; a user pasting a modern `*.pkg.dev` reference must not
+be rejected. Resolves `ARCHITECTURE.md` §10 assumption 3.
+
+### Q11. Design choices the spec left open
+
+**Answer: keep all three as designed.** Base layer at top (Dockerfile reading order);
+tree shows B-side totals with signed deltas and A-side in a tooltip; selecting a point on
+the shared trunk compares that point to itself, yielding an intentionally empty diff that
+demonstrates sharing.
+
+### Q12. Filesystem tree view defects to fix
+
+Approved the design **conditional on** three fixes to the tree view:
+
+1. **No column headers** — numeric columns were unlabeled and therefore unreadable.
+   Add a sticky header row that stays aligned with rows at every indent depth.
+2. **Delta text overflows the row** — `+/- NNN` values wrap. Numeric columns need fixed
+   reserved widths sized for the worst realistic case, right-aligned, tabular numerals,
+   never wrapping.
+3. **`393 f` is jargon** — in `+381 files 119 MiB · 393 f` the trailing count is
+   meaningless and the delta and absolute counts run together. With headers present, drop
+   inline unit suffixes and make it unambiguous which number is a total and which is a
+   change.
+
+These are tracked as acceptance criteria for the frontend implementation phase, not just
+prototype fixes.

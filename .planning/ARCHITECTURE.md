@@ -279,9 +279,13 @@ type Entry struct {
     Path       string    // cleaned, "/"-rooted, no trailing slash ("/usr/lib/x.so")
     Kind       EntryKind
     Mode       uint32    // permission bits + setuid/setgid/sticky (lower 12 bits of tar mode)
-    UID, GID   int       // stored for display; EXCLUDED from ChangesetDigest
+    UID, GID   int       // INCLUDED in ChangesetDigest (Docker build-cache rule)
+    Uname,Gname string    // tar uname/gname; INCLUDED in ChangesetDigest
+    Devmajor, Devminor int64 // device nodes; INCLUDED in ChangesetDigest
+    Xattrs     map[string]string // sorted at hash time; INCLUDED in ChangesetDigest
     Size       int64     // regular files only; hardlinks 0
-    MtimeUnix  int64     // stored for display; EXCLUDED from ChangesetDigest
+    MtimeUnix  int64     // stored for display; EXCLUDED from ChangesetDigest (the ONLY
+                          // excluded field — mirrors BuildKit's v1TarHeaderSelect)
     LinkTarget string    // symlink target (verbatim) or hardlink target path (cleaned)
     ContentSHA Digest    // regular files only, hashed during the streaming pass
 }
@@ -296,8 +300,16 @@ type LayerIndex struct {
 }
 ```
 
-**Normalized changeset digest** (RESEARCH Q5, binding): SHA-256 over the canonical
-serialization of the sorted entries, where each entry contributes exactly
+**Normalized changeset digest** (RESEARCH **Q9**, binding — supersedes Q5): the field
+set is **tarsum v1**, i.e. exactly what Docker/BuildKit hashes for its *build* cache.
+Verified against `moby/buildkit` `cache/contenthash/{filehash,tarsum.go}`:
+`v1TarHeaderSelect` emits `{name, mode, uid, gid, size, typeflag, linkname, uname,
+gname, devmajor, devminor}` + sorted `SCHILY.xattr.*` records, explicitly *"excluding
+the 'mtime' header"*, and the file's content is streamed into the same hash.
+
+**mtime is the only excluded field. uid/gid ARE included** (this reverses the earlier
+Q5 answer). SHA-256 over the canonical serialization of the sorted entries, where each
+entry contributes exactly
 
 ```
 (Path, Kind, ContentSHA, Mode /* 12 permission bits */, LinkTarget)
@@ -352,11 +364,16 @@ type DiffNode struct {
 }
 ```
 
-Modification predicate for a path present on both sides:
-`Kind, Mode (12 bits), ContentSHA, LinkTarget` differ ⇒ Modified — deliberately the
-same field set as the changeset digest, so the diff view and the dotted edges
-never disagree about what "same" means. mtime/uid/gid differences do **not** mark
-a file modified (assumption recorded in §10).
+Modification predicate for a path present on both sides: the **tarsum-v1 field set**
+— `Kind (typeflag), Mode (12 bits), UID, GID, Uname, Gname, Size, LinkTarget,
+Devmajor, Devminor, Xattrs, ContentSHA` differ ⇒ Modified. Deliberately the same field
+set as the changeset digest, so the diff view and the dotted edges never disagree about
+what "same" means, and both agree with Docker's own build cache.
+
+**mtime is the only difference that does not mark a file modified** — which is correct
+and load-bearing: mtime churn is exactly what breaks DiffID equality between two
+otherwise identical rebuilds, and surfacing that as a tree full of "modified" rows
+would bury the real changes.
 
 ---
 
@@ -403,8 +420,14 @@ IndexLayer(compressed io.Reader, mediaType, declaredDiffID, progress *counter):
         hdr is regular file:
             h := sha256.New()
             n := io.Copy(h, tr)                 // hash while draining; nothing stored
-            entries[p] = Entry{KindFile, mode12(hdr), uid, gid, n, mtime, "", hex(h)}
-        else: entries[p] = Entry{kindOf(hdr), ..., LinkTarget: hdr.Linkname}
+            entries[p] = entryFrom(hdr, p, KindFile, n, hex(h))
+        else: entries[p] = entryFrom(hdr, p, kindOf(hdr), 0, "")
+
+// entryFrom captures every field the tarsum-v1 changeset digest needs (§3.1):
+//   Kind/typeflag, Mode (12 bits), UID, GID, Uname, Gname, Size, LinkTarget,
+//   Devmajor, Devminor, Xattrs (from hdr.PAXRecords "SCHILY.xattr." prefix,
+//   filtered like BuildKit: keep "security.capability", drop other security.*
+//   and system.*), plus MtimeUnix which is stored for display only.
   verify sha256(dh) == declaredDiffID           // else fail the ingest: corrupt/tampered
   sorted := sortByPath(entries)
   return LayerIndex{DiffID, ChangesetDigest: digestOf(sorted), sorted, ...}
@@ -887,6 +910,7 @@ IP vetting at dial time, never relying on either alone.
    - exact: `index.docker.io`, `registry-1.docker.io`, `docker.io`, `ghcr.io`,
      `gcr.io`, `public.ecr.aws`
    - patterns: `*.gcr.io` (regional `us.`/`eu.`/`asia.gcr.io`),
+     `*.pkg.dev` (Google Artifact Registry, which superseded GCR — RESEARCH Q10),
      `*.dkr.ecr.*.amazonaws.com`, `*.azurecr.io`
    - Pattern matching is on **dot-separated label boundaries** (a `*` matches
      exactly one or more full labels, never a substring — `evilgcr.io` and
@@ -1071,8 +1095,9 @@ both directions → `InstructionKnown=false` for all layers, buildkit and classi
 Trunk LCP: normal fork; **zero shared layers**; **A strict prefix of B** (empty
 left branch); identical images (two empty branches); single-layer images.
 
-Changeset digest: identical content + different mtimes ⇒ equal; different
-**mode bits** ⇒ different; different uid/gid ⇒ **equal**; symlink target change ⇒
+Changeset digest (tarsum-v1 field set): identical content + different mtimes ⇒ equal;
+different **mode bits** ⇒ different; different **uid/gid** ⇒ **different**; different
+uname/gname ⇒ different; xattr change ⇒ different; symlink target change ⇒
 different; whiteout-vs-file at same path ⇒ different; entry-order independence
 (hash over sorted entries); empty changesets excluded from could-be-shared;
 digest-scheme version byte changes the digest.
@@ -1093,7 +1118,7 @@ testability requirement); concurrent read during eviction sees old-or-gone,
 never torn.
 
 `imgref` / `safehttp`: allowlist accepts the five registries incl. Hub
-shorthand and regional/pattern hosts; rejects `evilgcr.io`,
+shorthand, regional/pattern hosts, and `*.pkg.dev`; rejects `evilgcr.io`,
 `x.azurecr.io.evil.com`, explicit ports, `http`; dialer rejects loopback,
 RFC1918, link-local, ULA, IPv4-mapped-IPv6, unspecified, and mixed
 public+private DNS answers (fake resolver); redirect cap; digest-path validation
@@ -1209,13 +1234,12 @@ Worth testing (logic, not pixels):
 1. **Image identity = config digest.** Two refs to the same config collapse into
    one record (RefNames accumulates). Assumed desirable; invalidated if the user
    wants per-tag records with independent LRU.
-2. **Diff modification predicate excludes mtime/uid/gid** (mirrors the Q5
-   changeset normalization, applied to the tree view too, for consistency).
-   If the user expects "same content, different owner" to render as *modified*
-   in the tree, this needs a flag; today it shows unchanged. **Confirm.**
-3. **Allowlist scope**: added regional `*.gcr.io` hosts; did **not** include
-   Artifact Registry (`*.pkg.dev`) since PROJECT.md says GCR. Cheap to add.
-   **Confirm.**
+2. **RESOLVED (RESEARCH Q9).** The diff modification predicate and the changeset
+   digest both use the **tarsum-v1** field set — Docker's own build-cache rule.
+   mtime is the only excluded field; uid/gid are included. No flag needed.
+3. **RESOLVED (RESEARCH Q10).** Allowlist includes regional `*.gcr.io` hosts **and**
+   Artifact Registry `*.pkg.dev`, since Artifact Registry superseded GCR and modern
+   Google references use `*.pkg.dev`.
 4. **Pull state is in-memory**: a server restart forgets in-flight pull IDs
    (poller gets 404 and surfaces "pull lost — retry"); committed layer indexes
    make the retry cheap. Assumed acceptable for a private tool.
