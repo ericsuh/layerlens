@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>layerlens — prototype</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <span class="brand"><span class="logo"></span>layerlens</span>
+    <span id="headImgs" class="head-imgs" hidden>
+      <span class="img-chip"><span class="badge a">A</span><span class="ref"><bdi id="headRefA"></bdi></span></span>
+      <span style="color:var(--text-muted)">vs</span>
+      <span class="img-chip"><span class="badge b">B</span><span class="ref"><bdi id="headRefB"></bdi></span></span>
+      <button id="backBtn" class="link-btn" hidden>Change images</button>
+    </span>
+    <span class="head-spacer"></span>
+    <button id="themeBtn" class="icon-btn" title="Toggle theme">☾</button>
+  </header>
+
+  <!-- ============ image selection view ============ -->
+  <div id="selectView" class="view">
+    <div class="select-wrap">
+      <h1>Compare two images</h1>
+      <p class="sub">Pick an image for each slot, then compare their layers and filesystems.</p>
+      <div class="slots">
+        <button id="slotA" class="slot empty"></button>
+        <button id="slotB" class="slot empty"></button>
+      </div>
+      <div class="compare-row">
+        <button id="compareBtn" class="btn-primary" disabled>Compare layers →</button>
+        <span id="compareHint" class="compare-hint"></span>
+      </div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" data-tab="analyzed" aria-selected="true">Analyzed <span class="count-chip">4</span></button>
+        <button class="tab" role="tab" data-tab="daemon"><span class="dot ok"></span>Docker daemon <span class="count-chip">3</span></button>
+        <button class="tab" role="tab" data-tab="registry">Registry</button>
+      </div>
+
+      <div class="panel tabpanel" data-tab="analyzed" role="tabpanel">
+        <div id="listAnalyzed"></div>
+      </div>
+      <div class="panel tabpanel" data-tab="daemon" role="tabpanel" hidden>
+        <div id="listDaemon"></div>
+      </div>
+      <div class="panel tabpanel" data-tab="registry" role="tabpanel" hidden>
+        <form class="reg-form" onsubmit="return false">
+          <label for="regInput" style="display:block;font-weight:600;margin-bottom:8px">Fetch a public image by reference</label>
+          <div class="reg-line">
+            <input id="regInput" class="reg-input" placeholder="ghcr.io/org/image:tag" spellcheck="false" autocomplete="off">
+            <button id="regFetch" class="btn-primary" disabled>Fetch &amp; analyze</button>
+          </div>
+          <div id="regVerdict" class="reg-verdict"></div>
+          <p class="reg-help">Anonymous public pulls only. Allowed registries: Docker Hub, GitHub Container Registry (ghcr.io),
+          Google Container Registry (gcr.io), AWS ECR (public.ecr.aws / *.dkr.ecr.*.amazonaws.com), Azure Container Registry (*.azurecr.io).
+          Images up to 25 GiB.</p>
+        </form>
+        <div id="pullCard" class="progress-card" hidden>
+          <div class="pc-head">
+            <span class="pc-ref" title="ghcr.io/acme/media-encoder:2.4.1">ghcr.io/acme/media-encoder:2.4.1</span>
+            <span class="mono" style="color:var(--text-muted)">sha256:7c1e…a94f</span>
+            <button id="pullCancel" class="btn-ghost">Cancel</button>
+          </div>
+          <div class="phases">
+            <div class="phase done"><span class="ic">✓</span>Resolving manifest</div>
+            <div class="phase now"><span class="ic">●</span>Downloading &amp; indexing layers — 9 of 14</div>
+            <div class="phase"><span class="ic">○</span>Finalizing analysis</div>
+          </div>
+          <div class="pbar"><div style="width:42%"></div></div>
+          <div class="pstats num"><span>3.91 GiB of 9.28 GiB · 38.2 MiB/s</span><span>about 2 min left</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ layer browsing view ============ -->
+  <div id="browseView" class="view browse" hidden>
+    <div class="col">
+      <div class="section-head">
+        <h2>Layer comparison</h2><span class="dirhint">base → latest</span>
+        <span class="sel-chips"><span id="selChipA" class="sel-chip a"></span><span id="selChipB" class="sel-chip b"></span></span>
+      </div>
+      <div class="scroll">
+        <div id="diagram" class="diagram">
+          <svg id="edges" class="edges" aria-hidden="true"></svg>
+          <div id="trunk" class="trunk" role="radiogroup" aria-label="Shared layers"></div>
+          <div class="colheads">
+            <div class="colhead a"><span class="badge a">A</span>example:v1</div>
+            <div class="colhead b"><span class="badge b">B</span>example:v2</div>
+          </div>
+          <div class="branches">
+            <div id="branchA" class="branch ba" role="radiogroup" aria-label="Image A layers"></div>
+            <div id="branchB" class="branch bb" role="radiogroup" aria-label="Image B layers"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col fscol">
+      <div class="section-head"><h2>Filesystem diff</h2><span class="dirhint">cumulative up to the selected layers · B relative to A</span></div>
+      <div class="fs-toolbar">
+        <div id="crumbs" class="crumbs" aria-label="Path"></div>
+        <div class="fs-meta-row">
+          <span class="cmp-line">Comparing <b class="a" id="cmpA"></b> vs <b class="b" id="cmpB"></b></span>
+          <span class="legend">
+            <span><i class="sw seg-a"></i>+ added</span>
+            <span><i class="sw seg-r"></i>− removed</span>
+            <span><i class="sw seg-m"></i>± modified</span>
+            <span><i class="sw seg-u"></i>· unchanged</span>
+          </span>
+        </div>
+        <div class="fs-controls">
+          <select id="filterSel" class="filter" aria-label="Filter entries">
+            <option value="changed" selected>Changed only</option>
+            <option value="all">All entries</option>
+            <option value="added">Added</option>
+            <option value="removed">Removed</option>
+            <option value="modified">Modified</option>
+          </select>
+          <input id="searchInput" class="search" placeholder="Filter by name…" aria-label="Filter by name">
+          <span id="showing" class="showing"></span>
+        </div>
+      </div>
+      <div class="tree-wrap"><div id="tree" class="tree" role="tree" aria-label="Filesystem diff"></div></div>
+    </div>
+  </div>
+</div>
+<script src="fixtures.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
