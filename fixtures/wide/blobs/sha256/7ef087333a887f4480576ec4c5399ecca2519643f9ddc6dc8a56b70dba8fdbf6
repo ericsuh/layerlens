@@ -1,0 +1,1 @@
+{"created":"2026-07-28T06:30:00Z","architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/local/bin:/usr/bin:/bin","SHARD_SET=v1"],"WorkingDir":"/data"},"rootfs":{"type":"layers","diff_ids":["sha256:d8073f34ca10f07095f4cf89dfcae383a1efa043f2d8e6fcf5ad5d56c6a438a7"]},"history":[{"created":"2026-07-28T06:30:00Z","created_by":"COPY shards/ /data/shards/ # buildkit"}]}

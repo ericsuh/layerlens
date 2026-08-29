@@ -48,6 +48,14 @@ depends = ["build-web"]
 dir = "{{config_root}}"
 run = "node -e \"const m=require('./bin/esbuild-meta.json');for(const [f,o] of Object.entries(m.outputs))console.log((o.bytes/1024).toFixed(1).padStart(8),'KiB ',f)\""
 
+[tasks.genfixtures]
+description = "Regenerate the vendored OCI image-layout fixtures (deterministic: expect no git diff)"
+# Deliberately no sources/outputs: this task is run by hand to review a
+# fixture change, and a cache hit that silently skipped it would defeat the
+# point. It is cheap (well under a second) and idempotent.
+dir = "{{config_root}}"
+run = "go run ./cmd/genfixtures --out fixtures"
+
 [tasks.fmt]
 description = "Format Go sources"
 dir = "{{config_root}}"

@@ -1177,15 +1177,28 @@ tar entries, gzip with fixed header) writing OCI image layouts (verified loader:
 `layout.ImageIndexFromPath`). Vendored outputs live in `fixtures/` (RESEARCH
 Q2); `mise run genfixtures` regenerates byte-identically for review.
 
+**Layout convention** (what phase 005 loads): one OCI image layout *directory
+per pair* — `fixtures/example/`, `fixtures/prefix/`, … each with its own
+`oci-layout`, `index.json` and `blobs/sha256/`. Every manifest in an
+`index.json` carries `"org.opencontainers.image.ref.name": "example:v1"` and a
+`linux/amd64` platform; that annotation is how tags are discovered. A layout
+per pair keeps each pair independently loadable, and makes the blob store show
+the sharing between exactly the two images a reviewer is comparing.
+
 Required image pairs:
 
 1. **`example:v1` / `example:v2`** — the golden demo, shaped like PROJECT.md's
-   Dockerfile: 3 identical synthetic "node base" trunk layers → diverging
-   `COPY . .` layer (v2 adds `debug.log` + a modified `main.js` — the
+   Dockerfile: 5 identical synthetic "node base" trunk layers (base rootfs, apt
+   deps, node runtime, yarn, `WORKDIR /app`) → diverging `COPY . .` layer (v2
+   adds `debug.log`, `.env` and a whole `.git/`, modifies `main.js` and
+   `src/util.js`, and drops v1's `src/old-util.js` and `src/legacy/` — the
    `.dockerignore` mistake) → **byte-different but content-identical
    `npm install` layers** (same files, different mtimes ⇒ different DiffIDs,
-   equal changeset digests ⇒ dotted edge) → an apt/ffmpeg layer in v2 only,
-   containing whiteouts (`rm -rf /var/lib/apt/lists` as `.wh.` entries).
+   equal changeset digests ⇒ dotted edge with `diffIDEqual: false`) → an
+   apt/ffmpeg layer **in both images**, byte-identical (deb archives reproduce
+   their own timestamps) so its edge is the contrasting `diffIDEqual: true`
+   case, and carrying the `rm -rf /var/lib/{apt,dpkg,cache,log}/` cleanup as
+   four `.wh.` whiteouts over directories the base layer shipped.
 2. **`prefix:base` / `prefix:extended`** — strict-prefix pair (one image is the
    other's trunk; one empty branch).
 3. **`disjoint:a` / `disjoint:b`** — zero shared layers.

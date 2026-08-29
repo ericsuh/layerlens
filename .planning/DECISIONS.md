@@ -553,6 +553,66 @@ Applied from `REVIEW-phase-001.md` after phase 002 landed.
   (§6.4's wire shape is unchanged; the extra field is for diagnostics and the
   server DTO simply omits it).
 
+### Phase 004 (fixture generator & vendored demo images), 2026-08-29
+
+- **ARCHITECTURE §9.2 — the apt/ffmpeg layer is in *both* example images, not
+  "in v2 only"** (file updated). The two images are two builds of the *same*
+  Dockerfile, so they necessarily have the same number of steps; a v2-only
+  final layer would have been a different Dockerfile. `.planning/DESIGN.md` §11
+  and the approved prototype screenshot already showed the symmetric shape with
+  two dotted edges, and `IMPLEMENTATION-phase-004.md` says "matching apt/ffmpeg
+  layers", so §9.2's line was the outlier. Consequence worth stating: at the
+  golden workflow's layer-8-vs-layer-8 comparison the whiteouts are applied on
+  *both* sides, so the removed rows the demo shows there come from the COPY
+  layer (`src/old-util.js`, `src/legacy/`); the whiteout deletions surface when
+  the left selection is the pre-cleanup layer. Both are asserted in
+  `TestExampleFfmpegWhiteoutsDelete` / `TestExampleCopyLayerDiff`.
+- **The ffmpeg layers are byte-identical, so the demo carries both edge
+  flavours** (ARCHITECTURE §9.2 updated). `npm install` writes files at the
+  build clock, so its two layers differ only by mtime → `diffIDEqual: false`,
+  the crux of the lesson. Files unpacked from `.deb` archives keep the
+  archives' own timestamps, so the ffmpeg layer reproduces exactly →
+  `diffIDEqual: true`. That is realistic *and* it means the UI's two edge
+  states are both reachable from the demo data instead of only one.
+- **`WORKDIR /app` is a real layer, not an `empty_layer` history entry**
+  (ARCHITECTURE §4.0 lists WORKDIR among the empty-layer instructions; both
+  happen in practice — the classic builder records it empty, BuildKit
+  materializes the directory). The fixtures use the BuildKit behaviour, which
+  is what DESIGN §11 and the prototype show (five trunk layers, the fifth
+  `0 B · empty`). The empty-layer path is still exercised: each example config
+  carries four `empty_layer` entries (`CMD ["bash"]`, two `ENV`s, the final
+  `CMD`), asserted by `TestExampleHistoryMapping`.
+- **Fixture *shape* is realistic, absolute sizes are ~1/20 scale.** File bodies
+  are a short seeded ASCII banner followed by NUL padding: unique per path (so
+  `ContentSHA` differences are real) and ~1000:1 compressible (so the committed
+  tree is 227 KiB for ~180 MiB of nominal image content). ARCHITECTURE §10.8
+  already accepts toy scale; recorded here because the numbers the UI displays
+  (a 14 MiB `node` binary, a 4 MiB `lodash.js`, a 4.4 MiB `.git` pack) are
+  deliberately a fifth to a twentieth of the prototype's, chosen to keep
+  proportions and size-bar behaviour intact.
+- **One OCI layout per pair, tags via `org.opencontainers.image.ref.name`**
+  (ARCHITECTURE §9.2 updated with the convention). Phase 005's fixture loader
+  should scan `--fixtures-dir` for subdirectories containing an `oci-layout`
+  file, read each `index.json`, and take the display reference from that
+  annotation. Blob sharing inside a layout is automatic (content addressing),
+  which is why the example pair costs 144 KiB for two 8-layer images.
+- **`cmd/genfixtures` writes the OCI layout by hand; go-containerregistry is a
+  test-only dependency.** Hand-writing the manifest/config/index JSON is ~200
+  lines and gives byte-level control over field order and formatting, which is
+  what makes "regenerate, no git diff" hold across library upgrades. gcr
+  (`layout.ImageIndexFromPath` + `validate.Image`) is then an *independent*
+  checker of the result rather than both producer and validator. It is added to
+  `go.mod` now because phase 006's ingest needs it anyway.
+- **`fixtures/.gitattributes` is generated, not hand-written.** It marks
+  `**/blobs/sha256/**` binary so git neither diffs a gzip stream nor rewrites
+  line endings in one; keeping it an output of the generator means it cannot
+  drift from the layout the generator actually writes.
+- **The generator refuses duplicate tar members.** A repeated path inside one
+  layer is legal in tar (last-in wins) and would build silently, but in a
+  hand-written fixture it is always a mistake — and one that would quietly move
+  what the property tests assert against. `buildLayer` errors instead
+  (`TestDuplicateMembersAreRejected`).
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.
