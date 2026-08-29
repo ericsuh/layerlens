@@ -1,0 +1,5 @@
+.claude/settings.local.json
+.pnpm-store/
+**/node_modules/
+**/dist/
+**/.DS_Store
