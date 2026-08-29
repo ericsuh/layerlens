@@ -412,6 +412,47 @@ or under-specified in an earlier planning file, with the source file updated.
   Production builds omit the source map so the 1 MB map is not embedded in the
   binary; `mise run dev` keeps it.
 
+### Phase 002 (domain model & streaming layer indexer), 2026-08-29
+
+- **The `ARCHITECTURE.md` §3.1 contradiction was already resolved.** Phase 002's
+  file (step 5) expected to find a stale
+  `(Path, Kind, ContentSHA, Mode, LinkTarget)` serialization snippet excluding
+  uid/gid and to have to correct it. Commit `6b6d884` had already rewritten
+  §3.1 to the binding RESEARCH **Q9** tarsum-v1 field set, so there was nothing
+  to fix. The implementation follows Q9:
+  `(Path, Kind/typeflag, Mode&0o7777, UID, GID, Uname, Gname, Size, LinkTarget,
+  Devmajor, Devminor, sorted Xattrs, ContentSHA)`, **mtime the only exclusion**,
+  behind a scheme-version byte, with every field length- or width-prefixed. The
+  superseded-Q5 wording that survives at DECISIONS §A4 and RESEARCH Q5 is
+  explicitly labeled as historical and was left as the record of the reversal.
+- **ARCHITECTURE §2 — `analyze` imports klauspost/zstd** (file updated). §2 said
+  `analyze` imports `domain` only, but §4.1 puts media-type decompression
+  (gzip/zstd/none) inside `IndexLayer`, which lives in `analyze`. Verified with
+  `go list -deps`: `domain` is stdlib-only; `analyze` and `index` add
+  klauspost/compress and nothing else; none of the three pull in `net/http`,
+  go-containerregistry or moby.
+- **ARCHITECTURE §5 — the index header carries three more fields** (file
+  updated): `changesetDigest`, `contentBytes` and `warnings` join
+  `{"v","diffId","entryCount"}`. `index` may not import `analyze`, so without
+  them a decoded `LayerIndex` could not reproduce its own changeset digest and
+  the codec would be lossy. `layer.json` is unchanged and still exists as the
+  cheap sidecar summary.
+- **ARCHITECTURE §7.3 — the archive-root member is skipped silently** (file
+  updated). `sanitizePath` rejects `.`/`/`/`./` as specified, but GNU tar emits
+  a root member in most real layer tars; treating it as a sanitization failure
+  would have put a spurious warning on nearly every layer. The indexer
+  recognizes it as the root and skips it without a warning; hostile names still
+  warn.
+- **`klauspost/compress` pinned at v1.19.2.** DECISIONS named the library
+  (§Risks, cache format) but never pinned a version; this is the version
+  `go get` resolved. No other pinned version changed.
+- **Indexer uses one reusable copy buffer.** `io.Copy` allocates a fresh 32 KiB
+  buffer per call, which on a 500k-file layer is gigabytes of garbage; the
+  indexer holds a single 128 KiB scratch buffer and calls `io.CopyBuffer`
+  through a wrapper that hides `tar.Reader.WriteTo` (which would otherwise
+  bypass the buffer). A regression test streams a 1 GiB synthetic layer and
+  asserts total allocations stay under 8 MiB.
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.

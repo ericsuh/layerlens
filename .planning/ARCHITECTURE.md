@@ -125,8 +125,11 @@ internal/
   domain/           pure core types: digests, refs, layers, entries, trees, diff nodes.
                     Imports: stdlib only. No gcr, no net/http.
   analyze/          pure algorithms over domain types: history mapping, trunk LCP,
-                    changeset digest, squash, diff, aggregation, could-be-shared.
-                    Imports: domain.
+                    changeset digest, streaming layer indexer, squash, diff,
+                    aggregation, could-be-shared.
+                    Imports: domain, klauspost/zstd. (The indexer of §4.1 owns
+                    media-type decompression, so it needs a zstd decoder; still
+                    no gcr, no net/http.)
   index/            JSONL+zstd (de)serialization of per-layer indexes and image
                     records; schema versioning. Imports: domain, klauspost/zstd.
   cachestore/       on-disk cache under --data-dir: layout, atomic write/rename,
@@ -627,8 +630,14 @@ schema-versioned directory so a breaking change is a new sibling, not a migratio
 ```
 
 **index.jsonl.zst**: zstd stream (klauspost, default level) of JSON lines. Line 1
-is a header object `{"v":1,"diffId":"sha256:...","entryCount":N}`; each following
-line is one `Entry` in path-sorted order. Readers reject unknown major `v`.
+is a header object
+`{"v":1,"diffId":"sha256:...","entryCount":N,"changesetDigest":"sha256:...","contentBytes":N,"warnings":[...]}`;
+each following line is one `Entry` in path-sorted order. Readers reject unknown
+major `v`. The three fields after `entryCount` are what make the codec a
+lossless round-trip of `domain.LayerIndex` on its own: `index` may not import
+`analyze`, so it cannot recompute the changeset digest from the entries.
+`layer.json` remains the sidecar summary a reader can consult without opening
+the zstd stream at all.
 JSONL (not one big array) lets the indexer write while streaming and lets loads
 fail fast on truncation.
 
@@ -986,6 +995,10 @@ guardedDial(ctx, network, addr):
   validated against `^sha256:[a-f0-9]{64}$` and only the hex half is joined;
   anything else is an internal error before `filepath.Join` is reached. Pull IDs
   used in `staging/` are server-generated random hex, never user input.
+- **The archive root** (`./`, `/`, `.`): GNU tar emits a member for the archive
+  root itself. It carries no changeset information — the root always exists —
+  so the indexer skips it silently rather than recording a warning for what is
+  a normal, benign member of most layer tars.
 - **Tar entry names** (`sanitizePath`): reject names containing NUL; convert
   `\` to nothing special (POSIX tars only); strip leading `/` and `./`;
   `path.Clean`; reject empty, `.`, or any result containing a `..` segment

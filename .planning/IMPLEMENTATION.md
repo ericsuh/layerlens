@@ -39,7 +39,7 @@ testability requirement) — it needs no network to exist or to verify.
 | Phase | Name | Requirements covered (PROJECT.md) | Depends on | Status |
 |---|---|---|---|---|
 | 001 | Toolchain & walking skeleton | Technical design › Frontend (esbuild, `go:embed`); Testing, validation, toolchain (mise tools+tasks, golangci-lint, tsc, test runners) | — | **Complete** |
-| 002 | Domain model & streaming layer indexer | Key req › 25 GiB support (streaming, no buffering); layer instructions (history mapping); could-be-shared basis (changeset digest); Technical design › pre-existing libs kept at the boundary | 001 | Not started |
+| 002 | Domain model & streaming layer indexer | Key req › 25 GiB support (streaming, no buffering); layer instructions (history mapping); could-be-shared basis (changeset digest); Technical design › pre-existing libs kept at the boundary | 001 | **Complete** |
 | 003 | Analysis algorithms: squash, diff, aggregate, trunk, edges | Key req › layer comparison (trunk/fork), could-be-shared edges; filesystem diff (cumulative squash + whiteouts, folder aggregates) | 002 | Not started |
 | 004 | Fixture generator & vendored demo images | Key req › Demo materials; Acceptance › pre-specified images available at start (per RESEARCH Q2); Out of scope › linux/amd64 only | 003 | Not started |
 | 005 | Cache store, fixture ingestion & analysis API | Key req › cached-images source; Technical design › Backend (JSON API, server-side aggregation + pagination, durable cache, `/var/lib/layerlens/images`); RESEARCH Q7 (LRU + cap + refusal); Acceptance › startup loads examples | 002, 003, 004 | Not started |
