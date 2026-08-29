@@ -168,6 +168,17 @@ edge. This requires hashing every regular file's content during the single index
 (SHA-256 while streaming; CPU-bound but one-pass). Whether mode/uid/gid participate is a
 knob — see Open questions.
 
+> **RESOLVED 2026-08-29** (user decision, `RESEARCH.md` Q5). The knob is settled as
+> **content + mode bits; mtime and uid/gid excluded**. The normalized changeset digest
+> hashes sorted entries of `(path, typeflag, mode bits, symlink/link target,
+> content-sha256, whiteout marker)`. Excluding mtime is mandatory — it is the very thing
+> that makes two byte-identical rebuilds produce different DiffIDs, which is the
+> phenomenon this tool exists to expose. Including mode bits is mandatory — two layers
+> are not interchangeable if one ships a non-executable binary. uid/gid are excluded as a
+> deliberate trade-off, since build-context ownership varies with the builder's
+> environment while the resulting image behaves identically. This supersedes the
+> "(path, typeflag, mode, uid, gid, ...)" sketch in the paragraph above.
+
 ### A5. Dockerfile instruction recovery — config `history` with `empty_layer` offset
 
 From OCI image-spec v1.1.1 `config.md` (verified): `history` is ordered oldest-first;
@@ -385,6 +396,14 @@ explicit platform selection at save time.
    package.json to revisit.
 
 ## Open questions for the user
+
+> **ALL RESOLVED 2026-08-29.** Every question below has been answered by the user; the
+> binding answers live in `.planning/RESEARCH.md` (Q1–Q8). Summary: anonymous-only
+> registry auth; vendored deterministic OCI fixtures for the demo images; private/trusted
+> deployment (no auth layer needed); configurable cache cap with LRU eviction; changeset
+> digest = content + mode, excluding mtime and uid/gid. The questions are kept below for
+> the record — read `RESEARCH.md` for what was decided.
+
 
 1. **Private-registry credentials — in scope?** Anonymous public pulls work for Docker
    Hub, GHCR, GCR, ECR-Public, and anonymous-enabled ACR. Private ECR (no anonymous mode
