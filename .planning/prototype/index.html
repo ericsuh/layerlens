@@ -123,7 +123,18 @@
           <span id="showing" class="showing"></span>
         </div>
       </div>
-      <div class="tree-wrap"><div id="tree" class="tree" role="tree" aria-label="Filesystem diff"></div></div>
+      <div class="tree-wrap">
+        <div class="tree-head tgrid" aria-hidden="true">
+          <div class="h-name">Name</div>
+          <div class="h-status" title="Change status: + added, − removed, ± modified, · unchanged. On a directory, ± N counts changed descendants.">±</div>
+          <div class="h-num" title="Change in total size, B relative to A">Δ size</div>
+          <div class="h-num col-dfiles" title="Change in file count, B relative to A">Δ files</div>
+          <div class="h-num" title="Total size in image B — hover a row for the A-side totals">Size</div>
+          <div class="h-num col-filesb" title="Total file count in image B — hover a row for the A-side totals">Files</div>
+          <div class="h-bar" title="Size relative to the largest sibling; hatched segments are the added / removed / modified portions">Rel. size</div>
+        </div>
+        <div id="tree" class="tree" role="tree" aria-label="Filesystem diff"></div>
+      </div>
     </div>
   </div>
 </div>

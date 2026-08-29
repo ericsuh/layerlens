@@ -153,7 +153,7 @@ recoverable": via title-tooltip, popover, or copy affordance.
 | Full paths (breadcrumbs) | **Collapse middle crumbs** | Show root + `…` + last 2 crumbs when > available width; the `…` is a button that opens a menu of the hidden crumbs. |
 | Dockerfile instructions on layer cards | **Truncate-end, single line** + popover | Card shows first line, stripped of `/bin/sh -c` / `# buildkit` decoration. Click/hover opens popover with the *raw* multi-line instruction in mono, pre-wrapped, max-height 40vh with internal scroll (heredoc RUNs can be pages long). |
 | Image refs (`ghcr.io/org/name:tag`) | **Truncate-start** (`direction:rtl` trick or JS) | The tail (`name:tag`) is the identifying part; leading registry/namespace elides first: `…org/very-long-name:v2`. Tooltip shows full ref. |
-| Sizes / counts | **Never truncate** | Always short by construction: human units, ≤9 chars (`999.9 MiB`). Column reserved at fixed width, right-aligned, tabular-nums. |
+| Sizes / counts | **Never truncate, never wrap** | Short by construction (human units) *and* the column reserves the worst plausible rendering, not the current data: `Δ size` fits `−1023.9 MiB` (84px), `Δ files` fits `+999,999` (64px), `Size` fits `1023.9 MiB` (76px), `Files` fits `999,999` (56px), status fits `± 9.9M` (42px) — all right-aligned, mono, tabular-nums, `white-space: nowrap`. Counts ≥1M keep fitting because the status summary uses compact notation (§5.3) and file counts in images are bounded well below 100M. |
 | Error messages | Wrap, max 3 lines, then "Show details" disclosure | Never clip an error silently. |
 | Tooltips/popovers themselves | max-width 480px, wrap, internal scroll beyond 40vh | |
 
@@ -412,13 +412,48 @@ Comparing A @ layer 6 (…v1)  vs  B @ layer 7 (…v2)      + added − removed 
   the loaded window (§10).
 - **Legend**: the three glyph+swatch(hatched) pairs; hover explains each.
 
+#### Tree columns & header
+
+Fixed 32px row height (virtualized). One shared column grid — used by the
+header row *and* every tree row — so the two can never drift:
+
+```
+[ Name (fluid) ][ ± 42px ][ Δ size 84px ][ Δ files 64px ][ Size 76px ][ Files 56px ][ Rel. size 108px ]
+   [indent][▸][name……]       −1023.9 MiB     +999,999       1023.9 MiB    999,999      ▕██▓▓░░▏
+```
+
+- **Header row**: persistent and **sticky** (`position: sticky; top: 0`) at
+  the top of the tree's scroll container, opaque surface background +
+  bottom border so rows scroll beneath it. `text-label` styling (uppercase,
+  muted). It is `aria-hidden` — the tree is `role=tree`, not a table, and
+  every row's SR text already spells out each value with its meaning (§7).
+- **Alignment invariant**: indentation (guides + chevron) lives *inside* the
+  fluid Name cell; every numeric column is a fixed grid track. The header
+  therefore stays aligned with the rows at every depth by construction —
+  there is nothing depth-dependent outside the Name cell.
+- **Column set** — `Name | ± | Δ size | Δ files | Size | Files | Rel. size`:
+  the Δ pair sits directly after the status glyph because "what changed" is
+  the tool's primary question; the absolute pair follows as the "after"
+  context; the bar stays outermost as a purely visual summary. Absolute
+  columns are the **B-side** totals (the after state) — keeping the existing
+  decision that A-side totals live in the row tooltip. Two labeled absolute
+  columns replace the old `142 MiB · 393 f` composite cell: the unit-suffix
+  jargon (`f`) is gone, and delta vs absolute is disambiguated by the
+  headers, not by inline suffixes.
+- **Header labels + tooltips** (label short, meaning in `title`):
+  - `±` — "Change status: + added, − removed, ± modified, · unchanged; on a
+    directory, ± N counts changed descendants."
+  - `Δ size` — "Change in total size, B relative to A."
+  - `Δ files` — "Change in file count, B relative to A."
+  - `Size` — "Total size in image B — hover a row for the A-side totals."
+  - `Files` — "Total file count in image B — hover a row for the A-side totals."
+  - `Rel. size` — "Size relative to the largest sibling; hatched segments
+    are the added / removed / modified portions."
+- **Fixed widths** are sized from the worst plausible content, not the
+  fixture (§3): nothing in a numeric column may ever wrap or overflow.
+  Numeric cells are right-aligned, mono, tabular-nums, `white-space: nowrap`.
+
 #### Tree rows
-
-Fixed 32px height (virtualized). Column grid:
-
-```
-[indent][▸][icon][name………………][status][Δ size][files Δ][total size][size bar]
-```
 
 - **Disclosure triangle**: 16px hit area 24px, rotates 90° in 120ms when
   open; only on directories; `cursor:pointer`. Chevron area toggles;
@@ -432,12 +467,17 @@ Fixed 32px height (virtualized). Column grid:
 - **Status glyph + color** (never color alone): `+` added, `−` removed,
   `±` modified, `·` unchanged, in the status column and colored per token.
   Screen-reader text spelled out (§7).
-- **Deltas**: signed human sizes (`+14.3 MiB`) colored per polarity; file
-  count delta (`+312 files`). Zero deltas render as muted `—`.
-- **Total size / files**: the *B-side* cumulative subtree totals (the "after"
-  state), with the A-side totals in the row tooltip; rationale: one column of
-  truth plus delta beats four columns of numbers. Removed entries show their
-  A-side size in the total column, struck through.
+- **Δ size / Δ files**: signed values colored per polarity — `+14.3 MiB`,
+  `+312`. Size units stay (they *are* the value); the ` files` word and any
+  other unit suffix are dropped — the column header carries the meaning.
+  Zero deltas render as muted `—`. File rows leave `Δ files` empty (a file
+  is not a subtree; its add/remove is already the status glyph).
+- **Size / Files**: the *B-side* cumulative subtree totals (the "after"
+  state) in two labeled columns, with the A-side totals in the row tooltip
+  (`A: 98.4 MiB (393 files) → B: 119 MiB (453 files)`) on both cells;
+  rationale: one side of truth plus deltas beats four columns of numbers.
+  File rows show their own size and leave `Files` empty. Removed entries
+  show their A-side values in both columns, struck through.
 - **Size bar**: 6px, right-aligned fixed 96px track; width = subtree size /
   largest sibling subtree at this level (per-sibling-group normalization —
   the spec's "relative sizes of each entry"). Segmented fill: unchanged
@@ -454,7 +494,9 @@ Fixed 32px height (virtualized). Column grid:
     inherit their own explicit states (all added/removed).
   - *Directory merely containing changes*: **no tint** — surface row, dir
     name in `--text`, but the status column shows a small stacked-dot
-    change summary `± 12` in muted amber meaning "12 changed descendants",
+    change summary `± 12` in muted amber meaning "12 changed descendants"
+    (counts ≥1,000 render compactly — `± 1.2K`, `± 9.9M` — so the 42px
+    status column never overflows; the exact count is in the tooltip),
     and its size bar shows the hatched change segments. This is the visual
     rule that separates "changed container" from "changed thing".
   - *Unchanged*: muted name (`--text-muted`), `·` glyph, no bar texture.
@@ -513,7 +555,9 @@ skeleton shimmer and the armed-slot pulse.
 - **Row SR text**: composed as e.g. "node_modules, directory, modified
   contents: 312 files added, 14.3 mebibytes added, total 142 mebibytes,
   level 2, 5 of 9". Status is *words*, never glyph-only; bars are
-  `aria-hidden` (their data is in the text).
+  `aria-hidden` (their data is in the text), and so is the sticky column
+  header (§5.3) — `role=tree` has no column semantics, so the header is a
+  purely visual legend whose meanings the row SR text already carries.
 - **Focus order**: header → slot A → slot B → Compare → tabs → panel content
   (selection view); header → layer groups (A then B) → toolbar → tree
   (browse view). No focus traps; popovers return focus on close.
@@ -533,8 +577,9 @@ below that we do not optimize (no mobile).
 
 - ≥1280px: browse view two columns (400px + fluid), page gutter 32px.
 - 1024–1279px: left column narrows to 360px (branch cards drop the digest
-  line into the tooltip), gutter 24px, tree hides the *files Δ* column
-  (data remains in tooltip/SR text).
+  line into the tooltip), gutter 24px, tree hides both file-count columns
+  (`Δ files` and `Files`) in rows *and* header (data remains in the row
+  tooltip/SR text); the size columns and their headers stay.
 - <1024px (unsupported but non-broken): columns stack vertically — layer
   section first at natural height (own scroll capped 50vh), diff below;
   a floating "A @ 6 · B @ 7" chip keeps selection context while scrolled
@@ -630,7 +675,10 @@ below that we do not optimize (no mobile).
   to each selected point, then diffed), so layer selection genuinely changes
   the tree — including the all-unchanged trunk-point case.
 - Tree supports disclosure, drill-down with breadcrumbs, changed-only filter,
-  per-sibling-normalized hatched size bars.
+  per-sibling-normalized hatched size bars, and the sticky column header
+  (§5.3); the fixture includes the deep path
+  `/app/node_modules/@babel/plugin-transform-runtime/lib/get-runtime-path/`
+  to prove header/row column alignment holds at depth.
 - Simplifications vs this spec: no virtualization, no keyboard nav, no
   popovers (title tooltips only), pull progress is a static mock, and the
   degenerate fork cases are not interactive (described in §5.2 only).

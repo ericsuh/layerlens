@@ -97,6 +97,12 @@
   nm.push(F("/app/node_modules/undici/lib/llhttp/llhttp.wasm", 2148069));
   for (let i = 0; i < 14; i++) nm.push(F("/app/node_modules/.bin/bin" + i, sz(300, 2e3)));
   nm.push(F("/app/node_modules/lodash/lodash.js", 66601536)); // fat demo blob so node_modules dominates
+  // deep-indent case (DESIGN.md §5.3): proves header/row column alignment holds at depth
+  const babel = "/app/node_modules/@babel/plugin-transform-runtime/";
+  nm.push(F(babel + "package.json", 1522), F(babel + "README.md", 2214), F(babel + "LICENSE", 1106));
+  nm.push(F(babel + "lib/index.js", 24618), F(babel + "lib/definitions.js", 9412), F(babel + "lib/helpers.js", 3187));
+  nm.push(F(babel + "lib/get-runtime-path/index.js", 3121), F(babel + "lib/get-runtime-path/browser.js", 918));
+  nm.push(F("/app/node_modules/@babel/runtime/package.json", 2380), F("/app/node_modules/@babel/runtime/helpers/esm/inherits.js", 431), F("/app/node_modules/@babel/runtime/helpers/inherits.js", 486));
 
   // ---- ffmpeg apt layer (IDENTICAL in both → could-be-shared) ------------
   const ff = [F("/usr/bin/ffmpeg", 285816), F("/usr/bin/ffprobe", 199224), F("/usr/bin/ffplay", 166840)];

@@ -173,7 +173,12 @@ html[data-theme=dark] .set-btn { color:#0b1120; }
 
 /* ---------- browse view ---------- */
 .browse { display:grid; grid-template-columns:400px minmax(560px,1fr); gap:24px; padding:24px 32px; height:100%; min-height:0; }
-@media (max-width:1279px){ .browse { grid-template-columns:360px minmax(0,1fr); padding:24px; gap:24px; } .fscol .col-files { display:none; } }
+@media (max-width:1279px){
+  .browse { grid-template-columns:360px minmax(0,1fr); padding:24px; gap:24px; }
+  /* drop both file-count columns; data stays in the row tooltip / SR text */
+  .tgrid { grid-template-columns:minmax(0,1fr) 42px 84px 76px 108px; }
+  .col-dfiles, .col-filesb, .cell-dfiles, .cell-filesb { display:none; }
+}
 .col { min-height:0; display:flex; flex-direction:column; }
 .section-head { display:flex; align-items:baseline; gap:10px; margin-bottom:16px; flex:none; flex-wrap:wrap; }
 .section-head h2 { font-size:15px; font-weight:600; margin:0; }
@@ -273,11 +278,30 @@ input.search {
 }
 .showing { font-size:11.5px; color:var(--text-muted); margin-left:auto; }
 .tree-wrap { border:1px solid var(--border); border-top:none; border-radius:0 0 10px 10px; background:var(--surface); overflow:auto; flex:1; min-height:0; }
-.tree { padding:4px 0; }
-.trow {
-  display:grid; grid-template-columns:minmax(0,1fr) 30px 92px 84px 84px 108px; align-items:center;
-  height:32px; padding:0 14px 0 8px; font-size:13px; column-gap:8px;
+.tree { padding:0 0 4px; }
+/* shared column grid — header and rows use the SAME template so numeric
+   columns can never drift; indentation lives inside the fluid name cell.
+   Widths reserve the worst plausible rendering (see DESIGN.md §5.3):
+   status "± 9.9M" · Δ size "−1023.9 MiB" · Δ files "+999,999" ·
+   Size "1023.9 MiB" · Files "999,999" · bar track 96px */
+.tgrid {
+  display:grid; grid-template-columns:minmax(0,1fr) 42px 84px 64px 76px 56px 108px;
+  align-items:center; column-gap:8px; padding:0 14px 0 8px;
   border-left:3px solid transparent;
+}
+.tree-head {
+  position:sticky; top:0; z-index:2; height:28px;
+  background:var(--surface); border-bottom:1px solid var(--border);
+  font-size:10.5px; font-weight:600; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--text-muted);
+}
+.tree-head > div { white-space:nowrap; overflow:hidden; }
+.tree-head .h-name { padding-left:30px; } /* clears the chevron gutter */
+.tree-head .h-status { text-align:center; font-family:var(--mono); }
+.tree-head .h-num, .tree-head .h-bar { text-align:right; font-variant-numeric:normal; }
+.tree-head [title] { cursor:help; }
+.trow {
+  height:32px; font-size:13px;
 }
 .trow:hover { background:var(--surface-2); }
 .trow .cell-name { display:flex; align-items:center; min-width:0; gap:2px; }
@@ -313,15 +337,18 @@ button.fname:hover { text-decoration:underline; text-underline-offset:2px; }
 }
 .trow:hover .drill.dir, .trow:focus-within .drill.dir { display:inline-flex; }
 .drill:hover { background:color-mix(in srgb, var(--text-muted) 14%, transparent); color:var(--text); }
-.cell-status { text-align:center; font-weight:650; font-family:var(--mono); font-size:12px; color:var(--text-muted); }
+.cell-status { text-align:center; font-weight:650; font-family:var(--mono); font-size:12px; color:var(--text-muted); white-space:nowrap; }
 .cell-status .contains { color:var(--modified-strong); font-weight:600; font-size:11px; opacity:.85; }
-.cell-delta, .cell-files, .cell-size { font-family:var(--mono); font-size:11.5px; text-align:right; white-space:nowrap; }
-.cell-delta.pos { color:var(--added-strong); } .cell-delta.neg { color:var(--removed-strong); }
+/* numeric cells: right-aligned, mono/tabular, and NEVER allowed to wrap —
+   widths in .tgrid are reserved for the worst case instead */
+.cell-delta, .cell-dfiles, .cell-size, .cell-filesb { font-family:var(--mono); font-size:11.5px; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.cell-delta.pos, .cell-dfiles.pos { color:var(--added-strong); }
+.cell-delta.neg, .cell-dfiles.neg { color:var(--removed-strong); }
 .cell-delta.mix { color:var(--modified-strong); }
-.cell-delta.zero, .cell-files.zero { color:var(--text-muted); opacity:.6; }
-.cell-files { color:var(--text-muted); }
-.cell-size { color:var(--text-muted); }
-.cell-size.gone { text-decoration:line-through; opacity:.7; }
+.cell-delta.zero, .cell-dfiles.zero { color:var(--text-muted); opacity:.6; }
+.cell-dfiles { color:var(--text-muted); }
+.cell-size, .cell-filesb { color:var(--text-muted); }
+.cell-size.gone, .cell-filesb.gone { text-decoration:line-through; opacity:.7; }
 .cell-bar { display:flex; justify-content:flex-end; }
 .sbar { width:96px; height:6px; border-radius:3px; background:var(--surface-2); overflow:hidden; display:flex; }
 .sbar i { display:block; height:100%; }

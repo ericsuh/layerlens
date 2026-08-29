@@ -354,8 +354,9 @@
       mk(p, acc, i === parts.length - 1);
     });
   }
+  const compact = n => n < 1000 ? String(n) : new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(n);
   function rowFor(node, path, depth) {
-    const row = el("div", "trow st-" + node.status);
+    const row = el("div", "trow tgrid st-" + node.status);
     row.setAttribute("role", "treeitem"); row.setAttribute("aria-level", depth + 1);
     const isDir = node.kind === "dir";
     const open = state.expanded.has(path) || !!state.search;
@@ -381,21 +382,27 @@
     row.appendChild(name);
     // status
     let st;
+    const nCh = node.addN + node.remN + node.modN;
     if (node.status === "added") st = "+"; else if (node.status === "removed") st = "−";
-    else if (node.status === "modified") st = "±"; else if (node.status === "contains") st = '<span class="contains" title="' + (node.addN + node.remN + node.modN) + ' changed descendants">± ' + (node.addN + node.remN + node.modN) + "</span>";
+    else if (node.status === "modified") st = "±"; else if (node.status === "contains") st = '<span class="contains" title="' + nCh.toLocaleString() + ' changed descendants">± ' + compact(nCh) + "</span>";
     else st = "·";
     row.appendChild(el("div", "cell-status", st));
-    // deltas
+    // Δ size — signed human size; headers carry the meaning, cells carry only the value
     const dBytes = node.bSize - node.aSize;
     const dcls = node.status === "modified" || node.status === "contains" ? (dBytes > 0 ? "pos" : dBytes < 0 ? "neg" : "zero") : node.status === "added" ? "pos" : node.status === "removed" ? "neg" : "zero";
     row.appendChild(el("div", "cell-delta num " + dcls, signed(dBytes)));
+    // Δ files — signed count, no unit suffix (the header labels it); blank on file rows
     const dFiles = node.bFiles - node.aFiles;
-    row.appendChild(el("div", "cell-files num" + (dFiles === 0 ? " zero" : ""), node.kind === "file" ? "" : dFiles === 0 ? "—" : signedN(dFiles) + " files"));
-    // total (B side; struck A side when removed)
+    row.appendChild(el("div", "cell-dfiles num " + (node.kind === "file" ? "" : dFiles > 0 ? "pos" : dFiles < 0 ? "neg" : "zero"), node.kind === "file" ? "" : dFiles === 0 ? "—" : signedN(dFiles)));
+    // Size + Files — B-side absolutes (A-side struck through when removed; A totals in tooltip)
     const gone = node.status === "removed";
-    const totalCell = el("div", "cell-size num" + (gone ? " gone" : ""), human(gone ? node.aSize : node.bSize) + (node.kind === "dir" && !gone ? " · " + node.bFiles.toLocaleString() + " f" : ""));
-    totalCell.title = "A: " + human(node.aSize) + " (" + node.aFiles.toLocaleString() + " files) → B: " + human(node.bSize) + " (" + node.bFiles.toLocaleString() + " files)";
-    row.appendChild(totalCell);
+    const abTitle = "A: " + human(node.aSize) + " (" + node.aFiles.toLocaleString() + " files) → B: " + human(node.bSize) + " (" + node.bFiles.toLocaleString() + " files)";
+    const sizeCell = el("div", "cell-size num" + (gone ? " gone" : ""), human(gone ? node.aSize : node.bSize));
+    sizeCell.title = abTitle;
+    row.appendChild(sizeCell);
+    const filesCell = el("div", "cell-filesb num" + (gone ? " gone" : ""), node.kind === "file" ? "" : (gone ? node.aFiles : node.bFiles).toLocaleString());
+    filesCell.title = abTitle;
+    row.appendChild(filesCell);
     // bar
     const bar = el("div", "cell-bar");
     const sb = el("div", "sbar"); sb.setAttribute("aria-hidden", "true");
