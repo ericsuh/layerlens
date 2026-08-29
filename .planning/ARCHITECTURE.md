@@ -312,14 +312,29 @@ Q5 answer). SHA-256 over the canonical serialization of the sorted entries, wher
 entry contributes exactly
 
 ```
-(Path, Kind, ContentSHA, Mode /* 12 permission bits */, LinkTarget)
+(Path, Kind /* typeflag */, Mode /* 12 permission bits */, UID, GID,
+ Uname, Gname, Size, LinkTarget, Devmajor, Devminor,
+ Xattrs /* sorted by key, BuildKit's filter: keep "security.capability",
+           drop other security.* and system.* */,
+ ContentSHA /* regular files only */)
 ```
 
-length-prefixed fields, one record per entry, in Path order. `MtimeUnix`, `UID`,
-`GID`, `Size` (redundant with ContentSHA for files) are excluded. Whiteout and
-opaque entries participate (their Kind and Path are the payload; ContentSHA/Mode
-empty/zero). A digest-scheme version byte prefixes the stream so the definition
-can evolve without silently colliding with old digests.
+length-prefixed fields, one record per entry, in Path order. **`MtimeUnix` is the only
+excluded field** — matching `v1TarHeaderSelect`, which copies the v0 list "excluding the
+'mtime' header". `Size` is retained even though it is largely redundant with ContentSHA
+for regular files, because tarsum v1 includes it and it carries meaning for entry kinds
+that have no content hash.
+
+Whiteout and opaque entries participate (their Kind and Path are the payload;
+ContentSHA/Mode empty/zero). A digest-scheme version byte prefixes the stream so the
+definition can evolve without silently colliding with old digests.
+
+> **Note on fidelity.** We apply tarsum-v1 *field selection* to layer-tar entries;
+> BuildKit applies it to build-context files, and its byte-level serialization
+> (`"key"+"value"` concatenation) differs from our length-prefixed encoding. We are
+> deliberately not trying to reproduce BuildKit's digest values — only its notion of
+> *which differences matter*. The UI must therefore say "equivalent under Docker's
+> build-cache rule", never "this is a cache hit".
 
 ### 3.2 Cumulative (squashed) tree and diff tree
 
