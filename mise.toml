@@ -1,0 +1,115 @@
+# Toolchain and task runner for layerlens.
+# `mise install` provisions the pinned tools; `mise run build` produces
+# bin/layerlens with the SPA embedded.
+
+[tools]
+go = "1.26"
+node = "22"
+golangci-lint = "2.13.2"
+
+[env]
+# The deploy target is linux/amd64 and the binary must stay statically linked
+# so it can run under a hardened systemd unit with no libc dependency.
+CGO_ENABLED = "0"
+
+[tasks.deps]
+description = "Install web dependencies"
+dir = "{{config_root}}/web"
+sources = ["package.json", "package-lock.json"]
+outputs = ["node_modules/.package-lock.json"]
+run = "npm install --no-audit --no-fund"
+
+[tasks.build-web]
+description = "Bundle the SPA (esbuild) and stylesheet (Tailwind v4 CLI) into internal/webui/dist"
+depends = ["deps"]
+dir = "{{config_root}}"
+sources = ["web/src/**/*.ts", "web/src/**/*.tsx", "web/src/**/*.css", "web/index.html", "web/package.json"]
+outputs = ["internal/webui/dist/app.js", "internal/webui/dist/app.css", "internal/webui/dist/index.html", "bin/esbuild-meta.json"]
+run = [
+  "mkdir -p internal/webui/dist bin",
+  # Start from an empty dist so stale assets can never be embedded.
+  "find internal/webui/dist -mindepth 1 ! -name .gitkeep -delete",
+  # Tailwind v4 has no esbuild plugin path we want (DECISIONS §C5): the CLI is
+  # its own step, not a bundler plugin.
+  "web/node_modules/.bin/tailwindcss --input web/src/app.css --output internal/webui/dist/app.css --minify",
+  "web/node_modules/.bin/esbuild web/src/main.tsx --bundle --minify --format=iife --target=es2022 --jsx=automatic --define:process.env.NODE_ENV=\\\"production\\\" --outfile=internal/webui/dist/app.js --metafile=bin/esbuild-meta.json",
+  "cp web/index.html internal/webui/dist/index.html",
+]
+
+[tasks.build]
+description = "Build bin/layerlens with the SPA embedded"
+depends = ["build-web"]
+dir = "{{config_root}}"
+run = "go build -trimpath -o bin/layerlens ./cmd/layerlens"
+
+[tasks.bundle-size]
+description = "Report the bundled asset sizes from the esbuild metafile"
+depends = ["build-web"]
+dir = "{{config_root}}"
+run = "node -e \"const m=require('./bin/esbuild-meta.json');for(const [f,o] of Object.entries(m.outputs))console.log((o.bytes/1024).toFixed(1).padStart(8),'KiB ',f)\""
+
+[tasks.fmt]
+description = "Format Go sources"
+dir = "{{config_root}}"
+run = "gofmt -l -w ./cmd ./internal"
+
+[tasks.lint-go]
+description = "Run golangci-lint (includes go vet)"
+dir = "{{config_root}}"
+# Scoped to our own trees: web/node_modules contains third-party Go sources.
+run = "golangci-lint run ./cmd/... ./internal/..."
+
+[tasks.lint-web]
+description = "Run eslint over the SPA sources"
+depends = ["deps"]
+dir = "{{config_root}}/web"
+run = "npm run --silent lint"
+
+[tasks.lint]
+description = "Lint both languages"
+depends = ["lint-go", "lint-web"]
+run = []
+
+[tasks.typecheck]
+description = "Typecheck the SPA (tsc --noEmit)"
+depends = ["deps"]
+dir = "{{config_root}}/web"
+run = "npm run --silent typecheck"
+
+[tasks.test-go]
+description = "Run Go unit tests"
+dir = "{{config_root}}"
+# Scoped to our own trees: web/node_modules contains third-party Go sources.
+run = "go test ./cmd/... ./internal/..."
+
+[tasks.test-web]
+description = "Run Vitest unit tests"
+depends = ["deps"]
+dir = "{{config_root}}/web"
+run = "npm run --silent test"
+
+[tasks.test]
+description = "Run all unit tests"
+depends = ["test-go", "test-web"]
+run = []
+
+[tasks.check]
+description = "Everything CI-equivalent: lint, typecheck, tests, build"
+depends = ["lint", "typecheck", "test", "build"]
+run = []
+
+[tasks.dev]
+description = "Watch the SPA (esbuild + Tailwind) and run the server with go run"
+depends = ["deps"]
+dir = "{{config_root}}"
+run = """
+set -euo pipefail
+mkdir -p internal/webui/dist bin
+cp web/index.html internal/webui/dist/index.html
+web/node_modules/.bin/tailwindcss --input web/src/app.css --output internal/webui/dist/app.css --watch &
+web/node_modules/.bin/esbuild web/src/main.tsx --bundle --sourcemap --format=iife --target=es2022 --jsx=automatic --outfile=internal/webui/dist/app.js --watch=forever &
+trap 'kill 0' EXIT INT TERM
+# --ui-dir makes the server read the watched assets from disk; the embedded
+# copy inside `go run`'s binary is a snapshot taken at compile time.
+go run ./cmd/layerlens --listen "${LAYERLENS_LISTEN:-:8080}" --data-dir "${LAYERLENS_DATA_DIR:-.dev-data}" --ui-dir internal/webui/dist
+"""

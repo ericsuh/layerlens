@@ -1,5 +1,14 @@
 .claude/settings.local.json
+.DS_Store
+**/.DS_Store
 .pnpm-store/
 **/node_modules/
-**/dist/
-**/.DS_Store
+
+# Build output
+bin/
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+
+# Local runtime state
+.dev-data/
+.e2e-data/

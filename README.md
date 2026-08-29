@@ -2,4 +2,37 @@
 
 Optimize your Docker images.
 
-All project/agent planning files are [.planning/](.planning/).
+layerlens is a single Go binary that serves a JSON API plus an embedded React
+SPA for comparing container images: their layer graphs (shared trunk, per-image
+branches, could-be-shared layers) and the filesystem diff between any two
+points in those graphs.
+
+All project/agent planning files are in [.planning/](.planning/).
+
+## Development
+
+Toolchain and tasks are managed by [mise](https://mise.jdx.dev). Pinned tools
+(Go, Node, golangci-lint) come from `mise.toml`; SPA dependencies from
+`web/package.json`.
+
+```sh
+mise install        # provision Go, Node, golangci-lint
+mise run build      # bundle the SPA and build ./bin/layerlens with it embedded
+./bin/layerlens --listen :8080 --data-dir ./.dev-data
+```
+
+| Task | What it does |
+|---|---|
+| `mise run build` | esbuild + Tailwind → `internal/webui/dist`, then `go build -o bin/layerlens` |
+| `mise run build-web` | Just the SPA bundle and stylesheet |
+| `mise run bundle-size` | Bundle sizes from the esbuild metafile |
+| `mise run dev` | esbuild + Tailwind watchers alongside `go run` (assets served from disk via `--ui-dir`) |
+| `mise run lint` | `golangci-lint run` (includes `go vet`) + eslint |
+| `mise run typecheck` | `tsc --noEmit` |
+| `mise run test` | `go test` + Vitest |
+| `mise run check` | lint + typecheck + test + build |
+| `mise run fmt` | `gofmt -w` over the Go trees |
+
+The built SPA lives in `internal/webui/dist` and is embedded with `//go:embed`,
+so the binary is self-contained: it serves `/healthz`, the reserved `/api/v1`
+namespace, and the SPA (with fallback for client-side routes) from one process.

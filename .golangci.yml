@@ -1,0 +1,26 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - revive
+  exclusions:
+    presets:
+      - std-error-handling
+    paths:
+      # npm dependencies ship Go sources that are not ours to lint.
+      - web/node_modules
+    rules:
+      # httptest.ResponseRecorder results carry a NopCloser body; bodyclose
+      # cannot see through the test helpers that do close them.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt

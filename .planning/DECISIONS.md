@@ -364,6 +364,54 @@ entries map positionally onto `diff_ids`.
 produces an OCI layout tarball with compat `manifest.json`; multi-platform images need
 explicit platform selection at save time.
 
+## Implementation deltas
+
+Recorded per the PROJECT.md workflow rule: anything implementation proved wrong
+or under-specified in an earlier planning file, with the source file updated.
+
+### Phase 001 (toolchain & walking skeleton), 2026-08-29
+
+- **npm versions that did not exist / did not resolve** (the rest of §C/§D
+  installed exactly as pinned — react 19.2.8, react-dom 19.2.8,
+  @tanstack/react-query 5.102.8, typescript 5.9.3, esbuild 0.28.2,
+  tailwindcss + @tailwindcss/cli 4.3.3, vitest 4.1.11, jsdom 30.0.1,
+  @testing-library/react 16.3.3, eslint 10.9.1, typescript-eslint 8.68.0,
+  @playwright/test not yet installed — phase 007):
+  - `@eslint/js` has its own version line; there is no 10.9.1. Installed
+    **@eslint/js 10.0.1** (latest), which is the companion package for
+    eslint 10.9.1.
+  - `eslint-plugin-react-hooks` (never pinned in DECISIONS) 7.0.1 caps its
+    eslint peer at ^9; **7.1.1** is the first release that allows eslint ^10.
+  - Added two packages DECISIONS did not name but the pinned ones require or
+    imply: **@testing-library/dom 10.4.1** (peer of @testing-library/react 16)
+    and **@types/react 19.2.8 / @types/react-dom 19.2.4**.
+- **mise-resolved toolchain**: `go = "1.26"` → go1.26.7, `node = "22"` →
+  v22.23.2, `golangci-lint = "2.13.2"` exact. All three installed from a clean
+  cache in the sandbox, so `mise install` needs no manual fallback.
+- **ARCHITECTURE §1.3 — new `--ui-dir` flag** (file updated). `mise run dev`
+  runs the esbuild/Tailwind watchers next to `go run`, but `//go:embed` snapshots
+  `internal/webui/dist` at compile time, so watcher output was invisible to the
+  running server. `--ui-dir <dir>` (empty by default, warned about at startup)
+  serves the asset directory from disk instead of the embedded FS. Development
+  only; production and the systemd unit never set it.
+- **ARCHITECTURE §6.1 — new `not_found` error code** (file updated). The table
+  had no code for "unrouted path inside `/api`"; `image_not_found` would be a
+  lie and falling through to the SPA shell would hand clients HTML. Unmatched
+  `/api/*` now returns 404 `not_found` in the standard envelope.
+- **`go test ./...` / `golangci-lint run` traverse `web/node_modules`**: npm
+  dependencies ship Go sources (`flatted/golang/pkg/flatted`), which land inside
+  the module's package space. The `mise` tasks are therefore scoped to
+  `./cmd/... ./internal/...`, and `.golangci.yml` excludes `web/node_modules`
+  so a bare `golangci-lint run` is clean too.
+- **Tailwind v4 source scanning is explicit**: automatic detection walks up to
+  the git root and would emit utilities for `.planning/prototype/*`, so
+  `web/src/app.css` uses `@import "tailwindcss" source(none)` + `@source "../src"`.
+- **SPA bundle format is IIFE, not ESM**: nothing in the bundle needs module
+  scope or code splitting, and an IIFE + `<script defer>` is executable in
+  environments (jsdom-based checks) that do not run `<script type="module">`.
+  Production builds omit the source map so the 1 MB map is not embedded in the
+  binary; `mise run dev` keeps it.
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.

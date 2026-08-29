@@ -1,0 +1,164 @@
+/* Explicit source scanning: automatic detection would walk the whole repo
+   (including .planning/prototype) and emit utilities we never ship. */
+@import "tailwindcss" source(none);
+@source "../src";
+
+/*
+ * Semantic color tokens (DESIGN §2.4). Component CSS never hardcodes a hex:
+ * the raw values live here and flip between themes, and the @theme block below
+ * exposes them to Tailwind utilities (bg-surface, text-added, …).
+ */
+:root {
+  --ll-bg: #f8fafc;
+  --ll-surface: #ffffff;
+  --ll-surface-2: #f1f5f9;
+  --ll-border: #e2e8f0;
+  --ll-text: #1e293b;
+  --ll-text-muted: #64748b;
+  --ll-focus-ring: #2563eb;
+
+  --ll-added: #15803d;
+  --ll-added-tint: #dcfce7;
+  --ll-added-strong: #166534;
+  --ll-removed: #b91c1c;
+  --ll-removed-tint: #fee2e2;
+  --ll-removed-strong: #991b1b;
+  --ll-modified: #a16207;
+  --ll-modified-tint: #fef3c7;
+  --ll-modified-strong: #854d0e;
+  --ll-unchanged: #64748b;
+  --ll-shared: #475569;
+  --ll-shared-tint: #f1f5f9;
+  --ll-image-a: #1d4ed8;
+  --ll-image-a-tint: #dbeafe;
+  --ll-image-b: #7e22ce;
+  --ll-image-b-tint: #f3e8ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ll-bg: #0b1120;
+    --ll-surface: #111a2e;
+    --ll-surface-2: #1a2540;
+    --ll-border: #27324d;
+    --ll-text: #e2e8f0;
+    --ll-text-muted: #94a3b8;
+    --ll-focus-ring: #60a5fa;
+
+    --ll-added: #4ade80;
+    --ll-added-tint: #12291c;
+    --ll-added-strong: #4ade80;
+    --ll-removed: #f87171;
+    --ll-removed-tint: #2d1517;
+    --ll-removed-strong: #f87171;
+    --ll-modified: #fbbf24;
+    --ll-modified-tint: #2a2110;
+    --ll-modified-strong: #fbbf24;
+    --ll-unchanged: #94a3b8;
+    --ll-shared: #94a3b8;
+    --ll-shared-tint: #1a2540;
+    --ll-image-a: #60a5fa;
+    --ll-image-a-tint: #16233f;
+    --ll-image-b: #c084fc;
+    --ll-image-b-tint: #241b3a;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ll-bg: #0b1120;
+  --ll-surface: #111a2e;
+  --ll-surface-2: #1a2540;
+  --ll-border: #27324d;
+  --ll-text: #e2e8f0;
+  --ll-text-muted: #94a3b8;
+  --ll-focus-ring: #60a5fa;
+
+  --ll-added: #4ade80;
+  --ll-added-tint: #12291c;
+  --ll-added-strong: #4ade80;
+  --ll-removed: #f87171;
+  --ll-removed-tint: #2d1517;
+  --ll-removed-strong: #f87171;
+  --ll-modified: #fbbf24;
+  --ll-modified-tint: #2a2110;
+  --ll-modified-strong: #fbbf24;
+  --ll-unchanged: #94a3b8;
+  --ll-shared: #94a3b8;
+  --ll-shared-tint: #1a2540;
+  --ll-image-a: #60a5fa;
+  --ll-image-a-tint: #16233f;
+  --ll-image-b: #c084fc;
+  --ll-image-b-tint: #241b3a;
+}
+
+@theme inline {
+  --color-bg: var(--ll-bg);
+  --color-surface: var(--ll-surface);
+  --color-surface-2: var(--ll-surface-2);
+  --color-border: var(--ll-border);
+  --color-text: var(--ll-text);
+  --color-text-muted: var(--ll-text-muted);
+  --color-focus-ring: var(--ll-focus-ring);
+
+  --color-added: var(--ll-added);
+  --color-added-tint: var(--ll-added-tint);
+  --color-added-strong: var(--ll-added-strong);
+  --color-removed: var(--ll-removed);
+  --color-removed-tint: var(--ll-removed-tint);
+  --color-removed-strong: var(--ll-removed-strong);
+  --color-modified: var(--ll-modified);
+  --color-modified-tint: var(--ll-modified-tint);
+  --color-modified-strong: var(--ll-modified-strong);
+  --color-unchanged: var(--ll-unchanged);
+  --color-shared: var(--ll-shared);
+  --color-shared-tint: var(--ll-shared-tint);
+  --color-image-a: var(--ll-image-a);
+  --color-image-a-tint: var(--ll-image-a-tint);
+  --color-image-b: var(--ll-image-b);
+  --color-image-b-tint: var(--ll-image-b-tint);
+
+  /* Typography scale (DESIGN §2.1). System stack only — no webfonts, so the
+     binary stays self-contained. */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --text-page-title: 20px;
+  --text-page-title--line-height: 28px;
+  --text-page-title--font-weight: 650;
+  --text-section: 15px;
+  --text-section--line-height: 22px;
+  --text-section--font-weight: 600;
+  --text-body: 13.5px;
+  --text-body--line-height: 20px;
+  --text-label: 12px;
+  --text-label--line-height: 16px;
+  --text-label--font-weight: 550;
+  --text-label--letter-spacing: 0.04em;
+  --text-meta: 12px;
+  --text-meta--line-height: 16px;
+
+  /* Radius (DESIGN §2.3) */
+  --radius-control: 6px;
+  --radius-panel: 10px;
+  --radius-badge: 999px;
+
+  /* Elevation (DESIGN §2.3) */
+  --shadow-panel: 0 1px 2px rgb(0 0 0 / 0.06);
+  --shadow-raised: 0 4px 12px rgb(0 0 0 / 0.1);
+  --shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.14);
+}
+
+@layer base {
+  html {
+    color-scheme: light dark;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: var(--text-body--line-height);
+  }
+}

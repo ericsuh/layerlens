@@ -99,7 +99,10 @@ trees, diffs, aggregates — are computed from these indexes.
 - Flags/env: `--listen` (default `:8080`), `--data-dir` (default
   `/var/lib/layerlens/images`), `--cache-max-bytes` (default 50 GiB),
   `--fixtures-dir` (default: embedded-adjacent `fixtures/`), `--docker-host`
-  (default: `DOCKER_HOST` / `/var/run/docker.sock` autodetect).
+  (default: `DOCKER_HOST` / `/var/run/docker.sock` autodetect), `--ui-dir`
+  (development only, default empty: serve SPA assets from this directory
+  instead of the embedded copy, so `mise run dev`'s esbuild/Tailwind watchers
+  are visible without recompiling the binary).
 - systemd unit: dedicated `layerlens` user, `StateDirectory=layerlens`,
   `ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`,
   `Restart=on-failure`. `mise run deploy` scp's binary + unit + fixtures, then
@@ -701,6 +704,7 @@ interface ApiError {
 | `pull_conflict` | 409 | (reserved; duplicate submissions instead return the existing pull, §6.3) |
 | `bad_request` | 400 | malformed params (layer count out of range, bad cursor, bad path) |
 | `internal` | 500 | anything else; message is generic, details logged server-side only |
+| `not_found` | 404 | no route matches the request path inside the reserved `/api` namespace (never falls through to the SPA shell) |
 
 ### 6.2 Images
 
