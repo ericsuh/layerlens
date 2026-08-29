@@ -111,8 +111,12 @@ type LayerIndex struct {
 	ChangesetDigest Digest `json:"changesetDigest"`
 	// ContentBytes is the sum of regular-file sizes in this changeset.
 	ContentBytes int64 `json:"contentBytes"`
-	// Entries are sorted by Path with exactly one entry per path
-	// (last-in-tar wins).
+	// Entries are ordered by Path and then by Kind. A path holds at most
+	// one filesystem object (duplicates within a tar resolve last-in-tar
+	// wins) and, independently, at most one whiteout and one opaque
+	// marker: an opaque directory is represented by the directory member
+	// *and* a marker inside it, and both are needed to squash it
+	// correctly (ARCHITECTURE §4.2).
 	Entries []Entry `json:"entries"`
 	// Warnings records tar entries that were skipped, e.g. names that
 	// failed sanitization.

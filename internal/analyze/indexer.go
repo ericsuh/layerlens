@@ -135,6 +135,7 @@ func IndexLayer(ctx context.Context, src LayerSource) (*domain.LayerIndex, error
 
 	idx := indexState{
 		entries: make(map[string]domain.Entry),
+		markers: make(map[markerKey]domain.Entry),
 		buf:     make([]byte, copyBufferSize),
 	}
 	tr := tar.NewReader(tee)
@@ -172,7 +173,17 @@ func IndexLayer(ctx context.Context, src LayerSource) (*domain.LayerIndex, error
 // indexState accumulates one layer's entries. Only metadata lives here: file
 // content is hashed as it streams past and then dropped.
 type indexState struct {
-	entries      map[string]domain.Entry
+	entries map[string]domain.Entry
+	// markers holds whiteout and opaque entries in their own keyspace.
+	// A whiteout or opaque marker shares its Path with the filesystem
+	// object it refers to, and a layer may legitimately carry both: the
+	// standard overlay representation of an opaque directory is the
+	// directory member *and* a ".wh..wh..opq" member inside it, and the
+	// spec's "whiteout x, then recreate x in the same layer" case needs
+	// both too. Keeping markers separate is what lets squashing apply the
+	// deletion to the lower state and still land this layer's own entry
+	// (ARCHITECTURE §4.2).
+	markers      map[markerKey]domain.Entry
 	buf          []byte
 	warnings     []string
 	suppressed   int
@@ -185,6 +196,19 @@ func (s *indexState) warn(format string, args ...any) {
 		return
 	}
 	s.warnings = append(s.warnings, fmt.Sprintf(format, args...))
+}
+
+// markerKey identifies a whiteout or opaque marker: the path it refers to plus
+// which kind of marker it is, since a layer can carry both for one path.
+type markerKey struct {
+	path string
+	kind domain.EntryKind
+}
+
+// putMarker records a whiteout or opaque marker, which never displaces the
+// filesystem entry for the same path.
+func (s *indexState) putMarker(e domain.Entry) {
+	s.markers[markerKey{path: e.Path, kind: e.Kind}] = e
 }
 
 // put records an entry, letting a later entry for the same path replace an
@@ -224,7 +248,7 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 	case base == whiteoutOpaqueDir:
 		// The marker's own path is not a filesystem path: the payload is
 		// the directory it makes opaque.
-		s.put(domain.Entry{Path: dir, Kind: domain.KindOpaque})
+		s.putMarker(domain.Entry{Path: dir, Kind: domain.KindOpaque})
 		return nil
 	case strings.HasPrefix(base, whiteoutPrefix):
 		name := strings.TrimPrefix(base, whiteoutPrefix)
@@ -232,7 +256,7 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 			s.warn("skipped malformed whiteout entry %q", hdr.Name)
 			return nil
 		}
-		s.put(domain.Entry{Path: path.Join(dir, name), Kind: domain.KindWhiteout})
+		s.putMarker(domain.Entry{Path: path.Join(dir, name), Kind: domain.KindWhiteout})
 		return nil
 	}
 
@@ -270,11 +294,22 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 }
 
 func (s *indexState) finish(diffID domain.Digest) *domain.LayerIndex {
-	entries := make([]domain.Entry, 0, len(s.entries))
+	entries := make([]domain.Entry, 0, len(s.entries)+len(s.markers))
 	for _, e := range s.entries {
 		entries = append(entries, e)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	for _, e := range s.markers {
+		entries = append(entries, e)
+	}
+	// Path order, then kind, so that the one path that can hold two
+	// entries (an object and its marker) still has a total, deterministic
+	// order — the changeset digest hashes this sequence.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Path != entries[j].Path {
+			return entries[i].Path < entries[j].Path
+		}
+		return entries[i].Kind < entries[j].Kind
+	})
 
 	warnings := s.warnings
 	if s.suppressed > 0 {

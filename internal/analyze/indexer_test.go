@@ -83,14 +83,21 @@ func TestIndexLayerWhiteouts(t *testing.T) {
 
 	t.Run("opaque_entry_captured", func(t *testing.T) {
 		t.Parallel()
-		raw := tartest.New().Dir("var/cache").Opaque("var/cache").Bytes()
+		raw := tartest.New().Dir("var/cache", tartest.Mode(0o700)).Opaque("var/cache").Bytes()
 		idx := indexTar(t, raw)
 
-		// The dir entry and the opaque marker share a path; the marker
-		// is written last and wins, exactly as an extractor would see
-		// it — squashing (phase 003) resolves the two-pass semantics.
-		opq := entryByPath(t, idx, "/var/cache")
-		assert.Equal(t, domain.KindOpaque, opq.Kind)
+		// The dir entry and the opaque marker share a path and BOTH
+		// survive: that pair is the standard overlay representation of
+		// an opaque directory, and squashing needs the marker to clear
+		// the lower children *and* the dir entry to carry this layer's
+		// own metadata (ARCHITECTURE §4.2). Object first, marker
+		// second, so the order is deterministic.
+		require.Len(t, idx.Entries, 2)
+		assert.Equal(t, domain.KindDir, idx.Entries[0].Kind)
+		assert.Equal(t, "/var/cache", idx.Entries[0].Path)
+		assert.Equal(t, uint32(0o700), idx.Entries[0].Mode)
+		assert.Equal(t, domain.KindOpaque, idx.Entries[1].Kind)
+		assert.Equal(t, "/var/cache", idx.Entries[1].Path)
 	})
 
 	t.Run("root_opaque", func(t *testing.T) {

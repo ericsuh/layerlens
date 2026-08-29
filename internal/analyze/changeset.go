@@ -68,35 +68,12 @@ func changesetDigest(version byte, entries []domain.Entry) domain.Digest {
 	return domain.DigestFromHash(h)
 }
 
-// writeEntry appends one entry's tarsum-v1 field selection to h. Every field
-// is length- or width-prefixed, so no combination of values can be re-parsed
-// as a different combination.
+// writeEntry appends one entry's tarsum-v1 field selection to h. The field
+// selection itself lives in fields.go and is shared verbatim with the diff
+// tree's modification predicate (§3.2), so the digest and the tree can never
+// disagree about what "same" means.
 func writeEntry(h hash.Hash, e *domain.Entry) {
-	writeStr(h, e.Path)
-	writeUint(h, uint64(e.Kind))
-	writeUint(h, uint64(e.Mode&domain.ModePermMask))
-	writeInt(h, int64(e.UID))
-	writeInt(h, int64(e.GID))
-	writeStr(h, e.Uname)
-	writeStr(h, e.Gname)
-	writeInt(h, e.Size)
-	writeStr(h, e.LinkTarget)
-	writeInt(h, e.Devmajor)
-	writeInt(h, e.Devminor)
-
-	keys := make([]string, 0, len(e.Xattrs))
-	for k := range e.Xattrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	writeUint(h, uint64(len(keys)))
-	for _, k := range keys {
-		writeStr(h, k)
-		writeStr(h, e.Xattrs[k])
-	}
-
-	// Regular files only; empty for every other kind.
-	writeStr(h, string(e.ContentSHA))
+	writeFields(h, e.Path, fieldsOfEntry(e))
 
 	// MtimeUnix is deliberately absent. See the doc comment above: it is the
 	// one difference that does not make two layers different, and that
