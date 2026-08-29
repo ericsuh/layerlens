@@ -56,8 +56,9 @@ run = "gofmt -l -w ./cmd ./internal"
 [tasks.lint-go]
 description = "Run golangci-lint (includes go vet)"
 dir = "{{config_root}}"
-# Scoped to our own trees: web/node_modules contains third-party Go sources.
-run = "golangci-lint run ./cmd/... ./internal/..."
+# web/go.mod makes web/ a separate module, so ./... stops before the Go
+# sources vendored inside web/node_modules.
+run = "golangci-lint run ./..."
 
 [tasks.lint-web]
 description = "Run eslint over the SPA sources"
@@ -78,13 +79,16 @@ run = "npm run --silent typecheck"
 
 [tasks.test-go]
 description = "Run Go unit tests"
+# The Go tests compile the go:embed'd internal/webui/dist. Without this
+# dependency they race build-web, which deletes and rewrites that directory.
+depends = ["build-web"]
 dir = "{{config_root}}"
-# Scoped to our own trees: web/node_modules contains third-party Go sources.
-run = "go test ./cmd/... ./internal/..."
+run = "go test ./..."
 
 [tasks.test-web]
 description = "Run Vitest unit tests"
-depends = ["deps"]
+# bundle.test.ts evaluates the real production bundle, so it must exist first.
+depends = ["deps", "build-web"]
 dir = "{{config_root}}/web"
 run = "npm run --silent test"
 
@@ -99,17 +103,54 @@ depends = ["lint", "typecheck", "test", "build"]
 run = []
 
 [tasks.dev]
-description = "Watch the SPA (esbuild + Tailwind) and run the server with go run"
+description = "Watch the SPA (esbuild + Tailwind) into .dev-dist and run the server against it"
 depends = ["deps"]
 dir = "{{config_root}}"
 run = """
-set -euo pipefail
-mkdir -p internal/webui/dist bin
-cp web/index.html internal/webui/dist/index.html
-web/node_modules/.bin/tailwindcss --input web/src/app.css --output internal/webui/dist/app.css --watch &
-web/node_modules/.bin/esbuild web/src/main.tsx --bundle --sourcemap --format=iife --target=es2022 --jsx=automatic --outfile=internal/webui/dist/app.js --watch=forever &
-trap 'kill 0' EXIT INT TERM
+set -eu
+# .dev-dist, deliberately NOT internal/webui/dist: that directory is a
+# build-only artifact that go:embed compiles into the binary. Letting the dev
+# watchers write it makes `mise run build` skip build-web (its declared outputs
+# look fresh) and ship the unminified bundle plus a 1.8 MB source map, and
+# races go:embed while the server binary is being compiled.
+rm -rf .dev-dist
+mkdir -p .dev-dist bin
+cp web/index.html .dev-dist/index.html
+
+tailwind_pid=""
+esbuild_pid=""
+server_pid=""
+cleanup() {
+  trap - EXIT INT TERM
+  # Saved PIDs, not `kill 0`: this script runs in mise's own process group, so
+  # `kill 0` signals the task runner itself and can leave watchers orphaned.
+  for pid in "$tailwind_pid" "$esbuild_pid" "$server_pid"; do
+    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+  done
+}
+# Installed before anything is backgrounded, so a failure part-way through the
+# launches still reaps whatever is already running.
+trap cleanup EXIT INT TERM
+
+# One synchronous pass first: --ui-dir now 404s a missing asset instead of
+# serving the shell, so the first page load must not race the watchers.
+web/node_modules/.bin/tailwindcss --input web/src/app.css --output .dev-dist/app.css
+
+# `--watch=always` / `--watch=forever`: both CLIs stop watching when stdin is
+# closed, which is exactly what a backgrounded job gets.
+web/node_modules/.bin/tailwindcss --input web/src/app.css --output .dev-dist/app.css --watch=always &
+tailwind_pid=$!
+web/node_modules/.bin/esbuild web/src/main.tsx --bundle --sourcemap --format=iife --target=es2022 --jsx=automatic --outfile=.dev-dist/app.js --watch=forever &
+esbuild_pid=$!
+
+# Built and run directly rather than via `go run`: go run's compiled child is a
+# grandchild of this script, so a signal delivered to the script alone leaves
+# the server holding the port. Go changes need a restart either way.
+go build -o bin/layerlens-dev ./cmd/layerlens
 # --ui-dir makes the server read the watched assets from disk; the embedded
-# copy inside `go run`'s binary is a snapshot taken at compile time.
-go run ./cmd/layerlens --listen "${LAYERLENS_LISTEN:-:8080}" --data-dir "${LAYERLENS_DATA_DIR:-.dev-data}" --ui-dir internal/webui/dist
+# copy inside the binary is a snapshot taken at compile time.
+bin/layerlens-dev --listen "${LAYERLENS_LISTEN:-:8080}" --data-dir "${LAYERLENS_DATA_DIR:-.dev-data}" --ui-dir .dev-dist &
+server_pid=$!
+# `wait` is interruptible by the trap; a foreground command would not be.
+wait "$server_pid"
 """

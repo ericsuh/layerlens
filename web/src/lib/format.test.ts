@@ -13,6 +13,7 @@ describe("formatBytes", () => {
     [15_000_000, "14.3 MiB"],
     [1024 ** 3, "1.0 GiB"],
     [1024 ** 4, "1.0 TiB"],
+    [1024 ** 5, "1.0 PiB"],
     [-2048, "-2.0 KiB"],
   ])("formats %i bytes as %s", (bytes, want) => {
     expect(formatBytes(bytes)).toBe(want);
@@ -23,7 +24,54 @@ describe("formatBytes", () => {
     expect(formatBytes(Number.POSITIVE_INFINITY)).toBe("—");
   });
 
-  it("keeps three significant digits at large magnitudes", () => {
-    expect(formatBytes(1024 ** 3 * 512)).toBe("512 GiB");
+  describe("unit boundaries", () => {
+    // The value just below a boundary must never render as "1024 <unit>":
+    // rounding carries it into the next unit instead.
+    it.each([
+      [1023, "1023 B"],
+      [1024, "1.0 KiB"],
+      [1024 * 1024 - 1, "1.0 MiB"],
+      [1024 * 1024, "1.0 MiB"],
+      [1024 ** 3 - 1, "1.0 GiB"],
+      [1024 ** 3, "1.0 GiB"],
+      [1024 ** 4 - 1, "1.0 TiB"],
+      [1024 ** 5 - 1, "1.0 PiB"],
+      // 1023.5 MiB rounds to 1024 MiB at zero decimals, so it carries too.
+      [Math.round(1023.5 * 1024 ** 2), "1.0 GiB"],
+      // 1023.4 MiB stays put: it rounds to 1023, not 1024.
+      [Math.round(1023.4 * 1024 ** 2), "1023 MiB"],
+    ])("formats %i bytes as %s", (bytes, want) => {
+      expect(formatBytes(bytes)).toBe(want);
+    });
+
+    it("never renders 1024 of any unit", () => {
+      for (let unit = 1; unit <= 5; unit += 1) {
+        for (const offset of [-2, -1, 0, 1, 2]) {
+          expect(formatBytes(1024 ** unit + offset)).not.toMatch(/^1024 /);
+        }
+      }
+    });
+  });
+
+  describe("precision rule (DESIGN 2.1: one decimal below 100, none at or above)", () => {
+    it.each([
+      [99.9 * 1024, "99.9 KiB"],
+      [100 * 1024, "100 KiB"],
+      [999 * 1024, "999 KiB"],
+      [512 * 1024 ** 3, "512 GiB"],
+    ])("formats %i bytes as %s", (bytes, want) => {
+      expect(formatBytes(bytes)).toBe(want);
+    });
+
+    it("uses whole numbers for raw bytes", () => {
+      expect(formatBytes(1)).toBe("1 B");
+      expect(formatBytes(999)).toBe("999 B");
+    });
+  });
+
+  it("signs negative values symmetrically", () => {
+    for (const bytes of [1023, 1024, 15_000_000, 1024 ** 3 - 1]) {
+      expect(formatBytes(-bytes)).toBe(`-${formatBytes(bytes)}`);
+    }
   });
 });

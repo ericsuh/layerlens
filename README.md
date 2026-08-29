@@ -26,7 +26,7 @@ mise run build      # bundle the SPA and build ./bin/layerlens with it embedded
 | `mise run build` | esbuild + Tailwind → `internal/webui/dist`, then `go build -o bin/layerlens` |
 | `mise run build-web` | Just the SPA bundle and stylesheet |
 | `mise run bundle-size` | Bundle sizes from the esbuild metafile |
-| `mise run dev` | esbuild + Tailwind watchers alongside `go run` (assets served from disk via `--ui-dir`) |
+| `mise run dev` | esbuild + Tailwind watchers writing `.dev-dist`, plus the server run with `--ui-dir .dev-dist` |
 | `mise run lint` | `golangci-lint run` (includes `go vet`) + eslint |
 | `mise run typecheck` | `tsc --noEmit` |
 | `mise run test` | `go test` + Vitest |
@@ -34,5 +34,9 @@ mise run build      # bundle the SPA and build ./bin/layerlens with it embedded
 | `mise run fmt` | `gofmt -w` over the Go trees |
 
 The built SPA lives in `internal/webui/dist` and is embedded with `//go:embed`,
-so the binary is self-contained: it serves `/healthz`, the reserved `/api/v1`
+so the binary is self-contained: it serves `/healthz`, the reserved `/api`
 namespace, and the SPA (with fallback for client-side routes) from one process.
+
+`internal/webui/dist` is a build-only artifact: only `mise run build-web` ever
+writes it. `mise run dev` builds into `.dev-dist` instead, so a dev session can
+never leave an unminified bundle behind for the next `mise run build` to embed.

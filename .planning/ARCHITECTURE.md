@@ -301,7 +301,9 @@ type LayerIndex struct {
     DiffID          Digest
     ChangesetDigest Digest
     ContentBytes    int64
-    Entries         []Entry // sorted by Path, exactly one entry per path (last-in-tar wins)
+    Entries         []Entry // ordered by (Path, Kind): at most one filesystem object per
+                            // path (last-in-tar wins) plus, independently, at most one
+                            // whiteout and one opaque marker for that path (§4.2)
     Warnings        []string // e.g. sanitized-away tar entries
 }
 ```
@@ -516,7 +518,11 @@ Exact semantics pinned down (the edge cases):
   resurrecting anything (children-preserving branch sees the already-cleared map).
 - **Whiteout/opaque for a nonexistent lower path**: no-op, no error.
 - **Duplicate paths inside one tar**: resolved at index time (last wins), so
-  squashing never sees them.
+  squashing never sees them. A marker and a filesystem object for the same path
+  are *not* duplicates and both survive indexing: the standard overlay
+  representation of an opaque directory is the directory member plus a
+  `.wh..wh..opq` member inside it, and the "whiteout x, then ship x" case above
+  needs both entries to exist for the two passes to have anything to do.
 - **Hardlinks**: kept as `KindHardlink` with `LinkTarget`; `Size` 0 so bytes are
   counted once (at the target). If the target was whiteout-deleted by a later
   layer the link dangles — displayed as-is, never resolved.
@@ -538,17 +544,20 @@ Diff(l, r *Node) *DiffNode:                   // either may be nil
   if l.Kind == KindDir && r.Kind == KindDir:
       for name in sortedUnion(l.Children, r.Children):   // merge two sorted key sets
           d.Children += Diff(l.Children[name], r.Children[name])
-      ownChanged := metaDiffers(l, r)          // Mode only, and only if neither Implicit
+      ownChanged := metaDiffers(l, r)          // metadata only, and skipped if either
+                                               //   side is an Implicit dir
       d.Status = Modified if ownChanged or any child != Unchanged else Unchanged
   else:
       d.Status = Modified if metaDiffers(l, r) else Unchanged
-      // metaDiffers: Kind, Mode(12b), ContentSHA, LinkTarget — see §3.2
+      // metaDiffers: the tarsum-v1 field set — see §3.2. Directories are
+      // projected with Size/ContentSHA forced to zero (they have neither), so
+      // one predicate serves both cases.
   fill d.Agg from children + own contribution  // same post-order visit, §4.4
   return d
 ```
 
-An `Implicit` dir on either side never counts as a mode modification (its 0755 is
-synthetic). Complexity O(|L| + |R|) node visits; the result is self-contained
+An `Implicit` dir on either side never counts as a metadata modification (its
+0755/uid 0 are synthetic); a *kind* change is still reported. Complexity O(|L| + |R|) node visits; the result is self-contained
 (SideMeta copies), so both input trees are garbage the moment Diff returns.
 
 ### 4.4 Bottom-up aggregation
@@ -714,6 +723,7 @@ interface ApiError {
 | `bad_request` | 400 | malformed params (layer count out of range, bad cursor, bad path) |
 | `internal` | 500 | anything else; message is generic, details logged server-side only |
 | `not_found` | 404 | no route matches the request path inside the reserved `/api` namespace (never falls through to the SPA shell) |
+| `method_not_allowed` | 405 | the path exists but not for this method; the response carries an `Allow` header |
 
 ### 6.2 Images
 

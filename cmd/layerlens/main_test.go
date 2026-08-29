@@ -1,12 +1,35 @@
 package main
 
 import (
+	"context"
 	"io"
+	"io/fs"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ericsuh/layerlens/internal/webui"
 )
+
+// noDockerSocket points the --docker-host autodetect at a path that cannot
+// exist, so flag tests see the "nothing configured" default.
+func noDockerSocket(t *testing.T) {
+	t.Helper()
+	previous := dockerSocketPath
+	dockerSocketPath = filepath.Join(t.TempDir(), "absent.sock")
+	t.Cleanup(func() { dockerSocketPath = previous })
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
@@ -50,6 +73,26 @@ func TestParseFlags(t *testing.T) {
 			wantErr: "--cache-max-bytes must be positive",
 		},
 		{
+			name:    "empty listen address is rejected",
+			args:    []string{"--listen", ""},
+			wantErr: "--listen must not be empty",
+		},
+		{
+			name:    "listen without a port is rejected",
+			args:    []string{"--listen", "localhost"},
+			wantErr: "is not a host:port address",
+		},
+		{
+			name:    "empty data dir is rejected",
+			args:    []string{"--data-dir", ""},
+			wantErr: "--data-dir must not be empty",
+		},
+		{
+			name:    "empty fixtures dir is rejected",
+			args:    []string{"--fixtures-dir", ""},
+			wantErr: "--fixtures-dir must not be empty",
+		},
+		{
 			name:    "positional arguments are rejected",
 			args:    []string{"serve"},
 			wantErr: "unexpected arguments",
@@ -64,6 +107,7 @@ func TestParseFlags(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DOCKER_HOST", "")
+			noDockerSocket(t)
 			got, err := parseFlags(tc.args, io.Discard)
 			if tc.wantErr != "" {
 				require.Error(t, err)
@@ -78,7 +122,265 @@ func TestParseFlags(t *testing.T) {
 
 func TestParseFlagsDefaultsDockerHostFromEnv(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+	noDockerSocket(t)
 	got, err := parseFlags(nil, io.Discard)
 	require.NoError(t, err)
 	assert.Equal(t, "tcp://127.0.0.1:2375", got.dockerHost)
+}
+
+// TestDockerHostDefaultIsNotPrintedInHelp is the point of resolving the
+// environment after parsing: flag defaults land in -h output, and DOCKER_HOST
+// can carry a hostname and credentials.
+func TestDockerHostDefaultIsNotPrintedInHelp(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://secret.internal:2376")
+	noDockerSocket(t)
+
+	var help stringWriter
+	_, err := parseFlags([]string{"-h"}, &help)
+	require.Error(t, err)
+	assert.NotContains(t, help.String(), "secret.internal")
+}
+
+type stringWriter struct{ b []byte }
+
+func (w *stringWriter) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
+func (w *stringWriter) String() string              { return string(w.b) }
+
+// TestParseFlagsAutodetectsLocalSocket covers the ARCHITECTURE §1.3 fallback.
+func TestParseFlagsAutodetectsLocalSocket(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+
+	sock := filepath.Join(t.TempDir(), "docker.sock")
+	ln, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, ln.Close()) }()
+
+	previous := dockerSocketPath
+	dockerSocketPath = sock
+	t.Cleanup(func() { dockerSocketPath = previous })
+
+	got, err := parseFlags(nil, io.Discard)
+	require.NoError(t, err)
+	assert.Equal(t, "unix://"+sock, got.dockerHost)
+}
+
+// TestParseFlagsIgnoresNonSocketAtSocketPath guards against treating a stray
+// regular file as a Docker endpoint.
+func TestParseFlagsIgnoresNonSocketAtSocketPath(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+
+	notASocket := filepath.Join(t.TempDir(), "docker.sock")
+	require.NoError(t, os.WriteFile(notASocket, nil, 0o600))
+
+	previous := dockerSocketPath
+	dockerSocketPath = notASocket
+	t.Cleanup(func() { dockerSocketPath = previous })
+
+	got, err := parseFlags(nil, io.Discard)
+	require.NoError(t, err)
+	assert.Empty(t, got.dockerHost)
+}
+
+func TestCheckUIDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "regular")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+
+	assert.ErrorContains(t, checkUIDir(filepath.Join(dir, "absent")), "--ui-dir")
+	assert.ErrorContains(t, checkUIDir(file), "is not a directory")
+	assert.ErrorContains(t, checkUIDir(dir), "has no index.html")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "index.html"), []byte("<!doctype html>"), 0o600))
+	assert.NoError(t, checkUIDir(dir))
+}
+
+// uiDir builds a minimal SPA asset directory for the run() tests.
+func uiDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "index.html"),
+		[]byte(`<!doctype html><div id="root"></div>`), 0o600))
+	return dir
+}
+
+func testConfig(t *testing.T) *config {
+	t.Helper()
+	return &config{
+		listen:        "127.0.0.1:0",
+		dataDir:       t.TempDir(),
+		cacheMaxBytes: 1 << 20,
+		fixturesDir:   "fixtures",
+		uiDir:         uiDir(t),
+	}
+}
+
+// startRun launches run() on an ephemeral port. It returns the server's base
+// URL, a function that triggers shutdown, and the channel carrying run's error.
+func startRun(t *testing.T, cfg *config) (string, func(), <-chan error) {
+	t.Helper()
+	return start(t, func(ctx context.Context, ready func(net.Addr)) error {
+		return run(ctx, cfg, discardLogger(), ready)
+	})
+}
+
+// startServe launches serve() with an arbitrary handler, which is how the
+// drain test gets a request that is still in flight when shutdown begins.
+func startServe(t *testing.T, cfg *config, handler http.Handler) (string, func(), <-chan error) {
+	t.Helper()
+	return start(t, func(ctx context.Context, ready func(net.Addr)) error {
+		return serve(ctx, cfg, discardLogger(), handler, ready)
+	})
+}
+
+func start(t *testing.T, fn func(context.Context, func(net.Addr)) error) (string, func(), <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	addrCh := make(chan net.Addr, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- fn(ctx, func(a net.Addr) { addrCh <- a })
+	}()
+
+	select {
+	case addr := <-addrCh:
+		return "http://" + addr.String(), cancel, errCh
+	case err := <-errCh:
+		t.Fatalf("run returned before listening: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not start listening")
+	}
+	return "", cancel, errCh
+}
+
+func waitForRun(t *testing.T, errCh <-chan error) {
+	t.Helper()
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+	case <-time.After(shutdownTimeout + 5*time.Second):
+		t.Fatal("run did not return after shutdown was requested")
+	}
+}
+
+func TestRunServesAndShutsDownCleanly(t *testing.T) {
+	base, stop, errCh := startRun(t, testConfig(t))
+
+	resp, err := http.Get(base + "/healthz")
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "ok", string(body))
+
+	stop()
+	waitForRun(t, errCh)
+
+	// The listener is released, so nothing answers on that port any more.
+	_, err = http.Get(base + "/healthz")
+	assert.Error(t, err)
+}
+
+// TestRunDrainsInFlightRequests is the property graceful shutdown exists for:
+// a request that is already being served finishes instead of being cut off.
+func TestRunDrainsInFlightRequests(t *testing.T) {
+	release := make(chan struct{})
+	slow := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("done"))
+	})
+
+	base, stop, errCh := startServe(t, testConfig(t), slow)
+
+	type result struct {
+		status int
+		body   string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.Get(base + "/slow")
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		b, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		done <- result{status: resp.StatusCode, body: string(b), err: readErr}
+	}()
+
+	// Give the request time to reach the handler, then ask for shutdown while
+	// it is still in flight.
+	time.Sleep(200 * time.Millisecond)
+	stop()
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		assert.Equal(t, http.StatusOK, got.status)
+		assert.Equal(t, "done", got.body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request was cut off instead of drained")
+	}
+	waitForRun(t, errCh)
+}
+
+func TestRunRejectsMissingUIDir(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.uiDir = filepath.Join(t.TempDir(), "absent")
+
+	err := run(context.Background(), cfg, discardLogger(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--ui-dir")
+}
+
+func TestRunReportsListenFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, ln.Close()) }()
+
+	cfg := testConfig(t)
+	cfg.listen = ln.Addr().String()
+
+	err = run(context.Background(), cfg, discardLogger(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "listen on")
+}
+
+// TestRunUsesEmbeddedUIWhenUIDirIsEmpty proves the production path (no
+// --ui-dir) serves the go:embed'd bundle rather than a test double.
+func TestRunUsesEmbeddedUIWhenUIDirIsEmpty(t *testing.T) {
+	requireBuiltBundle(t)
+
+	cfg := testConfig(t)
+	cfg.uiDir = ""
+	base, stop, errCh := startRun(t, cfg)
+
+	resp, err := http.Get(base + "/")
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), `id="root"`)
+	assert.NotEmpty(t, resp.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+
+	stop()
+	waitForRun(t, errCh)
+}
+
+// requireBuiltBundle skips when internal/webui/dist holds only .gitkeep, which
+// is the state of a clean checkout before `mise run build-web`. The mise
+// test-go task depends on build-web, so the CI-equivalent run never skips.
+func requireBuiltBundle(t *testing.T) {
+	t.Helper()
+	if _, err := fs.Stat(webui.FS(), "index.html"); err != nil {
+		t.Skip("SPA bundle is not built; run `mise run build-web`")
+	}
 }

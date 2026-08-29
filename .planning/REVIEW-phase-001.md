@@ -6,8 +6,9 @@ phase-001 acceptance criteria pass. Traversal battery (12 encodings) found no
 escape from the embedded FS. Package layout and error envelope match
 ARCHITECTURE §2/§6.1 exactly; all pinned versions match.
 
-Status: **fixes pending** — applied after phase 002 lands, to avoid editing
-`mise.toml` underneath a running agent's verification.
+Status: **fixes applied** (after phase 002 landed). Every item below is
+addressed; the deltas are recorded in DECISIONS.md under "Phase 001 review
+fixes". The findings are kept verbatim as the record of what was found.
 
 ## Must fix (build pipeline — one root cause)
 

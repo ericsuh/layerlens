@@ -412,6 +412,60 @@ or under-specified in an earlier planning file, with the source file updated.
   Production builds omit the source map so the 1 MB map is not embedded in the
   binary; `mise run dev` keeps it.
 
+### Phase 001 review fixes, 2026-08-29
+
+Applied from `REVIEW-phase-001.md` after phase 002 landed.
+
+- **`mise run dev` no longer writes `internal/webui/dist`** (review M1/M2/M3,
+  one root cause). `dist` is a build-only artifact that `go:embed` compiles in;
+  letting the dev watchers write it made `build-web`'s `outputs` look fresh, so
+  `mise run build` skipped the production bundle and shipped the unminified dev
+  one plus its 1.8 MB source map (binary 8.63 MB → 11.45 MB, `GET /app.js.map`
+  → 200). `dev` now builds into a gitignored `.dev-dist/` and runs the server
+  with `--ui-dir .dev-dist`. The `dev` trap is installed before the watchers are
+  backgrounded and kills saved PIDs instead of `kill 0`, which was signalling
+  mise's own process group and orphaning a watcher. `test-go` gained
+  `depends = ["build-web"]` so it no longer compiles the embed while
+  `build-web` is deleting and rewriting it.
+- **ARCHITECTURE §6.1 — new `method_not_allowed` error code** (file updated).
+  405 responses were returning `bad_request`, which §6.1 pins to HTTP 400. The
+  new row covers "the path exists but not for this method"; the response also
+  carries `Allow`.
+- **ARCHITECTURE §1.3 — `--docker-host` no longer defaults to the live
+  `DOCKER_HOST`.** The flag default is printed by `-h`, and `DOCKER_HOST` can
+  carry a hostname and credentials, so the flag defaults to empty and the
+  environment is consulted after `fs.Parse`. The §1.3 `/var/run/docker.sock`
+  autodetect (previously deferred without a delta) is now implemented: the path
+  is used only when it is actually a socket.
+- **DESIGN §2.1 — the size example `1.02 GiB` contradicted its own rule**
+  (file updated). The stated rule is "one decimal below 100, none at ≥100", so
+  the example is now `1.0 GiB`. The rule was also silent about the carry: the
+  implementation rounds first, so 1,048,575 B renders `1.0 MiB` rather than
+  `1024 KiB`. `web/src/lib/format.ts` had a dead branch
+  (`value < 10 ? 1 : value < 100 ? 1 : 0`) that reduces to `value < 100 ? 1 : 0`.
+  Phase 007 must extend this formatter, not fork it.
+- **`web/go.mod` replaces the manual `./cmd/... ./internal/...` scoping.** A
+  nested one-line module makes `web/` a boundary that `go test ./...` and
+  `golangci-lint run` stop at, so the Go sources vendored inside
+  `web/node_modules` are never compiled or linted. The mise tasks and the
+  `.golangci.yml` `web/node_modules` path exclusion were simplified away.
+- **New devDependency `@types/node` 22.20.1** (matching the pinned `node = "22"`).
+  `web/src/bundle.test.ts` reads the built bundle off disk and evaluates it in
+  jsdom, which needs the Node type declarations.
+- **Only `--docker-host` reads the environment.** ARCHITECTURE §1.3 heads its
+  list "Flags/env" but names an environment variable for exactly one flag.
+  That is the implemented reading: `DOCKER_HOST` is consulted, nothing else has
+  an env fallback. Recording it here because the review flagged it as deferred
+  without a delta; adding `LAYERLENS_*` fallbacks for the remaining flags would
+  be a new decision, not a fix.
+- **Content-Security-Policy on the SPA shell.** layerlens is entirely
+  self-hosted, so the policy is `default-src 'none'` with `script-src 'self'`,
+  `style-src 'self'`, `img-src 'self' data:`, `font-src 'self'`,
+  `connect-src 'self'` and `base-uri`/`form-action`/`frame-ancestors` set to
+  `'none'`. Note for phase 007: `style-src 'self'` also forbids `style="…"`
+  attributes. If the virtualized tree needs inline transforms, add
+  `style-src-attr 'unsafe-inline'` rather than loosening `style-src`.
+
 ### Phase 002 (domain model & streaming layer indexer), 2026-08-29
 
 - **The `ARCHITECTURE.md` §3.1 contradiction was already resolved.** Phase 002's
@@ -452,6 +506,52 @@ or under-specified in an earlier planning file, with the source file updated.
   through a wrapper that hides `tar.Reader.WriteTo` (which would otherwise
   bypass the buffer). A regression test streams a 1 GiB synthetic layer and
   asserts total allocations stay under 8 MiB.
+
+### Phase 003 (analysis algorithms: squash, diff, aggregate, trunk, edges), 2026-08-29
+
+- **Phase 002's indexer collapsed a path's object and its whiteout/opaque
+  marker into one entry; fixed** (ARCHITECTURE §3.1 `LayerIndex.Entries` and
+  §4.2's duplicate-paths bullet updated). `indexState.put` keyed everything by
+  path, so the standard overlay representation of an opaque directory — the
+  `var/cache/` member *plus* a `var/cache/.wh..wh..opq` member — lost whichever
+  came first in tar order. In practice the directory's own mode/uid/gid was
+  dropped and the squashed tree showed a synthetic 0755 implicit directory
+  instead, and §4.2's pinned semantics ("opaque in a directory the layer also
+  re-creates", "whiteout x while the layer also ships x") were unreachable:
+  the two-pass squasher can only apply what the changeset still contains.
+  Markers now live in their own keyspace (`{path, kind}`), and `Entries` is
+  ordered by `(Path, Kind)` so the one path that can hold two entries still has
+  a total, deterministic order for the changeset digest. Duplicate *filesystem*
+  entries still resolve last-in-tar-wins. `TestIndexLayerWhiteouts/
+  opaque_entry_captured` was updated to assert both entries survive.
+- **ARCHITECTURE §4.3 — the directory "own meta changed" predicate is the whole
+  tarsum-v1 field set, not `Mode` alone** (file updated). §4.3's pseudocode
+  comment said "Mode only", which would have hidden a `chown` of a directory
+  whose contents did not otherwise change — a real difference that the
+  changeset digest *does* see, so the tree and the dotted edges would have
+  disagreed about what "same" means, which §3.2 forbids. Directories are
+  instead projected with `Size` and `ContentSHA` forced to zero (a directory
+  has neither, and a tar directory member's `size` field is meaningless), so a
+  single predicate serves files and directories. The `Implicit` exemption is
+  unchanged and now covers all synthetic metadata, not just the mode; a *kind*
+  change is still reported even when one side is implicit.
+- **One field-set definition in code** (acceptance criterion made structural).
+  `internal/analyze/fields.go` holds `tarsumFields` plus `fieldsOfEntry`,
+  `fieldsOfNode`, `equal` and `writeFields`; `ChangesetDigest` hashes it and
+  `Diff`'s `metaDiffers` compares it. The two cannot drift apart, and
+  `TestDiffModificationPredicate` asserts on every case that the tree verdict
+  and the digest equality agree.
+- **A path that is a directory on one side and a non-directory on the other is
+  a leaf in the diff** (ARCHITECTURE §4.3 as written, recorded here because it
+  is a visible product consequence): the vanished subtree's bytes are not
+  counted anywhere in the aggregates. Keeping it a leaf is what makes
+  "directory Agg == Σ children" an exact invariant, which the tree API's size
+  bars depend on; showing the lost subtree as removed rows would be more
+  informative but would give directories their own byte contribution.
+- **`CouldBeSharedEdge` lives in `analyze`, not `domain`**, and carries the
+  matched `ChangesetDigest` alongside `leftIndex`/`rightIndex`/`diffIdEqual`
+  (§6.4's wire shape is unchanged; the extra field is for diagnostics and the
+  server DTO simply omits it).
 
 ## Risks
 

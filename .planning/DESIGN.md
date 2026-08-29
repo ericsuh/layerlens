@@ -158,8 +158,10 @@ recoverable": via title-tooltip, popover, or copy affordance.
 | Tooltips/popovers themselves | max-width 480px, wrap, internal scroll beyond 40vh | |
 
 Human-readable sizes: binary units, one decimal below 100, none at ≥100
-(`14.3 MiB`, `999 KiB`, `1.02 GiB`); `0 B` for zero; deltas always signed
-(`+14.3 MiB`, `−2.1 MiB`).
+(`14.3 MiB`, `999 KiB`, `1.0 GiB`); raw bytes are always whole (`1023 B`);
+`0 B` for zero; deltas always signed (`+14.3 MiB`, `−2.1 MiB`). Rounding
+carries into the next unit, so `1024` of any unit is never rendered:
+1,048,575 B is `1.0 MiB`, not `1024 KiB`.
 
 ---
 
