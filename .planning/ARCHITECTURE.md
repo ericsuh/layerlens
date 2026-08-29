@@ -70,10 +70,15 @@ trees, diffs, aggregates — are computed from these indexes.
 
 ### 1.2 Request lifecycle for the golden workflow
 
-1. **Startup**: binary takes `flock` on the cache root, loads vendored OCI-layout
-   fixtures (`example:v1`, `example:v2`) from the fixtures directory, ingests any
-   whose layers are not yet indexed (marked *pinned* — never LRU-evicted). Startup
-   succeeds with zero network.
+1. **Startup**: binary takes `flock` on the cache root, then loads the vendored
+   OCI-layout fixtures (`example:v1`, `example:v2`, …) from the fixtures
+   directory, ingesting any whose layers are not yet indexed (marked *pinned* —
+   never LRU-evicted). Startup succeeds with zero network. *Discovery* of the
+   layout directories is synchronous, so "is there anything to load?" is settled
+   before the listener opens; the *analysis* runs in the background and
+   `/healthz` answers 503 `loading` until it finishes, so a cold cache never
+   delays binding the port. A missing or empty fixtures directory is a warning,
+   not a startup failure.
 2. `GET /api/v1/images` → SPA renders the cached-image picker; user selects
    `example:v1` (left) and `example:v2` (right); SPA navigates to
    `/compare?left=<idA>&right=<idB>`.
@@ -110,8 +115,13 @@ trees, diffs, aggregates — are computed from these indexes.
   the exact commands (per RESEARCH Q1, deploy is built, not run).
 - Exactly one server process per cache root, enforced by an exclusive advisory
   `flock` on `<root>/lock` at startup (fail fast with a clear error).
-- `GET /healthz` returns 200 once fixtures are loaded (used by Playwright
-  `webServer` and systemd `ExecStartPost` checks).
+- `GET /healthz` returns 200 `ok` once fixtures are loaded, and 503 `loading`
+  before that (used by Playwright `webServer` and systemd `ExecStartPost`
+  checks). Both bodies are `text/plain`.
+- `--fixtures-dir` is scanned one level deep for directories containing an
+  `oci-layout` file (the §9.2 "one layout per pair" convention); the directory
+  itself counts if it is a layout. Deeper recursion would turn a mistyped path
+  into a filesystem crawl.
 
 ---
 
@@ -652,9 +662,10 @@ fail fast on truncation.
 
 **Atomic write discipline**: every file is written to
 `staging/<pullID>/<final-name>.tmp`, fsync'd, then `os.Rename`'d into place
-(same filesystem ⇒ atomic); the layer *directory* is committed by writing
-`index.jsonl.zst` first and `layer.json` last — a layer dir without `layer.json`
-is garbage and is swept at startup. The image record is renamed into `images/`
+(same filesystem ⇒ atomic, and the destination directory is fsync'd after the
+rename); the layer *directory* is committed by writing `index.jsonl.zst` first
+and `layer.json` last — a layer dir without `layer.json` is garbage and is swept
+at startup. A `lastUsedAt` rewrite uses the same staging + rename path. The image record is renamed into `images/`
 only after all its layer dirs are committed, so a visible `ImageRecord` always
 has all its layers. Digest-derived path components are validated
 (`^[a-f0-9]{64}$`) before any `filepath.Join` (§7.3).
@@ -685,9 +696,20 @@ concurrent reader sees old-or-new, never torn).
   ingest; with realistic caps this only triggers at the tiny caps tests use —
   a 25 GiB image produces ~15–30 MB of index.)
 - Pinned fixture images are never evicted and never charged as evictable.
-- Eviction is atomic per image from a reader's perspective: the record rename-away
+- Eviction is atomic per image from a reader's perspective: the record removal
   happens before layer deletion, and an in-memory comparison already assembled is
-  unaffected (it holds no file handles).
+  unaffected (it holds no file handles). A layer directory is *renamed out* of
+  the layer store before it is deleted, so a reader that resolved its path a
+  moment earlier sees the whole directory vanish at once rather than finding it
+  with files missing — old-or-gone, never torn.
+- A layer whose index a still-open ingest has committed but no image record yet
+  names is held against eviction for the lifetime of that transaction; without
+  that it would look like garbage in exactly the window an ingest needs it.
+- The cap check runs *after* the staged index has been written, because a
+  compressed index size is not knowable up front (see the `cache_full` bullet
+  above). The transient overshoot is therefore bounded by one layer index, and
+  the refusal test runs before any eviction, so an image that cannot fit never
+  costs anything already cached.
 
 ---
 
@@ -872,9 +894,13 @@ interface TreeSideMeta {
 interface TreeAgg {          // for files this is degenerate (own size / count 1)
   leftBytes: number;  rightBytes: number;   // subtree regular-file bytes per side
   leftFiles: number;  rightFiles: number;   // subtree regular-file counts per side
-  addedBytes: number; removedBytes: number;
-  modifiedBytesLeft: number; modifiedBytesRight: number;
-  addedFiles: number; removedFiles: number; modifiedFiles: number;
+  // The seven change breakdowns are OMITTED WHEN ZERO; absent means 0. In an
+  // unchanged subtree — most rows in any real image — they are ~130 bytes of
+  // `":0,"` per row, a third of the row and the difference between the payload
+  // bound below holding and not.
+  addedBytes?: number; removedBytes?: number;
+  modifiedBytesLeft?: number; modifiedBytesRight?: number;
+  addedFiles?: number; removedFiles?: number; modifiedFiles?: number;
   // deltas are derivable (rightBytes - leftBytes etc.) — not duplicated on the wire
 }
 
@@ -912,10 +938,15 @@ Contract details:
   **≤ ~70 KB**; a deliberately wide directory (10 000 children) is 50 pages, each
   the same bounded size — the client's virtualized list appends pages as the
   user scrolls.
-- Cursor is opaque (base64 of `{section: "dir"|"file", lastName}`), valid only
-  for the same `(left,right,leftLayers,rightLayers,path,filter)` tuple; a stale
-  cursor after eviction/reassembly returns `bad_request` and the client refetches
-  from page 1 (results are deterministic, so this is loss-free).
+- Cursor is opaque (base64 of `{section: "dir"|"file", lastName}` plus a
+  fingerprint of the query), valid only for the same
+  `(left,right,leftLayers,rightLayers,path,filter)` tuple; a stale cursor after
+  eviction/reassembly returns `bad_request` and the client refetches from page 1
+  (results are deterministic, so this is loss-free).
+- A `path` that is well formed but names nothing in this comparison is also
+  `bad_request`, not 404: both images exist, the parameter simply does not
+  describe anything in them. 404 `image_not_found` is reserved for an image id
+  that is unknown or has been evicted.
 - The first request for a pair+selection assembles the comparison (may take
   ~1–10 s for huge images); subsequent requests hit the in-memory comparison LRU.
   Assembly is single-flighted per key so concurrent expands don't duplicate work.

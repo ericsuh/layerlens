@@ -3,7 +3,7 @@
 package server
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,8 +12,8 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/ericsuh/layerlens/internal/domain"
 	"github.com/ericsuh/layerlens/internal/webui"
 )
 
@@ -25,68 +25,58 @@ const APIPrefix = "/api/v1"
 // reserved, and all of them answer with the JSON envelope.
 const apiNamespace = "/api"
 
-// maxReflectedPathBytes caps how much of an attacker-controlled request path
-// is echoed back in an error envelope or written to the access log. A 60 KB
-// URL should not become a 60 KB response body or a 60 KB log line.
-const maxReflectedPathBytes = 256
-
-// Error codes returned in the API error envelope (ARCHITECTURE §6.1). Later
-// phases add handlers that use the codes their endpoints can produce.
-const (
-	CodeInvalidReference   = "invalid_reference"
-	CodeRegistryNotAllowed = "registry_not_allowed"
-	CodeImageNotFound      = "image_not_found"
-	CodePullUpstreamDenied = "pull_upstream_denied"
-	CodeDockerUnavailable  = "docker_unavailable"
-	CodeCacheFull          = "cache_full"
-	CodePullConflict       = "pull_conflict"
-	CodeBadRequest         = "bad_request"
-	CodeInternal           = "internal"
-	// CodeNotFound covers an unrouted path inside the reserved /api namespace.
-	CodeNotFound = "not_found"
-	// CodeMethodNotAllowed covers a known path reached with the wrong method.
-	CodeMethodNotAllowed = "method_not_allowed"
-)
-
-// ErrorBody is the payload of an APIError.
-type ErrorBody struct {
-	Code    string         `json:"code"`
-	Message string         `json:"message"`
-	Details map[string]any `json:"details,omitempty"`
+// CacheStats is the slice of the cache store /api/v1/meta reports on.
+type CacheStats interface {
+	UsedBytes() int64
+	MaxBytes() int64
 }
 
-// APIError is the envelope returned with every non-2xx API response.
-type APIError struct {
-	Error ErrorBody `json:"error"`
-}
-
-// WriteError writes an API error envelope with the given HTTP status.
-func WriteError(w http.ResponseWriter, status int, code, message string, details map[string]any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	payload := APIError{Error: ErrorBody{Code: code, Message: message, Details: details}}
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		slog.Error("write error envelope", "err", err)
-	}
-}
-
-// Options configures a Server. Fields that later phases populate (cache store,
-// ingester) are added as those phases land.
+// Options configures a Server. The ingest-side options (pull manager, docker
+// client) arrive with the phase that adds those endpoints.
 type Options struct {
 	// Logger receives server-side diagnostics. Defaults to slog.Default().
 	Logger *slog.Logger
 	// UI serves the single-page application. Defaults to the SPA embedded in
 	// the binary; tests substitute an in-memory asset tree.
 	UI http.Handler
+	// Images lists and fetches analyzed images. Defaults to an empty store,
+	// so a server built without one answers "no images" rather than panicking.
+	Images domain.ImageStore
+	// Layers yields per-layer changesets for tree assembly. Defaults to an
+	// empty source.
+	Layers domain.LayerIndexSource
+	// Cache backs /api/v1/meta. Optional.
+	Cache CacheStats
+	// Ready gates /healthz. It reports false until the vendored fixtures
+	// have been ingested (ARCHITECTURE §1.3). Nil means "always ready".
+	Ready func() bool
+	// Version is reported by /api/v1/meta.
+	Version string
+	// AllowedRegistries is reported by /api/v1/meta so the UI can name the
+	// registries a pull may target without hardcoding the list.
+	AllowedRegistries []string
+	// ComparisonCacheSize caps the in-memory assembled-comparison LRU.
+	// Defaults to DefaultComparisonCacheSize (§4.6).
+	ComparisonCacheSize int
+	// onComparisonAssembled is a test hook counting real assemblies, which
+	// is how the single-flight property is asserted without timing.
+	onComparisonAssembled func()
 }
 
 // Server is the root http.Handler for the application.
 type Server struct {
-	log     *slog.Logger
-	ui      http.Handler
-	mux     *http.ServeMux
-	apiMux  *http.ServeMux
-	handler http.Handler
+	log         *slog.Logger
+	ui          http.Handler
+	mux         *http.ServeMux
+	apiMux      *http.ServeMux
+	handler     http.Handler
+	images      domain.ImageStore
+	layers      domain.LayerIndexSource
+	cache       CacheStats
+	ready       func() bool
+	version     string
+	allowed     []string
+	comparisons *comparisonCache
 }
 
 // New builds the routing tree: /healthz, the reserved /api namespace, and the
@@ -101,7 +91,31 @@ func New(opts Options) *Server {
 	if ui == nil {
 		ui = webui.Handler()
 	}
-	s := &Server{log: log, ui: ui, mux: http.NewServeMux(), apiMux: http.NewServeMux()}
+	images := opts.Images
+	if images == nil {
+		images = emptyStore{}
+	}
+	layers := opts.Layers
+	if layers == nil {
+		layers = emptyStore{}
+	}
+	size := opts.ComparisonCacheSize
+	if size <= 0 {
+		size = DefaultComparisonCacheSize
+	}
+	s := &Server{
+		log:         log,
+		ui:          ui,
+		mux:         http.NewServeMux(),
+		apiMux:      http.NewServeMux(),
+		images:      images,
+		layers:      layers,
+		cache:       opts.Cache,
+		ready:       opts.Ready,
+		version:     opts.Version,
+		allowed:     opts.AllowedRegistries,
+		comparisons: newComparisonCache(size, opts.onComparisonAssembled),
+	}
 	s.routes()
 	// Outermost first: headers are set before any handler can write, the
 	// access log wraps the recovered status, and recovery sits closest to the
@@ -120,10 +134,25 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz/{rest...}", s.handleHealthzNotFound)
 	s.mux.Handle("/", s.ui)
 
-	// The API mux holds only the catch-all in phase 001. Later phases register
-	// exact patterns on it; they must not register trailing-slash subtree
-	// patterns, which would make ServeMux emit an HTML redirect for the
-	// slash-less form and break §6.1's "never HTML under /api" promise.
+	// Exact patterns only: a trailing-slash subtree pattern would make
+	// ServeMux emit an HTML redirect for the slash-less form and break
+	// §6.1's "never HTML under /api" promise. Each route is registered
+	// twice — once for GET, once method-less — so a wrong method gets the
+	// JSON 405 envelope with an Allow header instead of ServeMux's own
+	// plain-text 405.
+	for _, route := range []struct {
+		pattern string
+		handler http.HandlerFunc
+	}{
+		{APIPrefix + "/images", s.handleImages},
+		{APIPrefix + "/images/{id}", s.handleImage},
+		{APIPrefix + "/diff/layers", s.handleDiffLayers},
+		{APIPrefix + "/diff/tree", s.handleDiffTree},
+		{APIPrefix + "/meta", s.handleMeta},
+	} {
+		s.apiMux.HandleFunc("GET "+route.pattern, route.handler)
+		s.apiMux.HandleFunc(route.pattern, methodNotAllowed(http.MethodGet))
+	}
 	s.apiMux.HandleFunc("/", s.handleAPINotFound)
 }
 
@@ -267,49 +296,49 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 	})
 }
 
-// handleHealthz reports process readiness. From phase 005 it also gates on
-// fixture ingestion having completed.
+// handleHealthz reports process readiness, gated on fixture ingestion having
+// completed (ARCHITECTURE §1.3).
+//
+// The gate is what lets a supervisor, an e2e harness or a load balancer wait
+// for a server that is *useful* rather than merely listening: until the
+// vendored demo images are analyzed, /api/v1/images would answer an empty list
+// and the golden workflow would look broken.
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if s.ready != nil && !s.ready() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, err := w.Write([]byte("loading")); err != nil {
+			s.log.Debug("write healthz response", "err", err)
+		}
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte("ok")); err != nil {
 		s.log.Debug("write healthz response", "err", err)
 	}
 }
 
+// emptyStore stands in for an unconfigured cache so that a Server built
+// without one (unit tests of the routing tree, for instance) answers honestly
+// instead of panicking.
+type emptyStore struct{}
+
+func (emptyStore) Images(context.Context) ([]domain.ImageRecord, error) {
+	return nil, nil
+}
+
+func (emptyStore) Image(_ context.Context, id domain.Digest) (*domain.ImageRecord, error) {
+	return nil, fmt.Errorf("%w: image %s", domain.ErrNotFound, id)
+}
+
+func (emptyStore) Touch(context.Context, domain.Digest) error { return nil }
+
+func (emptyStore) LayerIndex(_ context.Context, diffID domain.Digest) (*domain.LayerIndex, error) {
+	return nil, fmt.Errorf("%w: %s", domain.ErrNotIndexed, diffID)
+}
+
 // handleHealthzNotFound answers /healthz/<anything>. Plain text, to match the
 // plain-text /healthz it shadows.
 func (s *Server) handleHealthzNotFound(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, "not found", http.StatusNotFound)
-}
-
-// methodNotAllowed answers with 405 and an Allow header listing allowed.
-func methodNotAllowed(allowed ...string) http.HandlerFunc {
-	allow := strings.Join(allowed, ", ")
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Allow", allow)
-		WriteError(w, http.StatusMethodNotAllowed, CodeMethodNotAllowed,
-			fmt.Sprintf("method %s is not allowed for %s", r.Method,
-				truncateForReflection(r.URL.Path)), nil)
-	}
-}
-
-func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
-	WriteError(w, http.StatusNotFound, CodeNotFound, "no such API endpoint", map[string]any{
-		"path": truncateForReflection(r.URL.Path),
-	})
-}
-
-// truncateForReflection bounds a string that came from the request before it
-// is echoed into a response body or a log line, cutting on a rune boundary so
-// the result is still valid UTF-8.
-func truncateForReflection(s string) string {
-	if len(s) <= maxReflectedPathBytes {
-		return s
-	}
-	cut := s[:maxReflectedPathBytes]
-	for len(cut) > 0 && !utf8.ValidString(cut) {
-		cut = cut[:len(cut)-1]
-	}
-	return cut + "…"
 }

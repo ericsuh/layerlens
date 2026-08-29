@@ -613,6 +613,76 @@ Applied from `REVIEW-phase-001.md` after phase 002 landed.
   what the property tests assert against. `buildLayer` errors instead
   (`TestDuplicateMembersAreRejected`).
 
+### Phase 005 (cache store, fixture ingestion & analysis API), 2026-08-29
+
+- **ARCHITECTURE §6.5 — the seven `TreeAgg` change breakdowns are optional on
+  the wire** (file updated; TS fields are now `addedBytes?` etc., absent means
+  zero). `leftBytes`/`rightBytes`/`leftFiles`/`rightFiles` are always present
+  because every row renders them. The four absolute plus eleven total fields
+  emitted unconditionally made a row ~418 B of JSON, so the default page
+  (`limit=200, depth=1`) over the `wide` fixture was 84 KB — over §6.5's own
+  "~70 KB" bound and over its "a row is ~250–350 bytes" estimate. In an
+  unchanged subtree, which is most rows in any real image, those seven fields
+  are ~130 B of `":0,"`. Omitting them brings the row to ~288 B and the default
+  page to 58 KB, measured by `TestTreeDefaultPageIsBounded`. Phase 007 must
+  therefore treat them as optional numbers defaulting to 0.
+- **ARCHITECTURE §6.5 — a well-formed `path` that names nothing in the
+  comparison is `bad_request`, not 404** (file updated). §6.5 listed only
+  `400 bad_request | 404 image_not_found`; both images exist in this case, so
+  `image_not_found` would be a lie, and inventing a `path_not_found` code for a
+  parameter validation failure buys nothing. 404 stays reserved for an unknown
+  or evicted image id.
+- **ARCHITECTURE §1.2/§1.3 — fixture *discovery* is synchronous, fixture
+  *analysis* is not** (file updated). Loading fixtures before binding the port
+  would delay startup by the whole cold-cache ingest; loading them entirely in
+  the background would make `/healthz` racy for a deployment that has no
+  fixtures at all. Discovery (a `stat` per subdirectory) therefore runs before
+  the listener opens and settles readiness immediately when there is nothing to
+  load; the analysis runs in a goroutine and `/healthz` answers
+  `503 loading` until it completes. A missing or empty `--fixtures-dir` is a
+  warning: the fixtures are a demo convenience, and refusing to start without
+  them would make the binary useless anywhere they are not deployed. A fixture
+  load that *fails* also marks the server ready — an operator needs the API and
+  the error message more than they need a process that refuses to answer.
+- **ARCHITECTURE §5 — the cap check runs after the staged index is written**
+  (file updated). §5 already says the check is enforced during ingest because
+  index size is unknowable up front; the consequence worth writing down is that
+  the accounting can transiently exceed the cap by at most one layer index. The
+  *refusal* test still runs before any eviction, which is what makes RESEARCH
+  Q7's "refuse rather than thrash-evict" structural rather than incidental.
+- **ARCHITECTURE §5 — an evicted layer directory is renamed out of the layer
+  store before being deleted, and in-flight transactions pin their layers**
+  (file updated). Deleting a directory in place lets a racing reader open it
+  between the two file removals and see an index without its sidecar; the
+  rename makes the whole directory disappear in one step, which is what §5's
+  "old-or-gone, never torn" actually requires. Separately, a layer an open
+  ingest has committed is referenced by no image record yet, so the refcount
+  had to include open transactions or the evictor would delete it in exactly
+  the window the ingest needs it.
+- **The comparison LRU's single flight is hand-rolled, not
+  `golang.org/x/sync/singleflight`.** It is ~40 lines shared with the LRU's own
+  lock, it lets a waiter abandon its wait on request cancellation while the
+  leader keeps working for the others, and it keeps `x/sync` an indirect
+  dependency. The test hook that counts real assemblies
+  (`server.WithAssemblyCounter`, `export_test.go`) is what makes
+  "N concurrent identical requests do one unit of work" assertable as a fact
+  about work done rather than a guess about timing.
+- **`go-containerregistry` is now a direct non-test dependency.** Phase 004
+  added it as a test-only checker; `internal/ingest` uses `pkg/v1/layout` to
+  read the vendored fixture layouts, per ARCHITECTURE §2's rule that only
+  `ingest` and `imgref` may import it. No gcr type escapes the package: the
+  layout reader returns domain-typed records, and `v1.Image` appears only as an
+  argument handed straight back into `Ingest`.
+- **`internal/server/errors.go` split out of `server.go`** (phase file's
+  requested layout). The §6.1 code table, envelope and `WriteError` moved
+  verbatim; the new helpers (`badRequest`, `imageNotFound`, `writeStoreError`,
+  `writeJSON`) are the only additions, and there is still exactly one error
+  mechanism.
+- **`cache_full` maps to HTTP 507** as §6.1's table says; the store's
+  `ErrCacheFull` is what carries it up from `internal/cachestore` through
+  `internal/ingest`. Phase 008's pull endpoints reuse the same error, unchanged.
+
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.

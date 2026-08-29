@@ -17,9 +17,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ericsuh/layerlens/internal/cachestore"
+	"github.com/ericsuh/layerlens/internal/ingest"
 	"github.com/ericsuh/layerlens/internal/server"
 	"github.com/ericsuh/layerlens/internal/webui"
 )
+
+// version is reported by GET /api/v1/meta. It is a build-time constant rather
+// than something derived at runtime so that a binary always reports what it
+// actually is.
+const version = "0.5.0"
 
 const (
 	defaultListen        = ":8080"
@@ -138,28 +145,97 @@ func main() {
 	}
 }
 
-// run builds the HTTP handler and serves it until ctx is cancelled.
+// run opens the durable cache, starts the fixture load, and serves until ctx
+// is cancelled.
+//
+// The lifecycle is ARCHITECTURE §1.2: take the cache lock, load the vendored
+// OCI-layout fixtures, then serve — with zero network involved. Fixture
+// analysis runs in the background so a cold cache does not delay the listener,
+// and /healthz reports "loading" until it finishes, which is what a supervisor
+// or an e2e harness waits on.
 func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr)) error {
-	handler, err := buildHandler(cfg, log)
+	if cfg.uiDir != "" {
+		// Checked before anything is opened: a typo here would
+		// otherwise surface as every route answering 500 "SPA assets
+		// are not built", after the cache lock had been taken.
+		if err := checkUIDir(cfg.uiDir); err != nil {
+			return err
+		}
+	}
+
+	store, err := cachestore.Open(cachestore.Options{
+		Root:     cfg.dataDir,
+		MaxBytes: cfg.cacheMaxBytes,
+		Logger:   log,
+	})
 	if err != nil {
 		return err
 	}
-	return serve(ctx, cfg, log, handler, ready)
-}
-
-// buildHandler assembles the root handler from cfg.
-func buildHandler(cfg *config, log *slog.Logger) (http.Handler, error) {
-	opts := server.Options{Logger: log}
-	if cfg.uiDir != "" {
-		// Fail fast: a typo here would otherwise surface as every route
-		// answering 500 "SPA assets are not built".
-		if err := checkUIDir(cfg.uiDir); err != nil {
-			return nil, err
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Error("release cache lock", "err", err)
 		}
+	}()
+	log.Info("cache opened", "data-dir", store.Root(),
+		"usedBytes", store.UsedBytes(), "maxBytes", store.MaxBytes())
+
+	ingester := ingest.New(store, ingest.Options{Logger: log})
+	loaded := startFixtureLoad(ctx, cfg, log, ingester)
+
+	opts := server.Options{
+		Logger:  log,
+		Images:  store,
+		Layers:  store,
+		Cache:   store,
+		Version: version,
+		Ready: func() bool {
+			select {
+			case <-loaded:
+				return true
+			default:
+				return false
+			}
+		},
+	}
+	if cfg.uiDir != "" {
 		log.Warn("serving SPA assets from disk instead of the embedded bundle", "ui-dir", cfg.uiDir)
 		opts.UI = webui.HandlerFS(os.DirFS(cfg.uiDir))
 	}
-	return server.New(opts), nil
+	return serve(ctx, cfg, log, server.New(opts), ready)
+}
+
+// startFixtureLoad kicks off the vendored-fixture ingest and returns a channel
+// closed once the server is ready to answer /healthz with "ok".
+//
+// Discovery is synchronous and analysis is not: whether there is anything to
+// load is answered before the listener opens (so a deployment with no fixtures
+// is ready immediately and cannot report a spurious "loading"), while the
+// analysis itself — the part that is slow on a cold cache — happens in the
+// background.
+func startFixtureLoad(ctx context.Context, cfg *config, log *slog.Logger, ingester *ingest.Ingester) <-chan struct{} {
+	done := make(chan struct{})
+	layouts, err := ingest.DiscoverLayouts(cfg.fixturesDir)
+	if err != nil || len(layouts) == 0 {
+		// A missing or empty fixtures directory is a warning, not a
+		// failure: the fixtures are a demo convenience, and refusing to
+		// start without them would make the binary useless anywhere
+		// they are not deployed.
+		log.Warn("no demo fixtures loaded", "fixtures-dir", cfg.fixturesDir, "err", err)
+		close(done)
+		return done
+	}
+
+	log.Info("loading demo fixtures", "fixtures-dir", cfg.fixturesDir, "layouts", len(layouts))
+	go func() {
+		defer close(done)
+		if _, err := ingester.LoadFixtures(ctx, cfg.fixturesDir); err != nil {
+			// Still marked ready: an operator needs the API and the
+			// error message far more than they need a process that
+			// refuses to answer.
+			log.Error("loading demo fixtures failed", "err", err)
+		}
+	}()
+	return done
 }
 
 // serve starts the HTTP server and blocks until ctx is cancelled, then drains

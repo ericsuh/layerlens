@@ -493,6 +493,13 @@ func TestIndexLayerStreamsWithoutBuffering(t *testing.T) {
 	if testing.Short() {
 		t.Skip("streams 1 GiB of synthetic tar")
 	}
+	if raceEnabled {
+		// The race detector's per-allocation bookkeeping inflates both counters
+		// far past the budgets below, so the assertions would report a buffering
+		// regression that is not there. Skipping keeps `go test -race ./...`
+		// green without weakening the budget for normal runs.
+		t.Skip("allocation budget is not meaningful under the race detector")
+	}
 	// Deliberately not parallel: the allocation assertion below measures a
 	// process-wide counter.
 

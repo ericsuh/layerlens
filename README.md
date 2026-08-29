@@ -42,6 +42,80 @@ namespace, and the SPA (with fallback for client-side routes) from one process.
 writes it. `mise run dev` builds into `.dev-dist` instead, so a dev session can
 never leave an unminified bundle behind for the next `mise run build` to embed.
 
+## HTTP API
+
+Everything under `/api/v1` answers JSON, including its failures: an error is
+always `{"error":{"code","message","details?"}}` with a stable machine-readable
+code, and the reserved `/api` namespace never falls through to the SPA shell.
+
+| Endpoint | What it returns |
+|---|---|
+| `GET /healthz` | `ok` once the fixtures are analyzed; `503 loading` before that |
+| `GET /api/v1/images` | Every analyzed image: refs, source, layer count, size, pinned |
+| `GET /api/v1/images/{id}` | One image plus its layers (DiffID, ChainID, instruction, size) |
+| `GET /api/v1/diff/layers?left=&right=` | The layer graph: shared trunk, both branches, could-be-shared edges |
+| `GET /api/v1/diff/tree?left=&right=&leftLayers=&rightLayers=&path=` | One directory of the unified diff tree, server-aggregated and paginated |
+| `GET /api/v1/meta` | Version and cache usage against `--cache-max-bytes` |
+
+`id` is always the image's config digest (`sha256:…`), which is what `left`,
+`right` and the `/images/{id}` path all take. `leftLayers`/`rightLayers` are
+**counts**, not indexes: `6` means "the filesystem after layer 6", and `0` is
+the empty filesystem before any layer.
+
+The tree endpoint expands one directory at a time and never serializes a whole
+tree: `depth` (1 or 2), `limit` (≤ 1000) and an opaque `cursor` bound the
+payload, and `filter=changed` prunes unchanged subtrees. Every row carries both
+sides' subtree byte totals and file counts, so the client formats and never
+computes. A cursor is valid only for the exact query that issued it; anything
+else is `bad_request` and the client refetches from page 1.
+
+### The golden workflow, by hand
+
+With no network and no Docker:
+
+```sh
+./bin/layerlens --listen 127.0.0.1:8080 --data-dir ./.dev-data --fixtures-dir fixtures &
+curl -s localhost:8080/healthz                       # -> ok
+
+# The two demo images, by tag
+L=$(curl -s localhost:8080/api/v1/images | jq -r '.images[]|select(.refNames[0]=="example:v1").id')
+R=$(curl -s localhost:8080/api/v1/images | jq -r '.images[]|select(.refNames[0]=="example:v2").id')
+
+# Layer graph: 5 shared layers, then a fork, and two dotted edges
+curl -s "localhost:8080/api/v1/diff/layers?left=$L&right=$R" | jq '{trunkLength, couldBeShared}'
+# -> trunkLength 5; edge 6<->6 diffIdEqual:false (same files, different mtimes)
+#                   edge 7<->7 diffIdEqual:true  (byte-identical tar)
+
+# Filesystem diff at the fork: the .dockerignore mistake
+curl -s "localhost:8080/api/v1/diff/tree?left=$L&right=$R&leftLayers=6&rightLayers=6&path=/app&filter=changed" \
+  | jq '.rows[]|{name,status}'
+# -> .git added, src modified, .env added, debug.log added, main.js modified
+```
+
+`cmd/layerlens/e2e_test.go` runs exactly this sequence against a real listener.
+
+## Analysis cache
+
+`--data-dir` holds one metadata index per layer, keyed by DiffID, plus one
+record per analyzed image. Layer blobs and extracted filesystems are never
+stored: a layer is streamed once, hashed, and reduced to its changeset, so the
+ten demo images cost ~190 KB on disk.
+
+- **Content-addressed.** Two images sharing a base share its indexes, and
+  analyzing the second one skips those layers without reading a byte.
+- **Crash-safe.** Files are staged, fsync'd and renamed into place; a layer
+  directory is committed index-first and sidecar-last, and an image record only
+  after all of its layers. Whatever a crash leaves behind is swept at the next
+  start.
+- **Single-writer.** An exclusive `flock` on the data directory is taken at
+  startup and held for the process lifetime; a second server on the same
+  directory fails immediately with a clear message.
+- **Bounded.** `--cache-max-bytes` (default 50 GiB) caps it. Over the cap,
+  un-pinned images are evicted least-recently-used first; an image that cannot
+  fit even with everything evictable gone is refused with `cache_full` rather
+  than thrash-evicting the cache on its behalf. The vendored fixtures are
+  pinned and never evicted.
+
 ## Demo fixtures
 
 `fixtures/` holds five vendored OCI image layouts — one directory per
