@@ -138,6 +138,13 @@ func (s *Server) writePullStartError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, ingest.ErrDockerUnavailable):
 		WriteError(w, http.StatusServiceUnavailable, CodeDockerUnavailable,
 			"No Docker daemon is reachable on this server.", nil)
+	case errors.Is(err, ingest.ErrTooManyPulls):
+		// 429 rather than 503: the server is healthy and the client's
+		// request is well-formed — there is simply a limit on how many
+		// pulls run at once, and retrying after one finishes will work.
+		WriteError(w, http.StatusTooManyRequests, CodeTooManyPulls,
+			"This server is already running as many pulls as it will run at once. "+
+				"Wait for one to finish and try again.", nil)
 	case errors.Is(err, cachestore.ErrCacheFull):
 		WriteError(w, http.StatusInsufficientStorage, CodeCacheFull, err.Error(), nil)
 	default:

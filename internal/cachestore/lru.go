@@ -50,6 +50,28 @@ func (s *Store) reserve(t *Txn, n int64) error {
 	return nil
 }
 
+// reserveCeiling is the most t could ever be allowed to reserve: the cap minus
+// what pinning has made unreclaimable, minus what this transaction already
+// holds. It is the same quantity reserve's refusal test uses, read ahead of
+// time so a staged write can be aborted the moment it passes it instead of
+// being written in full and then refused.
+//
+// It is an upper bound, not a promise: reserve still runs afterwards and is
+// still the authority. A write that exceeds this would have been refused
+// there, so stopping it early can only turn a slow refusal into a fast one.
+func (s *Store) reserveCeiling(t *Txn) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ceiling := s.max - s.pinnedBytesLocked()
+	if t != nil {
+		ceiling -= t.ownBytes
+	}
+	if ceiling < 0 {
+		return 0
+	}
+	return ceiling
+}
+
 // release gives back bytes reserved for a write that then failed.
 func (s *Store) release(t *Txn, n int64) {
 	if n <= 0 {

@@ -54,6 +54,30 @@ const copyBufferSize = 128 << 10
 // must stay proportional to entry count, never to attacker-chosen input.
 const maxWarnings = 64
 
+// DefaultMaxEntries caps how many distinct paths one layer may contribute to
+// its index.
+//
+// Entry *count* is the one input to this package that is chosen entirely by
+// whoever built the image, and it is the one the streaming design does not
+// bound on its own: content is hashed as it flows past and never held, but one
+// map entry per path is retained by construction. An empty tar member costs
+// 512 bytes on the wire and compresses to a handful, while the Entry it
+// produces costs ~640 bytes of heap once the map, the strings and the sorted
+// output slice are counted — a ~130:1 amplification an attacker can aim at the
+// server with a single push to any allowlisted registry.
+//
+// The number is four times ARCHITECTURE §4.6's 500k-file design envelope for a
+// whole *image*, so no image anyone means to analyze can reach it, and it puts
+// a stated ceiling (~1.3 GB for one pathological layer) where there was none.
+// Together with the concurrent-pull cap in internal/ingest, that is what makes
+// the §4.6 memory ceiling a property of the code rather than of the input.
+const DefaultMaxEntries = 2_000_000
+
+// ErrTooManyEntries reports a layer with more entries than the cap allows. It
+// is the per-layer sibling of ingest.ErrTooManyLayers: a bound on work, not a
+// statement about the blob being malformed.
+var ErrTooManyEntries = errors.New("analyze: layer has too many entries")
+
 // ErrDiffIDMismatch reports that the uncompressed layer stream did not hash to
 // the DiffID the image config declared: the blob is corrupt or tampered with.
 var ErrDiffIDMismatch = errors.New("layer diff_id mismatch")
@@ -100,6 +124,11 @@ type LayerSource struct {
 	DiffID domain.Digest
 	// Progress, if non-nil, accumulates compressed bytes as they are read.
 	Progress *ByteCounter
+	// MaxEntries caps the distinct paths this layer may contribute. Zero
+	// means DefaultMaxEntries; a negative value means no cap, which only
+	// fixture generation ever asks for. Injectable so a test can prove the
+	// refusal with a handful of entries instead of two million.
+	MaxEntries int
 }
 
 // IndexLayer streams a layer blob once and returns its complete changeset.
@@ -140,10 +169,15 @@ func IndexLayer(ctx context.Context, src LayerSource) (*domain.LayerIndex, error
 	diffHash := sha256.New()
 	tee := io.TeeReader(uncompressed, diffHash)
 
+	maxEntries := src.MaxEntries
+	if maxEntries == 0 {
+		maxEntries = DefaultMaxEntries
+	}
 	idx := indexState{
-		entries: make(map[string]domain.Entry),
-		markers: make(map[markerKey]domain.Entry),
-		buf:     make([]byte, copyBufferSize),
+		entries:    make(map[string]domain.Entry),
+		markers:    make(map[markerKey]domain.Entry),
+		buf:        make([]byte, copyBufferSize),
+		maxEntries: maxEntries,
 	}
 	tr := tar.NewReader(tee)
 	for {
@@ -190,11 +224,26 @@ type indexState struct {
 	// both too. Keeping markers separate is what lets squashing apply the
 	// deletion to the lower state and still land this layer's own entry
 	// (ARCHITECTURE §4.2).
-	markers      map[markerKey]domain.Entry
-	buf          []byte
+	markers map[markerKey]domain.Entry
+	buf     []byte
+	// maxEntries is the cap on entries+markers; <= 0 means unbounded.
+	maxEntries   int
 	warnings     []string
 	suppressed   int
 	contentBytes int64
+}
+
+// reserveEntry accounts for one *new* key in either keyspace and refuses once
+// the cap is reached. Overwriting an existing path costs nothing, so the check
+// is on distinct paths, which is exactly what the memory is proportional to.
+func (s *indexState) reserveEntry() error {
+	if s.maxEntries <= 0 {
+		return nil
+	}
+	if len(s.entries)+len(s.markers) >= s.maxEntries {
+		return fmt.Errorf("%w: the cap is %d", ErrTooManyEntries, s.maxEntries)
+	}
+	return nil
 }
 
 func (s *indexState) warn(format string, args ...any) {
@@ -214,20 +263,33 @@ type markerKey struct {
 
 // putMarker records a whiteout or opaque marker, which never displaces the
 // filesystem entry for the same path.
-func (s *indexState) putMarker(e domain.Entry) {
-	s.markers[markerKey{path: e.Path, kind: e.Kind}] = e
+func (s *indexState) putMarker(e domain.Entry) error {
+	key := markerKey{path: e.Path, kind: e.Kind}
+	if _, ok := s.markers[key]; !ok {
+		if err := s.reserveEntry(); err != nil {
+			return err
+		}
+	}
+	s.markers[key] = e
+	return nil
 }
 
 // put records an entry, letting a later entry for the same path replace an
 // earlier one (last-in-tar wins).
-func (s *indexState) put(e domain.Entry) {
-	if prev, ok := s.entries[e.Path]; ok && prev.Kind == domain.KindFile {
+func (s *indexState) put(e domain.Entry) error {
+	prev, ok := s.entries[e.Path]
+	if !ok {
+		if err := s.reserveEntry(); err != nil {
+			return err
+		}
+	} else if prev.Kind == domain.KindFile {
 		s.contentBytes -= prev.Size
 	}
 	if e.Kind == domain.KindFile {
 		s.contentBytes += e.Size
 	}
 	s.entries[e.Path] = e
+	return nil
 }
 
 func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
@@ -255,8 +317,7 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 	case base == whiteoutOpaqueDir:
 		// The marker's own path is not a filesystem path: the payload is
 		// the directory it makes opaque.
-		s.putMarker(domain.Entry{Path: dir, Kind: domain.KindOpaque})
-		return nil
+		return s.putMarker(domain.Entry{Path: dir, Kind: domain.KindOpaque})
 	case strings.HasPrefix(base, whiteoutMetaPrefix):
 		// aufs metadata, not a whiteout of anything. Skipped rather
 		// than recorded: a phantom marker would inflate EntryCount and
@@ -274,8 +335,7 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 			s.warn("skipped malformed whiteout entry %q", hdr.Name)
 			return nil
 		}
-		s.putMarker(domain.Entry{Path: path.Join(dir, name), Kind: domain.KindWhiteout})
-		return nil
+		return s.putMarker(domain.Entry{Path: path.Join(dir, name), Kind: domain.KindWhiteout})
 	}
 
 	kind, ok := kindOf(hdr.Typeflag)
@@ -285,6 +345,13 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 	}
 
 	e := entryFrom(hdr, p, kind)
+	// Checked before the body is drained, not after: a refusal must not
+	// cost the hashing pass over a file whose entry is never recorded.
+	if _, ok := s.entries[p]; !ok {
+		if err := s.reserveEntry(); err != nil {
+			return err
+		}
+	}
 	if kind == domain.KindFile {
 		h := sha256.New()
 		// The single most important line in the package: content is
@@ -307,8 +374,7 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 			s.warn("hardlink %q has unsafe target %q", hdr.Name, hdr.Linkname)
 		}
 	}
-	s.put(e)
-	return nil
+	return s.put(e)
 }
 
 func (s *indexState) finish(diffID domain.Digest) *domain.LayerIndex {

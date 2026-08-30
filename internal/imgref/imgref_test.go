@@ -106,9 +106,62 @@ func TestAllowsLabelBoundaries(t *testing.T) {
 		"", ".", "..", "ghcr..io", ".ghcr.io",
 		// A wildcard must consume whole labels, never the empty string.
 		"gcr.io..", "public.ecr.aws.evil.com",
+		// One trailing root dot is a spelling of the same name; two is an
+		// empty label, and normalization must not quietly eat both.
+		"ghcr.io..", "ghcr.io...",
 	}
 	for _, host := range refused {
 		assert.False(t, list.Allows(host), "expected %q to be refused", host)
+	}
+}
+
+// A "." or ".." path segment is refused on the registry path, exactly as it
+// already was on the Docker path. `ghcr.io/../../secret` otherwise produced a
+// literal `GET /v2/../../secret/manifests/v1` and a token scope of
+// `repository:../../secret:pull` — an arbitrary anonymous GET path on a
+// registry the operator vetted for something else.
+func TestParseRefusesTraversalSegments(t *testing.T) {
+	list := imgref.Default()
+	for _, raw := range []string{
+		"ghcr.io/../../secret",
+		"ghcr.io/./secret",
+		"ghcr.io/org/../secret",
+		"ghcr.io//secret",
+		"ghcr.io/org/..",
+		"../../secret",
+		"./alpine",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := list.Parse(raw)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, imgref.ErrInvalidReference)
+		})
+	}
+	// The rule must not cost a legitimate reference whose path merely
+	// contains dots.
+	for _, raw := range []string{"ghcr.io/org/my.img:v1", "ghcr.io/org.name/img"} {
+		_, err := list.Parse(raw)
+		assert.NoError(t, err, raw)
+	}
+}
+
+// A single trailing root dot is the same name to DNS; a second one is an empty
+// label. Parse used to trim one and Allows a second, so "ghcr.io.." was
+// accepted and then carried as the registry "ghcr.io." — a second idempotency
+// key for one image, and a non-canonical TLS ServerName.
+func TestParseNormalizesTrailingDotsExactlyOnce(t *testing.T) {
+	list := imgref.Default()
+
+	ref, err := list.Parse("ghcr.io./o/i")
+	require.NoError(t, err)
+	assert.Equal(t, "ghcr.io", ref.Registry)
+	assert.Equal(t, "ghcr.io/o/i:latest", imgref.Canonical(ref))
+
+	for _, raw := range []string{"ghcr.io../o/i", "ghcr.io.../o/i", "ghcr..io/o/i", ".ghcr.io/o/i"} {
+		t.Run(raw, func(t *testing.T) {
+			_, err := list.Parse(raw)
+			require.Error(t, err, "expected %q to be refused", raw)
+		})
 	}
 }
 

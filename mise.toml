@@ -6,6 +6,7 @@
 go = "1.26"
 node = "22"
 golangci-lint = "2.13.2"
+shellcheck = "0.11.0"
 
 [env]
 # The deploy target is linux/amd64 and the binary must stay statically linked
@@ -42,6 +43,15 @@ depends = ["build-web"]
 dir = "{{config_root}}"
 run = "go build -trimpath -o bin/layerlens ./cmd/layerlens"
 
+[tasks.build-linux]
+description = "Cross-compile the deploy artifact: static linux/amd64 with the SPA embedded"
+depends = ["build-web"]
+dir = "{{config_root}}"
+# CGO_ENABLED=0 comes from [env] and is repeated here on purpose: it is the
+# reason this cross-compiles at all from an arm64 dev host, and a build that
+# quietly picked up a cgo dependency must fail loudly rather than link one in.
+run = "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/layerlens-linux-amd64 ./cmd/layerlens"
+
 [tasks.bundle-size]
 description = "Report the bundled asset sizes from the esbuild metafile"
 depends = ["build-web"]
@@ -74,9 +84,14 @@ depends = ["deps"]
 dir = "{{config_root}}/web"
 run = "npm run --silent lint"
 
+[tasks.lint-sh]
+description = "Run shellcheck over the deploy scripts"
+dir = "{{config_root}}"
+run = "shellcheck --shell=bash --severity=style deploy/deploy.sh"
+
 [tasks.lint]
-description = "Lint both languages"
-depends = ["lint-go", "lint-web"]
+description = "Lint every language in the repo"
+depends = ["lint-go", "lint-web", "lint-sh"]
 run = []
 
 [tasks.typecheck]
@@ -170,3 +185,15 @@ description = "Playwright end-to-end suite against the real binary on fixtures (
 depends = ["build", "deps"]
 dir = "{{config_root}}/web"
 run = "node_modules/.bin/playwright test"
+
+[tasks.deploy]
+description = "Deploy to the linux/amd64 server over SSH (LAYERLENS_DEPLOY_DRY_RUN=1 to rehearse)"
+depends = ["build-linux"]
+dir = "{{config_root}}"
+run = "./deploy/deploy.sh"
+
+[tasks.deploy-dry-run]
+description = "Print the exact deploy command plan without touching the network"
+depends = ["build-linux"]
+dir = "{{config_root}}"
+run = "LAYERLENS_DEPLOY_DRY_RUN=1 ./deploy/deploy.sh"

@@ -2,7 +2,10 @@ package cachestore
 
 import (
 	"context"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -249,4 +252,68 @@ func TestInFlightLayersAreNotEvicted(t *testing.T) {
 
 	assert.True(t, s.HasLayer(first.DiffID), "the in-flight layer must survive the eviction it triggered")
 	require.NoError(t, txn.Abort())
+}
+
+// TestPeakDiskStaysWithinTheCap is M1. --cache-max-bytes bounded what the cache
+// *retained*, not what it ever *touched*: the staged index was written in full
+// and only then measured against the budget, so a 1 MiB cap was observed with
+// 12,104,078 bytes on disk (11.5x) before ErrCacheFull came back. The staged
+// write is now charged against the remaining budget as it streams.
+func TestPeakDiskStaysWithinTheCap(t *testing.T) {
+	const maxBytes = 1 << 20
+	root := t.TempDir()
+	c := newClock()
+	s := openStore(t, root, maxBytes, c)
+
+	// A sampler watches the whole data directory while the doomed put runs.
+	// Peak, not final size, is the quantity that matters: the old code
+	// deleted the oversized staging file on its way out, so the overshoot
+	// was invisible to anything that only looked afterwards.
+	var peak atomic.Int64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if n := treeBytes(root); n > peak.Load() {
+				peak.Store(n)
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+
+	// An index far too large for the cap: ~500k entries compressed.
+	_, err := tryPutImage(s, "toobig:1", false, makeIndex("toobig", 500_000))
+	close(stop)
+	<-done
+
+	require.ErrorIs(t, err, ErrCacheFull)
+	t.Logf("cap %d bytes; peak on disk %d bytes (%.2fx)", maxBytes, peak.Load(), float64(peak.Load())/float64(maxBytes))
+	assert.LessOrEqual(t, peak.Load(), int64(maxBytes+(64<<10)),
+		"peak on-disk bytes (%d) must stay within a small constant of the %d byte cap", peak.Load(), maxBytes)
+	assert.Zero(t, s.UsedBytes())
+
+	// And the refusal left nothing behind.
+	staging, err := os.ReadDir(s.stagingRoot())
+	require.NoError(t, err)
+	assert.Empty(t, staging)
+}
+
+// treeBytes is the on-disk size of everything under root, recursively.
+func treeBytes(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil //nolint:nilerr // a file that vanished mid-walk is a rename, not a failure
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
 }

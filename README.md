@@ -12,11 +12,11 @@ All project/agent planning files are in [.planning/](.planning/).
 ## Development
 
 Toolchain and tasks are managed by [mise](https://mise.jdx.dev). Pinned tools
-(Go, Node, golangci-lint) come from `mise.toml`; SPA dependencies from
-`web/package.json`.
+(Go, Node, golangci-lint, shellcheck) come from `mise.toml`; SPA dependencies
+from `web/package.json`.
 
 ```sh
-mise install        # provision Go, Node, golangci-lint
+mise install        # provision Go, Node, golangci-lint, shellcheck
 mise run build      # bundle the SPA and build ./bin/layerlens with it embedded
 ./bin/layerlens --listen :8080 --data-dir ./.dev-data
 ```
@@ -25,14 +25,18 @@ mise run build      # bundle the SPA and build ./bin/layerlens with it embedded
 |---|---|
 | `mise run build` | esbuild + Tailwind → `internal/webui/dist`, then `go build -o bin/layerlens` |
 | `mise run build-web` | Just the SPA bundle and stylesheet |
+| `mise run build-linux` | The deploy artifact: `CGO_ENABLED=0 GOOS=linux GOARCH=amd64` → `bin/layerlens-linux-amd64` |
 | `mise run bundle-size` | Bundle sizes from the esbuild metafile |
 | `mise run dev` | esbuild + Tailwind watchers writing `.dev-dist`, plus the server run with `--ui-dir .dev-dist` |
-| `mise run lint` | `golangci-lint run` (includes `go vet`) + eslint |
+| `mise run lint` | `golangci-lint run` (includes `go vet`) + eslint + shellcheck |
 | `mise run typecheck` | `tsc --noEmit` |
 | `mise run test` | `go test` + Vitest |
 | `mise run check` | lint + typecheck + test + build |
 | `mise run fmt` | `gofmt -w` over the Go trees |
 | `mise run genfixtures` | Regenerate `fixtures/` from `cmd/genfixtures` (deterministic — expect no git diff) |
+| `mise run e2e` | Playwright against the real binary on fixtures (no Docker, no network) |
+| `mise run deploy-dry-run` | Print the deploy command plan; runs nothing, dials nothing |
+| `mise run deploy` | Cross-compile, ship over SSH, restart the service, wait for `/healthz` |
 
 The built SPA lives in `internal/webui/dist` and is embedded with `//go:embed`,
 so the binary is self-contained: it serves `/healthz`, the reserved `/api`
@@ -200,3 +204,182 @@ byte for byte (227 KiB on disk for ~180 MiB of nominal image content — file
 bodies are seeded banners followed by NUL padding). The tests in
 `cmd/genfixtures/gen` re-derive the fixtures and diff them against what is
 committed, so a stale `fixtures/` fails `mise run test`.
+
+## Deployment
+
+The deploy target is a Linux **amd64** server, supervised by systemd. Two
+artifacts do the whole job: [`deploy/layerlens.service`](deploy/layerlens.service)
+and [`deploy/deploy.sh`](deploy/deploy.sh).
+
+```sh
+export LAYERLENS_DEPLOY_HOST=layerlens.example.internal
+mise run deploy-dry-run     # print the exact plan; runs nothing, dials nothing
+mise run deploy             # cross-compile, ship, restart, wait for /healthz
+```
+
+`mise run deploy` cross-compiles `bin/layerlens-linux-amd64`
+(`CGO_ENABLED=0 GOOS=linux GOARCH=amd64` — pure Go, so it links statically and
+needs no libc on the target), then, over one SSH connection per step: creates
+the install directory and the unprivileged `layerlens` system user, uploads the
+binary, the `fixtures/` directory and the unit file, swaps them into place,
+installs and reloads the unit, restarts the service, and finally polls
+`/healthz` **on the server** until it answers `ok`.
+
+### Configuration
+
+Every knob is an environment variable; only the host is required, and it has no
+default so that a bare run fails instead of guessing at a target.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `LAYERLENS_DEPLOY_HOST` | **required** | Target hostname or IP |
+| `LAYERLENS_DEPLOY_USER` | `root` | SSH user; anything else uses `sudo -n` for the privileged steps |
+| `LAYERLENS_DEPLOY_DIR` | `/opt/layerlens` | Remote install directory (binary + fixtures) |
+| `LAYERLENS_DEPLOY_PORT` | `22` | SSH port |
+| `LAYERLENS_DEPLOY_SERVICE` | `layerlens` | systemd unit name |
+| `LAYERLENS_DEPLOY_BINARY` | `bin/layerlens-linux-amd64` | Local binary to ship |
+| `LAYERLENS_DEPLOY_FIXTURES` | `fixtures` | Local fixtures directory to ship |
+| `LAYERLENS_DEPLOY_UNIT` | `deploy/layerlens.service` | Local unit file to install |
+| `LAYERLENS_DEPLOY_HEALTH_URL` | `http://127.0.0.1:8080/healthz` | Probed *on the remote host* after the restart |
+| `LAYERLENS_DEPLOY_HEALTH_RETRIES` | `30` | Health poll attempts, 2s apart |
+| `LAYERLENS_DEPLOY_SUDO` | `sudo -n` unless user is root | Privilege prefix for the root-only steps |
+| `LAYERLENS_DEPLOY_SSH_OPTS` | — | Extra `ssh`/`scp` options |
+| `LAYERLENS_DEPLOY_DRY_RUN` | — | `1` prints the plan and executes nothing |
+
+Runtime configuration belongs to the unit, not the deploy: it ships defaults
+for `--listen`, `--data-dir`, `--fixtures-dir`, `--cache-max-bytes`,
+`--docker-host`, and the resource guards below, and reads overrides from
+`/etc/layerlens/layerlens.env`, which the deploy never touches.
+
+### Resource guards
+
+These bound what a single crafted or hostile image can cost the server. The
+defaults are safe; they are surfaced as unit environment variables so an
+operator can tune them without editing the unit.
+
+| Flag | Default | What it bounds |
+|---|---|---|
+| `--max-layer-entries` | `2000000` | Distinct paths indexed per layer. A layer of many tiny entries is the cheapest way to amplify wire bytes into server memory — a crafted 14 MB blob reached 1.9 GB of heap before this cap existed. 4x the 500k-file design envelope. |
+| `--max-concurrent-pulls` | `4` | In-flight pulls. Surplus submissions get `429 too_many_pulls`; resubmitting an already-running pull rejoins it and takes no slot. |
+| `--pull-timeout` | `6h` | Backstop on a single pull; `0` disables. Generous on purpose — 6 h carries 25 GiB at ~1.2 MB/s. |
+| `--docker-allow-tcp` | off | Required before `--docker-host` accepts a `tcp://` endpoint. The daemon path bypasses the guarded dialer by design, so opening it to TCP is opt-in. |
+
+Registry bodies are additionally guarded by a throughput floor (4 KiB/s over a
+30 s window) rather than a fixed deadline, so a slow-but-progressing large pull
+is never killed while a trickling connection is.
+
+### The dry run
+
+`LAYERLENS_DEPLOY_DRY_RUN=1` (or `--dry-run`) prints every command the deploy
+would run, verbatim and correctly shell-quoted, and executes none of them —
+nothing is dialed and nothing is transferred. Local preflight still runs, so
+the rehearsal also tells you whether the artifacts exist and whether the binary
+is actually a linux/amd64 ELF; under dry-run a missing artifact is a warning
+rather than a fatal error, so the whole plan still prints on an unbuilt tree.
+
+Every remote command in the real deploy goes through one `run()` helper, which
+is what makes the printed plan *the* command list rather than a narration of
+it. `deploy/deploy_test.go` asserts the plan's contents and ordering with `ssh`
+and `scp` replaced by stubs that fail loudly if they are ever executed.
+
+### Deploy safety
+
+- **Atomic binary swap.** The binary is uploaded to a staging path *inside*
+  `LAYERLENS_DEPLOY_DIR` — the same filesystem as its destination — made
+  root-owned and executable there, and then moved into place with a single
+  `mv -f`, i.e. `rename(2)`. There is no instant at which the path systemd
+  execs holds a partially transferred file, and renaming over a running
+  executable replaces the directory entry while the live process keeps its own
+  inode (overwriting it in place would instead fail with `ETXTBSY`).
+- **Graceful restart.** `systemctl restart` sends one `SIGTERM`; the server
+  stops accepting, drains in-flight requests, and exits. `TimeoutStopSec=30s`
+  comfortably exceeds the server's own 15s drain budget, so systemd never
+  `SIGKILL`s mid-drain. An in-flight pull is abandoned, but its committed layer
+  indexes survive, so retrying it after the restart resumes rather than restarts.
+- **Fixtures keep one previous copy** (`fixtures.previous`). A directory cannot
+  be replaced by a single rename; the brief window where the new copy is being
+  moved in is harmless because fixtures are read once at startup, and the
+  restart happens afterwards.
+- **Idempotent.** Re-running the deploy on a fresh host and on a
+  deployed-to-a-hundred-times host does the same thing.
+
+### The systemd unit
+
+`Type=exec`, `Restart=on-failure`, journald logging under the `layerlens`
+identifier, and an `ExecStartPost` `curl` that retries until `/healthz` stops
+answering `503 loading` — so "started" means "the demo images are queryable",
+not "the process was spawned".
+
+It runs as a dedicated unprivileged `layerlens` user (created by the deploy)
+under `ProtectSystem=strict` with **one** writable path: `StateDirectory=layerlens`
+→ `/var/lib/layerlens`, which is where `--data-dir` lives. Also set:
+`NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`, `ProtectHome`,
+`ProtectProc=invisible` + `ProcSubset=pid`, the `ProtectKernel*` /
+`ProtectControlGroups` / `ProtectClock` / `ProtectHostname` set,
+`RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`, `LockPersonality`,
+`MemoryDenyWriteExecute` (pure Go, no JIT, so it costs nothing),
+`SystemCallFilter=@system-service`, an **empty** `CapabilityBoundingSet` and
+`AmbientCapabilities`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`,
+and resource limits (`MemoryHigh=2G`, `MemoryMax=3G`, `TasksMax=512`,
+`LimitNOFILE=8192`) sized against the ~1.5 GiB worst-case RSS in
+ARCHITECTURE §4.6. `systemd-analyze security` rates it **1.5 "OK"**; the
+remaining exposure is inherent to being a network server.
+
+The **Docker daemon source is off by default in the unit**
+(`LAYERLENS_DOCKER_HOST=off`), because reaching `/run/docker.sock` requires
+`SupplementaryGroups=docker`, and membership in that group is equivalent to
+root on the host. Both the group and the bind-mount are present in the unit,
+commented out, for a host where that is already the trust model.
+
+### Security posture, and what public exposure would need
+
+**The deployed instance is assumed to be on a private / trusted network**
+(RESEARCH Q6). There is no authentication layer, no per-user quota and no rate
+limiting, and that is a deliberate scoping decision, not an oversight: the
+registry allowlist and the guarded dialer exist to stop the *server* from being
+used as an SSRF pivot, not to police users.
+
+Before putting this on the public internet you would need, at minimum:
+
+1. **Authentication** in front of everything (the API included, not just the SPA).
+2. **Per-caller rate limiting on the pull endpoint.** `POST /api/v1/pulls` will
+   happily fetch a 25 GiB image from a public registry: unauthenticated, that is
+   a bandwidth and disk amplifier pointed at both your egress bill and your
+   cache budget. `--max-concurrent-pulls` bounds the server globally, but
+   nothing attributes cost to a caller, and any client can cancel any pull
+   (`GET /api/v1/pulls` lists them all).
+3. **A smaller `--cache-max-bytes`**, plus monitoring of it — the LRU refuses
+   rather than thrashes, so a full cache degrades into `cache_full` errors.
+4. **TLS**, terminated by a reverse proxy; the server speaks plain HTTP.
+
+The cheap hardening in the unit is applied regardless of exposure, because it
+is cheap and correct either way.
+
+## Known limitations
+
+- **linux/amd64 only.** Every path — registry, daemon and fixtures — resolves
+  the `linux/amd64` variant and nothing else. A multiplatform index is not
+  compared across its platforms; it is reduced to its amd64 member, and an
+  image with no amd64 variant is refused with a clear error. Windows images
+  are not supported at all. (PROJECT.md "Out of scope".)
+- **Registry coverage is deep on two of five** (RESEARCH Q4). Docker Hub and
+  GHCR are verified end to end against the live services. GCR, Artifact
+  Registry, ACR and ECR Public are on the allowlist and go through the
+  identical code path, but are **not** live-verified — expected to work, not
+  guaranteed. ECR *private* has no anonymous access and cannot work by design.
+- **Zstd layers are untested against a live registry** (ARCHITECTURE §10.9).
+  Decompression is media-type-driven and gzip, zstd and uncompressed layers are
+  all wired, but only gzip has been exercised end to end against a real upstream.
+- **Anonymous pulls only** (RESEARCH Q3). No credential file, helper or cloud
+  auth chain is consulted, so private repositories are unreachable — by design,
+  since the alternative is a server that lends its own identity to any caller.
+- **Pull state is in-memory** (ARCHITECTURE §10.4). A restart forgets in-flight
+  pull IDs; the poller reports the pull as lost and offers a retry, which is
+  cheap because the layer indexes committed before the restart are reused.
+- **One process per cache directory**, enforced by an exclusive `flock`.
+  Horizontal scaling is explicitly out of scope.
+- **The cache cap bounds index bytes, not image bytes.** Layer blobs are never
+  stored, so a 25 GiB image costs kilobytes of cache; `--cache-max-bytes` is a
+  budget for the analysis metadata, and sizing it against image sizes will
+  wildly over-provision.
+- **No CI.** The gates are local (`mise run check`, `mise run e2e`).

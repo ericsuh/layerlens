@@ -109,11 +109,27 @@ trees, diffs, aggregates — are computed from these indexes.
   (development only, default empty: serve SPA assets from this directory
   instead of the embedded copy, so `mise run dev`'s esbuild/Tailwind watchers
   are visible without recompiling the binary).
+- Resource bounds, all flags because the right value depends on the host:
+  `--max-concurrent-pulls` (default 4) is admission control — a submission past
+  it is refused with 429 `too_many_pulls` rather than queued (§6.3);
+  `--max-layer-entries` (default 2,000,000) caps the entries one layer may
+  contribute to its index (§4.6, §7.2); `--pull-timeout` (default 6h, `0`
+  disables) is a wall-clock backstop under the transport's throughput floor
+  (§7.2). `--docker-allow-tcp` (default false) is required before a
+  `tcp://` `--docker-host` (or `DOCKER_HOST`) is accepted: the daemon path is
+  the one egress the dial-time screen never sees, so reaching it over the
+  network is an explicit choice, not a default inherited from the environment.
 - systemd unit: dedicated `layerlens` user, `StateDirectory=layerlens`,
   `ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`,
   `Restart=on-failure`. `mise run deploy` scp's binary + unit + fixtures, then
   `systemctl daemon-reload && systemctl restart layerlens`; dry-run mode prints
   the exact commands (per RESEARCH Q1, deploy is built, not run).
+  The unit passes the flags above as `Environment=` defaults overridable from
+  `EnvironmentFile=-/etc/layerlens/layerlens.env`, so operator configuration
+  survives a deploy that overwrites the unit. It sets `--docker-host off` by
+  default: reaching `/run/docker.sock` under this sandbox needs
+  `SupplementaryGroups=docker`, which is root-equivalent and must be an
+  explicit opt-in (both lines ship commented out).
 - Exactly one server process per cache root, enforced by an exclusive advisory
   `flock` on `<root>/lock` at startup (fail fast with a clear error).
 - `GET /healthz` returns 200 `ok` once fixtures are loaded, and 503 `loading`
@@ -655,6 +671,18 @@ frees, streaming ingestion) rather than by accounting. Larger images degrade
 gracefully: the diff tree is the only unavoidable resident, and it scales with
 merged node count, not image bytes.
 
+**Ingest side: the entry-count cap is what makes the above a ceiling rather
+than an aspiration.** Everything in §4.1 is O(entries), never O(bytes) — but
+*entries* is chosen by whoever built the image, and an empty tar member is
+~5 bytes of gzip that becomes a ~640-byte `Entry`. Measured: 14.8 MB of gzip on
+the wire → 1.9 GB of heap, a **129:1 amplification**, from a single anonymous
+push to any allowlisted registry. `analyze.IndexLayer` therefore refuses a layer
+past `--max-layer-entries` (default 2,000,000 — four times the 500k design
+envelope for a whole image, so nothing legitimate can reach it) with
+`ErrTooManyEntries`, classified like `ErrTooManyLayers`. The stated worst case is
+then ~1.3 GB for one pathological layer, multiplied by `--max-concurrent-pulls`
+(default 4) and by nothing else; an operator on a small host lowers both.
+
 ---
 
 ## 5. On-disk cache format
@@ -737,9 +765,17 @@ concurrent reader sees old-or-new, never torn).
   that it would look like garbage in exactly the window an ingest needs it.
 - The cap check runs *after* the staged index has been written, because a
   compressed index size is not knowable up front (see the `cache_full` bullet
-  above). The transient overshoot is therefore bounded by one layer index, and
-  the refusal test runs before any eviction, so an image that cannot fit never
-  costs anything already cached.
+  above) — but the write itself is **charged against the remaining budget as it
+  streams**, and is aborted the moment it would pass it. "Bounded by one layer
+  index" was not a bound at all: an index is as large as the image says it is,
+  and a 1 MiB cap was measured with 20,173,648 bytes staged on disk (19x)
+  before `ErrCacheFull` came back. The streaming ceiling is `cap − pinned −
+  what this transaction already holds`, which is exactly `reserve`'s refusal
+  test read ahead of time, so a write it stops is a write `reserve` was always
+  going to refuse; `reserve` still runs afterwards and still writes the error
+  message. Peak on-disk is then within one buffered-writer flush of the cap
+  (measured 1.00x), and the refusal test still runs before any eviction, so an
+  image that cannot fit never costs anything already cached.
 
 ---
 
@@ -772,6 +808,8 @@ interface ApiError {
 | `docker_unavailable` | 503 | no reachable Docker socket (only on endpoints that require it) |
 | `cache_full` | 507 | image cannot fit under `--cache-max-bytes` even after full eviction |
 | `pull_conflict` | 409 | (reserved; duplicate submissions instead return the existing pull, §6.3) |
+| `too_many_pulls` | 429 | `--max-concurrent-pulls` in-flight pulls already running; the request is well formed and the server is healthy, so this is 429 and not 503. Joining an *identical* in-flight pull is idempotent and never refused (§6.3) |
+| `pull_too_large` | — | carried inside `PullStatus.error`, not as an HTTP status: the image is past a structural bound on work (more than 512 layers, or one layer past `--max-layer-entries`) |
 | `bad_request` | 400 | malformed params (layer count out of range, bad cursor, bad path) |
 | `internal` | 500 | anything else; message is generic, details logged server-side only |
 | `not_found` | 404 | no route matches the request path inside the reserved `/api` namespace (never falls through to the SPA shell) |
@@ -825,6 +863,7 @@ POST   /api/v1/pulls              body: {source: "registry"|"docker", reference:
        → 200 PullStatus           // identical request already in flight or image already
                                   // cached (state "done" with imageId) — idempotent
        → 400 invalid_reference | 403 registry_not_allowed | 503 docker_unavailable
+       → 429 too_many_pulls        // --max-concurrent-pulls already in flight
 GET    /api/v1/pulls              → 200 { pulls: PullStatus[] }       // in-memory, this process
 GET    /api/v1/pulls/{id}         → 200 PullStatus | 404
 DELETE /api/v1/pulls/{id}         → 200 PullStatus (state "cancelled") | 404
@@ -854,6 +893,17 @@ Polling contract: client polls at 500–1000 ms while `state` is
 resolving/running. Cancellation is `DELETE`; the server cancels the ingest
 context, cleans staging, and keeps any fully committed layer indexes (a retried
 pull resumes at layer granularity for free).
+
+Admission control: a submission takes one of `--max-concurrent-pulls` slots, and
+the duplicate check and the slot acquisition happen under **one** lock hold — so
+a resubmission that joins an in-flight pull is answered from the table and costs
+no slot, while two identical concurrent submits cannot both be admitted. Without
+this, every POST bought a goroutine and a real outbound registry session:
+400 concurrent submits produced 400 of each and a pull table of 400 despite the
+64-entry retention cap (which only ever evicts *terminal* pulls). Pull ids are
+`"p" + 16 crypto/rand bytes in hex`; any client may cancel any pull, which is
+acceptable on the trusted network of RESEARCH Q3 and is not made worse by an id
+anyone can also guess.
 
 ### 6.4 Layer graph for an image pair
 
@@ -1056,7 +1106,21 @@ IP vetting at dial time, never relying on either alone.
 3. Reject any reference whose registry component carries an explicit port, and
    force `https` (gcr defaults to https for all non-localhost registries; we
    additionally never pass `name.Insecure`).
-4. The result is converted to `domain.ImageRef`; gcr types stop at `imgref`.
+4. Reject any reference carrying a `.`, `..` or empty path segment. The
+   upstream grammar allows them and passes them through un-normalized, so
+   `ghcr.io/../../secret` becomes a literal `GET /v2/../../secret/manifests/v1`
+   and a token scope of `repository:../../secret:pull`. The host cannot change,
+   so the impact is only an arbitrary anonymous GET path on an already-vetted
+   registry — but it is not a reference anyone means to type. The same rule
+   guards the Docker path, where the reference is concatenated into the Engine
+   API URL.
+5. Registry normalization removes **exactly one** trailing root dot and then
+   requires every label to be non-empty: `ghcr.io.` is the same name, and
+   `ghcr.io..` is an empty label, not a third spelling. Doing it in two places
+   (trim one here, one in the allowlist) accepted `ghcr.io..` and carried it as
+   the registry `ghcr.io.` — a second idempotency key for one image and a
+   non-canonical TLS `ServerName`.
+6. The result is converted to `domain.ImageRef`; gcr types stop at `imgref`.
 
 The allowlist check happens **before any network activity** — it gates
 `POST /api/v1/pulls` synchronously (403 `registry_not_allowed`).
@@ -1103,17 +1167,34 @@ guardedDial(ctx, network, addr):
   passed the same screen, so falling through to the second on a dead first
   address changes nothing about the policy and everything about reliability.
 - Response-size caps: manifests, indexes, and configs are read through
-  `io.LimitReader` (8 MiB each); layer count capped (e.g. 512); these bound
-  memory against a hostile-but-allowlisted upstream.
+  `io.LimitReader` (8 MiB each); response *headers* are capped at 64 KiB
+  (the stdlib default is 10 MiB, per response, per concurrent pull); layer count
+  capped (512); entries per layer capped (`--max-layer-entries`, §4.6); these
+  bound memory against a hostile-but-allowlisted upstream.
+- **Throughput floor, not a total deadline.** `ResponseHeaderTimeout` bounds
+  time-to-first-byte only — a 25 GiB layer legitimately takes hours — so on its
+  own it let a trickling upstream hold a connection indefinitely (measured:
+  29.8 s for 1000 bytes, extendable without limit). Every response body is
+  therefore wrapped in a watchdog that requires `MinThroughput` bytes/s averaged
+  over a `StallWindow` (defaults 4 KiB/s over 30 s) and aborts the request's
+  context when it is not met. A floor rather than a deadline is the point: it
+  cannot misjudge a slow-but-progressing transfer, which is the exact case a
+  total deadline generous enough for 25 GiB is also generous enough to hide in.
+  `--pull-timeout` (default 6h) is the backstop for what the floor cannot see —
+  chiefly the docker-save stream over the unix socket.
 - The docker-daemon path bypasses safehttp entirely (unix socket, local trust);
-  fixtures are local files.
+  fixtures are local files. Because it is the one un-screened egress, the
+  endpoint must be a unix socket unless `--docker-allow-tcp` is passed (§1.3):
+  a `tcp://` endpoint inherited from `DOCKER_HOST` would otherwise turn local
+  trust into a network destination with no address screen in front of it.
 
 ### 7.3 Path safety
 
 - **Cache paths from digests**: every digest that becomes a path component is
   validated against `^sha256:[a-f0-9]{64}$` and only the hex half is joined;
   anything else is an internal error before `filepath.Join` is reached. Pull IDs
-  used in `staging/` are server-generated random hex, never user input.
+  used in `staging/` are server-generated random hex (`crypto/rand`), never user
+  input and never derivable from a wall clock.
 - **The archive root** (`./`, `/`, `.`): GNU tar emits a member for the archive
   root itself. It carries no changeset information — the root always exists —
   so the indexer skips it silently rather than recording a warning for what is
@@ -1401,9 +1482,12 @@ is; `webServer.cwd` is the repository root) boots `./bin/layerlens --listen
     layers). Paste `example.com/foo` → clear "registry not allowed" error.
 13. Restart the server: previously analyzed images are still listed (durable
     cache); comparisons still work.
-14. Start with `--cache-max-bytes=1000000` and ingest a fixture larger than
-    that: a clear "image too large for cache" error, and previously cached
-    images remain.
+14. Start with a cap just above what the pinned fixtures occupy (they take
+    ~195 KB, so `--cache-max-bytes=250000`) and ingest an image whose *index*
+    does not fit: a clear `cache_full` error, and previously cached images
+    remain. Note the cap bounds **index bytes, not image bytes** — layer blobs
+    are never stored (§5), so a 57 MB image costs a few hundred KB of cache and
+    `--cache-max-bytes=1000000` is not a small cap at all.
 
 ---
 

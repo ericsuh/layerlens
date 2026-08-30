@@ -1,45 +1,225 @@
 {
-  "_comment": "Shared accept/reject vectors for the registry allowlist (ARCHITECTURE §7.1). Read by internal/imgref/imgref_test.go AND by web/src/lib/refcheck.test.ts so the server rule and the client-side pre-flight mirror cannot drift. The server is always authoritative; the client copy exists only to give an inline verdict per keystroke (DESIGN §4.3).",
+  "_comment": "Shared accept/reject vectors for the registry allowlist (ARCHITECTURE \u00a77.1). Read by internal/imgref/imgref_test.go AND by web/src/lib/refcheck.test.ts so the server rule and the client-side pre-flight mirror cannot drift. The server is always authoritative; the client copy exists only to give an inline verdict per keystroke (DESIGN \u00a74.3).",
   "accept": [
-    { "input": "alpine:3.20", "registry": "index.docker.io", "repository": "library/alpine", "tag": "3.20" },
-    { "input": "library/alpine", "registry": "index.docker.io", "repository": "library/alpine", "tag": "latest" },
-    { "input": "docker.io/library/busybox:1.36", "registry": "index.docker.io", "repository": "library/busybox", "tag": "1.36" },
-    { "input": "index.docker.io/library/busybox:1.36", "registry": "index.docker.io", "repository": "library/busybox", "tag": "1.36" },
-    { "input": "registry-1.docker.io/library/busybox:1.36", "registry": "registry-1.docker.io", "repository": "library/busybox", "tag": "1.36" },
-    { "input": "ghcr.io/org/img:tag", "registry": "ghcr.io", "repository": "org/img", "tag": "tag" },
-    { "input": "gcr.io/p/i", "registry": "gcr.io", "repository": "p/i", "tag": "latest" },
-    { "input": "us.gcr.io/p/i", "registry": "us.gcr.io", "repository": "p/i", "tag": "latest" },
-    { "input": "asia.gcr.io/p/i:v2", "registry": "asia.gcr.io", "repository": "p/i", "tag": "v2" },
-    { "input": "us-docker.pkg.dev/p/r/i", "registry": "us-docker.pkg.dev", "repository": "p/r/i", "tag": "latest" },
-    { "input": "public.ecr.aws/x/y", "registry": "public.ecr.aws", "repository": "x/y", "tag": "latest" },
-    { "input": "123456789012.dkr.ecr.us-east-1.amazonaws.com/repo", "registry": "123456789012.dkr.ecr.us-east-1.amazonaws.com", "repository": "repo", "tag": "latest" },
-    { "input": "foo.azurecr.io/bar", "registry": "foo.azurecr.io", "repository": "bar", "tag": "latest" },
-    { "input": "ghcr.io/org/img@sha256:1111111111111111111111111111111111111111111111111111111111111111", "registry": "ghcr.io", "repository": "org/img", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111" },
-    { "input": "  ghcr.io/org/img:tag  ", "registry": "ghcr.io", "repository": "org/img", "tag": "tag" },
-    { "input": "GHCR.IO/org/img:tag", "registry": "ghcr.io", "repository": "org/img", "tag": "tag" }
+    {
+      "input": "alpine:3.20",
+      "registry": "index.docker.io",
+      "repository": "library/alpine",
+      "tag": "3.20"
+    },
+    {
+      "input": "library/alpine",
+      "registry": "index.docker.io",
+      "repository": "library/alpine",
+      "tag": "latest"
+    },
+    {
+      "input": "docker.io/library/busybox:1.36",
+      "registry": "index.docker.io",
+      "repository": "library/busybox",
+      "tag": "1.36"
+    },
+    {
+      "input": "index.docker.io/library/busybox:1.36",
+      "registry": "index.docker.io",
+      "repository": "library/busybox",
+      "tag": "1.36"
+    },
+    {
+      "input": "registry-1.docker.io/library/busybox:1.36",
+      "registry": "registry-1.docker.io",
+      "repository": "library/busybox",
+      "tag": "1.36"
+    },
+    {
+      "input": "ghcr.io/org/img:tag",
+      "registry": "ghcr.io",
+      "repository": "org/img",
+      "tag": "tag"
+    },
+    {
+      "input": "gcr.io/p/i",
+      "registry": "gcr.io",
+      "repository": "p/i",
+      "tag": "latest"
+    },
+    {
+      "input": "us.gcr.io/p/i",
+      "registry": "us.gcr.io",
+      "repository": "p/i",
+      "tag": "latest"
+    },
+    {
+      "input": "asia.gcr.io/p/i:v2",
+      "registry": "asia.gcr.io",
+      "repository": "p/i",
+      "tag": "v2"
+    },
+    {
+      "input": "us-docker.pkg.dev/p/r/i",
+      "registry": "us-docker.pkg.dev",
+      "repository": "p/r/i",
+      "tag": "latest"
+    },
+    {
+      "input": "public.ecr.aws/x/y",
+      "registry": "public.ecr.aws",
+      "repository": "x/y",
+      "tag": "latest"
+    },
+    {
+      "input": "123456789012.dkr.ecr.us-east-1.amazonaws.com/repo",
+      "registry": "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+      "repository": "repo",
+      "tag": "latest"
+    },
+    {
+      "input": "foo.azurecr.io/bar",
+      "registry": "foo.azurecr.io",
+      "repository": "bar",
+      "tag": "latest"
+    },
+    {
+      "input": "ghcr.io/org/img@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "registry": "ghcr.io",
+      "repository": "org/img",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "input": "  ghcr.io/org/img:tag  ",
+      "registry": "ghcr.io",
+      "repository": "org/img",
+      "tag": "tag"
+    },
+    {
+      "input": "GHCR.IO/org/img:tag",
+      "registry": "ghcr.io",
+      "repository": "org/img",
+      "tag": "tag"
+    }
   ],
   "reject": [
-    { "input": "evilgcr.io/x", "reason": "not_allowed", "registry": "evilgcr.io" },
-    { "input": "gcr.io.evil.com/x", "reason": "not_allowed", "registry": "gcr.io.evil.com" },
-    { "input": "x.azurecr.io.evil.com/y", "reason": "not_allowed", "registry": "x.azurecr.io.evil.com" },
-    { "input": "notpkg.dev.evil.com/y", "reason": "not_allowed", "registry": "notpkg.dev.evil.com" },
-    { "input": "pkg.dev/p/i", "reason": "not_allowed", "registry": "pkg.dev" },
-    { "input": "azurecr.io/x", "reason": "not_allowed", "registry": "azurecr.io" },
-    { "input": "amazonaws.com/x", "reason": "not_allowed", "registry": "amazonaws.com" },
-    { "input": "dkr.ecr.us-east-1.amazonaws.com/x", "reason": "not_allowed", "registry": "dkr.ecr.us-east-1.amazonaws.com" },
-    { "input": "123.dkr.ecr.us-east-1.amazonaws.com.evil.net/x", "reason": "not_allowed", "registry": "123.dkr.ecr.us-east-1.amazonaws.com.evil.net" },
-    { "input": "registry.example.com/x", "reason": "not_allowed", "registry": "registry.example.com" },
-    { "input": "evil.example.com/x", "reason": "not_allowed", "registry": "evil.example.com" },
-    { "input": "localhost/x", "reason": "not_allowed", "registry": "localhost" },
-    { "input": "127.0.0.1/x", "reason": "not_allowed", "registry": "127.0.0.1" },
-    { "input": "169.254.169.254/x", "reason": "not_allowed", "registry": "169.254.169.254" },
-    { "input": "ghcr.io:8443/x", "reason": "invalid" },
-    { "input": "localhost:5000/x", "reason": "invalid" },
-    { "input": "not a ref!", "reason": "invalid" },
-    { "input": "", "reason": "invalid" },
-    { "input": "   ", "reason": "invalid" },
-    { "input": "ghcr.io/UPPER/img", "reason": "invalid" },
-    { "input": "ghcr.io/org/img@sha256:zz", "reason": "invalid" },
-    { "input": "https://ghcr.io/org/img", "reason": "invalid" }
+    {
+      "input": "evilgcr.io/x",
+      "reason": "not_allowed",
+      "registry": "evilgcr.io"
+    },
+    {
+      "input": "gcr.io.evil.com/x",
+      "reason": "not_allowed",
+      "registry": "gcr.io.evil.com"
+    },
+    {
+      "input": "x.azurecr.io.evil.com/y",
+      "reason": "not_allowed",
+      "registry": "x.azurecr.io.evil.com"
+    },
+    {
+      "input": "notpkg.dev.evil.com/y",
+      "reason": "not_allowed",
+      "registry": "notpkg.dev.evil.com"
+    },
+    {
+      "input": "pkg.dev/p/i",
+      "reason": "not_allowed",
+      "registry": "pkg.dev"
+    },
+    {
+      "input": "azurecr.io/x",
+      "reason": "not_allowed",
+      "registry": "azurecr.io"
+    },
+    {
+      "input": "amazonaws.com/x",
+      "reason": "not_allowed",
+      "registry": "amazonaws.com"
+    },
+    {
+      "input": "dkr.ecr.us-east-1.amazonaws.com/x",
+      "reason": "not_allowed",
+      "registry": "dkr.ecr.us-east-1.amazonaws.com"
+    },
+    {
+      "input": "123.dkr.ecr.us-east-1.amazonaws.com.evil.net/x",
+      "reason": "not_allowed",
+      "registry": "123.dkr.ecr.us-east-1.amazonaws.com.evil.net"
+    },
+    {
+      "input": "registry.example.com/x",
+      "reason": "not_allowed",
+      "registry": "registry.example.com"
+    },
+    {
+      "input": "evil.example.com/x",
+      "reason": "not_allowed",
+      "registry": "evil.example.com"
+    },
+    {
+      "input": "localhost/x",
+      "reason": "not_allowed",
+      "registry": "localhost"
+    },
+    {
+      "input": "127.0.0.1/x",
+      "reason": "not_allowed",
+      "registry": "127.0.0.1"
+    },
+    {
+      "input": "169.254.169.254/x",
+      "reason": "not_allowed",
+      "registry": "169.254.169.254"
+    },
+    {
+      "input": "ghcr.io:8443/x",
+      "reason": "invalid"
+    },
+    {
+      "input": "localhost:5000/x",
+      "reason": "invalid"
+    },
+    {
+      "input": "not a ref!",
+      "reason": "invalid"
+    },
+    {
+      "input": "",
+      "reason": "invalid"
+    },
+    {
+      "input": "   ",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io/UPPER/img",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io/org/img@sha256:zz",
+      "reason": "invalid"
+    },
+    {
+      "input": "https://ghcr.io/org/img",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io/../../secret",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io/./secret",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io//secret",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io../o/i",
+      "reason": "invalid"
+    },
+    {
+      "input": "ghcr.io.../o/i",
+      "reason": "invalid"
+    }
   ]
 }

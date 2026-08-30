@@ -134,6 +134,10 @@ func TestCreatePullRejections(t *testing.T) {
 			http.StatusServiceUnavailable, server.CodeDockerUnavailable},
 		{"unknown source", ingest.ErrInvalidSource,
 			http.StatusBadRequest, server.CodeBadRequest},
+		// Admission control: the server is healthy and the request is
+		// well formed, so this is 429 and not 503.
+		{"too many pulls in flight", fmt.Errorf("%w: 4 running", ingest.ErrTooManyPulls),
+			http.StatusTooManyRequests, server.CodeTooManyPulls},
 		{"anything else", errors.New("boom"),
 			http.StatusInternalServerError, server.CodeInternal},
 	} {

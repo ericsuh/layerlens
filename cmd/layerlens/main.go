@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,12 +66,18 @@ var dockerSocketPath = "/var/run/docker.sock"
 // whose subsystems arrive in later phases are parsed and carried on the config
 // now so the command-line surface stays stable.
 type config struct {
-	listen        string
-	dataDir       string
-	cacheMaxBytes int64
-	fixturesDir   string
-	dockerHost    string
-	uiDir         string
+	listen         string
+	dataDir        string
+	cacheMaxBytes  int64
+	fixturesDir    string
+	dockerHost     string
+	dockerOff      bool
+	dockerAllowTCP bool
+	uiDir          string
+
+	maxPulls        int
+	pullTimeout     time.Duration
+	maxLayerEntries int
 }
 
 func parseFlags(args []string, stderr io.Writer) (*config, error) {
@@ -88,6 +95,19 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 	// The environment is consulted after parsing instead.
 	fs.StringVar(&cfg.dockerHost, "docker-host", "",
 		`Docker endpoint to ingest images from (default $DOCKER_HOST, else the local socket if present; "off" disables the daemon source)`)
+	// The daemon path is local trust: it bypasses safehttp by design, which
+	// is defensible for a unix socket on the same host and not defensible
+	// for an arbitrary TCP endpoint. Requiring an explicit opt-in keeps a
+	// stray DOCKER_HOST=tcp://... in the environment from quietly turning
+	// the one un-screened egress path into a remote one.
+	fs.BoolVar(&cfg.dockerAllowTCP, "docker-allow-tcp", false,
+		"permit a tcp:// --docker-host (the daemon path is not screened by the SSRF dialer; unix sockets only by default)")
+	fs.IntVar(&cfg.maxPulls, "max-concurrent-pulls", ingest.DefaultMaxInFlightPulls,
+		"maximum pulls that may run at once; further submissions are refused with 429")
+	fs.DurationVar(&cfg.pullTimeout, "pull-timeout", ingest.DefaultPullTimeout,
+		"wall-clock ceiling on a single pull (0 disables it; the throughput floor still applies)")
+	fs.IntVar(&cfg.maxLayerEntries, "max-layer-entries", ingest.MaxLayerEntries,
+		"maximum filesystem entries layerlens will index in one layer")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -103,7 +123,12 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 		// offer the daemon source" on a machine that happens to have a
 		// socket — which the e2e suite needs to stay deterministic, and
 		// an operator may want for a server that should only ever pull.
+		// The deployed systemd unit sets it by default, so the flag is
+		// carried through to the source rather than collapsed into an
+		// empty host: "turned off" and "none found" are different
+		// answers to the user's question.
 		cfg.dockerHost = ""
+		cfg.dockerOff = true
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -155,7 +180,45 @@ func (c *config) validate() error {
 	if c.cacheMaxBytes <= 0 {
 		return errors.New("--cache-max-bytes must be positive")
 	}
-	return nil
+	if c.maxPulls <= 0 {
+		return errors.New("--max-concurrent-pulls must be positive")
+	}
+	if c.pullTimeout < 0 {
+		return errors.New("--pull-timeout must not be negative")
+	}
+	if c.maxLayerEntries <= 0 {
+		return errors.New("--max-layer-entries must be positive")
+	}
+	return checkDockerHost(c.dockerHost, c.dockerAllowTCP)
+}
+
+// checkDockerHost enforces the one place layerlens talks to something that the
+// safehttp dialer never screens.
+//
+// A unix socket is a local-trust decision an operator makes by installing the
+// daemon; "tcp://10.0.0.5:2375" is a network destination that would reach the
+// Engine API with no address screen, no allowlist and no TLS requirement in
+// front of it. Both spellings are accepted, but the second only when the
+// operator says so out loud.
+func checkDockerHost(host string, allowTCP bool) error {
+	switch {
+	case host == "":
+		return nil
+	case strings.HasPrefix(host, "unix://"), strings.HasPrefix(host, "/"):
+		return nil
+	case strings.HasPrefix(host, "tcp://"), strings.HasPrefix(host, "http://"), strings.HasPrefix(host, "https://"):
+		if allowTCP {
+			return nil
+		}
+		return fmt.Errorf(
+			"--docker-host %q is not a unix socket; the Docker path is not screened by the outbound "+
+				"address checks, so a TCP endpoint must be opted into with --docker-allow-tcp "+
+				"(or set --docker-host=off, or unset DOCKER_HOST)", host)
+	default:
+		return fmt.Errorf(
+			"--docker-host %q is not a supported endpoint: use a unix socket path, "+
+				`"unix://<path>", or "off"`, host)
+	}
 }
 
 func main() {
@@ -214,16 +277,17 @@ func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr
 	log.Info("cache opened", "data-dir", store.Root(),
 		"usedBytes", store.UsedBytes(), "maxBytes", store.MaxBytes())
 
-	ingester := ingest.New(store, ingest.Options{Logger: log})
+	ingester := ingest.New(store, ingest.Options{Logger: log, MaxLayerEntries: cfg.maxLayerEntries})
 	loaded := startFixtureLoad(ctx, cfg, log, ingester)
 
 	transport := outboundTransport()
 	defer transport.CloseIdleConnections()
 
 	docker := ingest.NewDocker(ingest.DockerOptions{
-		Host:   cfg.dockerHost,
-		Images: store,
-		Logger: log,
+		Host:     cfg.dockerHost,
+		Disabled: cfg.dockerOff,
+		Images:   store,
+		Logger:   log,
 	})
 	defer func() {
 		if err := docker.Close(); err != nil {
@@ -231,7 +295,11 @@ func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr
 		}
 	}()
 	if cfg.dockerHost == "" {
-		log.Info("no Docker endpoint configured; the daemon source will report itself unavailable")
+		if cfg.dockerOff {
+			log.Info("the Docker daemon source is turned off (--docker-host off)")
+		} else {
+			log.Info("no Docker endpoint configured; the daemon source will report itself unavailable")
+		}
 	} else {
 		log.Info("docker endpoint configured", "host", cfg.dockerHost)
 	}
@@ -242,10 +310,15 @@ func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr
 			Transport: transport,
 			UserAgent: "layerlens/" + version,
 		}),
-		Docker:    docker,
-		Allowlist: imgref.Default(),
-		Images:    store,
-		Logger:    log,
+		Docker:      docker,
+		Allowlist:   imgref.Default(),
+		Images:      store,
+		Logger:      log,
+		MaxInFlight: cfg.maxPulls,
+		// The Manager reads zero as "use the default" and negative as
+		// "no deadline", so an operator's explicit 0 is translated here
+		// rather than silently becoming six hours.
+		PullTimeout: pullTimeoutFor(cfg.pullTimeout),
 	})
 
 	opts := server.Options{
@@ -270,6 +343,15 @@ func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr
 		opts.UI = webui.HandlerFS(os.DirFS(cfg.uiDir))
 	}
 	return serve(ctx, cfg, log, server.New(opts), ready)
+}
+
+// pullTimeoutFor maps the flag's "0 means no deadline" onto the manager's
+// "negative means no deadline".
+func pullTimeoutFor(d time.Duration) time.Duration {
+	if d == 0 {
+		return -1
+	}
+	return d
 }
 
 // startFixtureLoad kicks off the vendored-fixture ingest and returns a channel

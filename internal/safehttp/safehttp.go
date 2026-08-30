@@ -37,6 +37,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +58,9 @@ var (
 	ErrTooManyRedirects = errors.New("safehttp: too many redirects")
 	// ErrResponseTooLarge reports a response body past its cap.
 	ErrResponseTooLarge = errors.New("safehttp: response body exceeds the size limit")
+	// ErrStalled reports a response body that stopped making progress: it
+	// delivered less than the minimum throughput over a whole window.
+	ErrStalled = errors.New("safehttp: upstream stalled below the minimum throughput")
 )
 
 // Defaults for the transport. Every one of them is a security control, not a
@@ -77,6 +81,29 @@ const (
 	responseHeaderTimeout = 30 * time.Second
 	idleConnTimeout       = 90 * time.Second
 	maxIdleConns          = 32
+	// maxResponseHeaderBytes bounds the response head. The stdlib default is
+	// 10 MiB per response, which multiplied by concurrent pulls is real
+	// memory spent on something whose largest legitimate value is a
+	// WWW-Authenticate line.
+	maxResponseHeaderBytes = 64 << 10
+
+	// DefaultStallWindow and DefaultMinThroughput define the body stall
+	// detector.
+	//
+	// A *throughput floor over a sliding window* is used rather than a total
+	// deadline on purpose. The thing that must not be killed is a slow but
+	// genuinely progressing 25 GiB pull, and any total deadline generous
+	// enough for that is also generous enough for an attacker to sit inside.
+	// A floor inverts that: it does not care how long the transfer takes,
+	// only that it keeps moving, so an upstream trickling 1000 bytes over
+	// 30 seconds is refused while a 25 GiB pull on a slow link runs to
+	// completion.
+	//
+	// 4 KiB/s is roughly a thousandth of the slowest link anyone would pull
+	// a container image over, so the floor never fires on real traffic; it
+	// exists to turn "indefinitely" into "one window".
+	DefaultStallWindow   = 30 * time.Second
+	DefaultMinThroughput = 4 << 10 // bytes per second
 )
 
 // Resolver resolves a host name to IP addresses. *net.Resolver satisfies it;
@@ -97,6 +124,13 @@ type Options struct {
 	// verification (InsecureSkipVerify is never set, anywhere).
 	RootCAs *x509.CertPool
 
+	// StallWindow is the sliding window the throughput floor is measured
+	// over. Zero means DefaultStallWindow; negative disables the detector.
+	StallWindow time.Duration
+	// MinThroughput is the floor in bytes per second. Zero means
+	// DefaultMinThroughput; negative disables the detector.
+	MinThroughput int64
+
 	// PermitLoopback relaxes the address screen and the port restriction
 	// for loopback destinations.
 	//
@@ -115,6 +149,10 @@ type Transport struct {
 	resolver Resolver
 	opts     Options
 	maxMeta  int64
+	// stallWindow/minBytes are the throughput floor; a zero window means
+	// the detector is off.
+	stallWindow time.Duration
+	minBytes    int64
 
 	// smallBlobs holds blob digests the caller has declared small — in
 	// practice the image config, which §7.2 requires be size-capped like a
@@ -136,6 +174,17 @@ func New(opts Options) *Transport {
 	if t.maxMeta <= 0 {
 		t.maxMeta = MaxMetadataBytes
 	}
+	t.stallWindow = opts.StallWindow
+	t.minBytes = opts.MinThroughput
+	if t.stallWindow == 0 {
+		t.stallWindow = DefaultStallWindow
+	}
+	if t.minBytes == 0 {
+		t.minBytes = DefaultMinThroughput
+	}
+	if t.stallWindow < 0 || t.minBytes < 0 {
+		t.stallWindow = 0
+	}
 	t.base = &http.Transport{
 		// No proxy, ever. Proxy settings come from the environment, and
 		// an environment-supplied proxy is both an address the screen
@@ -147,13 +196,14 @@ func New(opts Options) *Transport {
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, ErrPlaintextRefused
 		},
-		DialTLSContext:        t.dialTLS,
-		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          maxIdleConns,
-		IdleConnTimeout:       idleConnTimeout,
-		TLSHandshakeTimeout:   tlsHandshakeTimeout,
-		ResponseHeaderTimeout: responseHeaderTimeout,
-		ExpectContinueTimeout: time.Second,
+		DialTLSContext:         t.dialTLS,
+		ForceAttemptHTTP2:      false,
+		MaxIdleConns:           maxIdleConns,
+		IdleConnTimeout:        idleConnTimeout,
+		TLSHandshakeTimeout:    tlsHandshakeTimeout,
+		ResponseHeaderTimeout:  responseHeaderTimeout,
+		ExpectContinueTimeout:  time.Second,
+		MaxResponseHeaderBytes: maxResponseHeaderBytes,
 	}
 	return t
 }
@@ -166,20 +216,38 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// the reason, which the dial-time one cannot.
 		return nil, fmt.Errorf("%w: %s", ErrPlaintextRefused, req.URL.Scheme)
 	}
+	// The round trip runs on a context this transport can cancel, which is
+	// the only mechanism net/http offers for aborting a body read that is
+	// already blocked in the kernel. The stall watchdog below holds the
+	// cancel func; closing the body releases it.
+	var cancel context.CancelFunc
+	if t.stallWindow > 0 {
+		var ctx context.Context
+		ctx, cancel = context.WithCancel(req.Context())
+		req = req.Clone(ctx)
+	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, err
 	}
 	limit, capped := t.bodyLimit(req)
-	if !capped {
-		return resp, nil
-	}
-	if resp.ContentLength > limit {
+	if capped && resp.ContentLength > limit {
 		_ = resp.Body.Close()
+		if cancel != nil {
+			cancel()
+		}
 		return nil, fmt.Errorf("%w: %s declared %d bytes, limit %d",
 			ErrResponseTooLarge, req.URL.Path, resp.ContentLength, limit)
 	}
-	resp.Body = &limitedBody{inner: resp.Body, remaining: limit}
+	if capped {
+		resp.Body = &limitedBody{inner: resp.Body, remaining: limit}
+	}
+	if cancel != nil {
+		resp.Body = newStallGuard(resp.Body, cancel, t.stallWindow, t.minBytes)
+	}
 	return resp, nil
 }
 
@@ -360,13 +428,14 @@ var (
 	nat64  = netip.MustParsePrefix("64:ff9b::/96")
 	teredo = netip.MustParsePrefix("2001::/32")
 	sixTo4 = netip.MustParsePrefix("2002::/16")
-	// 2001:db8::/32 documentation, 5f00::/16 (former 6bone), 100::/64
-	// discard-only.
+	// 2001:db8::/32 documentation, 5f00::/16 (former 6bone, now the
+	// segment-routing SRv6 block), 100::/64 discard-only.
 	reservedV6 = []netip.Prefix{
 		netip.MustParsePrefix("::/128"),
 		netip.MustParsePrefix("::1/128"),
 		netip.MustParsePrefix("100::/64"),
 		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("5f00::/16"),
 	}
 )
 
@@ -481,3 +550,81 @@ func (b *limitedBody) Read(p []byte) (int, error) {
 }
 
 func (b *limitedBody) Close() error { return b.inner.Close() }
+
+// stallGuard enforces a minimum-throughput floor on a response body.
+//
+// It is the answer to "a trickling upstream held a connection for 29.8 s to
+// deliver 1000 bytes, indefinitely extendable". Once per window the watchdog
+// asks whether at least window x minRate bytes arrived since the last check;
+// if not, it cancels the request context, which unblocks whatever Read is
+// parked in the kernel and surfaces to the caller as ErrStalled.
+//
+// Cancelling the context is used rather than closing the body because
+// http.Response.Body is not documented to be safe to close concurrently with a
+// Read in flight, while aborting a request through its context is exactly what
+// the context is for.
+type stallGuard struct {
+	inner  io.ReadCloser
+	cancel context.CancelFunc
+
+	read    atomic.Int64
+	tripped atomic.Bool
+
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newStallGuard(inner io.ReadCloser, cancel context.CancelFunc, window time.Duration, minRate int64) *stallGuard {
+	g := &stallGuard{inner: inner, cancel: cancel, done: make(chan struct{})}
+	floor := int64(window.Seconds() * float64(minRate))
+	if floor < 1 {
+		floor = 1
+	}
+	// A watchdog goroutine rather than a timer reset on every Read: a 25 GiB
+	// stream would otherwise perform a timer operation per 128 KiB buffer,
+	// and — worse — one byte per window would keep the connection alive
+	// forever, which is the exact shape being refused.
+	go func() {
+		ticker := time.NewTicker(window)
+		defer ticker.Stop()
+		var last int64
+		for {
+			select {
+			case <-g.done:
+				return
+			case <-ticker.C:
+				now := g.read.Load()
+				if now-last < floor {
+					g.tripped.Store(true)
+					g.cancel()
+					return
+				}
+				last = now
+			}
+		}
+	}()
+	return g
+}
+
+func (g *stallGuard) Read(p []byte) (int, error) {
+	n, err := g.inner.Read(p)
+	if n > 0 {
+		g.read.Add(int64(n))
+	}
+	if err != nil && !errors.Is(err, io.EOF) && g.tripped.Load() {
+		// The read failed because the watchdog pulled the context out
+		// from under it; reporting context.Canceled here would read as
+		// "the user cancelled", which is the one thing it is not.
+		return n, ErrStalled
+	}
+	return n, err
+}
+
+func (g *stallGuard) Close() error {
+	err := g.inner.Close()
+	g.closeOnce.Do(func() {
+		close(g.done)
+		g.cancel()
+	})
+	return err
+}

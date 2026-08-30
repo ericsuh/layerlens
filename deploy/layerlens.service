@@ -1,0 +1,175 @@
+# layerlens — systemd unit for the linux/amd64 server deployment.
+#
+# Installed at /etc/systemd/system/layerlens.service by deploy/deploy.sh, which
+# also creates the unprivileged `layerlens` system user this runs as:
+#
+#   useradd --system --user-group --home-dir /var/lib/layerlens \
+#           --shell /usr/sbin/nologin layerlens
+#
+# (A static user rather than DynamicUser=yes: the state directory then lives at
+# the obvious /var/lib/layerlens instead of /var/lib/private/layerlens behind a
+# symlink, and the Docker-socket opt-in below needs a real user to put in the
+# `docker` group. Every other DynamicUser= implication is set explicitly here.)
+#
+# RESEARCH Q6: the deployment is assumed to be on a private/trusted network, so
+# there is no auth layer. The hardening below is applied regardless — it is
+# cheap and correct either way. See README.md § Deployment before exposing this
+# to the public internet.
+
+[Unit]
+Description=layerlens — container image layer and filesystem diff analyzer
+Documentation=https://github.com/ericsuh/layerlens
+# Registry pulls need routable DNS and egress; nothing else does, so a failure
+# to reach the network is not fatal (fixtures and the local cache still serve).
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting: the rate limiter belongs in [Unit], and disabling it
+# keeps a host that reboots into a transient failure from latching off forever.
+StartLimitIntervalSec=0
+
+[Service]
+# Type=exec, not simple: systemd then reports a failure to *execute* the binary
+# (missing, wrong architecture, unreadable under the sandbox below) as a failed
+# start instead of a successful one followed by an immediate exit.
+Type=exec
+
+User=layerlens
+Group=layerlens
+
+# ---------------------------------------------------------------------------
+# Configuration. Defaults live here; overrides go in /etc/layerlens/layerlens.env
+# (optional — the leading `-` means "skip it if absent"), so an operator never
+# has to edit a file that the next deploy overwrites.
+# ---------------------------------------------------------------------------
+Environment=LAYERLENS_LISTEN=:8080
+Environment=LAYERLENS_DATA_DIR=/var/lib/layerlens/images
+Environment=LAYERLENS_FIXTURES_DIR=/opt/layerlens/fixtures
+Environment=LAYERLENS_CACHE_MAX_BYTES=53687091200
+# "off" disables the Docker daemon source outright. It is the default because
+# reaching /run/docker.sock requires SupplementaryGroups=docker below, and
+# membership in that group is equivalent to root on the host — an explicit
+# opt-in, never something a deploy turns on silently.
+Environment=LAYERLENS_DOCKER_HOST=off
+# Resource guards. These bound what a single crafted or hostile image can cost
+# the server; the defaults are safe, and are named here so an operator can tune
+# them from the EnvironmentFile without editing this unit.
+Environment=LAYERLENS_MAX_CONCURRENT_PULLS=4
+Environment=LAYERLENS_MAX_LAYER_ENTRIES=2000000
+Environment=LAYERLENS_PULL_TIMEOUT=6h
+# Must agree with LAYERLENS_LISTEN; used only by the ExecStartPost readiness
+# probe, which is deliberately a loopback URL and never the public address.
+Environment=LAYERLENS_HEALTH_URL=http://127.0.0.1:8080/healthz
+EnvironmentFile=-/etc/layerlens/layerlens.env
+
+ExecStart=/opt/layerlens/layerlens --listen ${LAYERLENS_LISTEN} --data-dir ${LAYERLENS_DATA_DIR} --fixtures-dir ${LAYERLENS_FIXTURES_DIR} --cache-max-bytes ${LAYERLENS_CACHE_MAX_BYTES} --docker-host ${LAYERLENS_DOCKER_HOST} --max-concurrent-pulls ${LAYERLENS_MAX_CONCURRENT_PULLS} --max-layer-entries ${LAYERLENS_MAX_LAYER_ENTRIES} --pull-timeout ${LAYERLENS_PULL_TIMEOUT}
+
+# Readiness gate: /healthz answers 503 "loading" until the vendored fixtures are
+# analyzed, and curl treats 503 as a retryable transient error, so this returns
+# only once the demo images are actually queryable. --retry-connrefused covers
+# the window before the listener is open.
+#   `-` prefix: a host without curl, or a slow cold-cache fixture load, must not
+#   fail the unit — the server is up either way. `systemctl status` still shows
+#   the probe's exit status, and deploy.sh polls /healthz itself before
+#   declaring the deploy good.
+ExecStartPost=-/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused --max-time 10 --output /dev/null ${LAYERLENS_HEALTH_URL}
+
+# Graceful restart: SIGTERM makes the server stop accepting and drain in-flight
+# requests (15s internal budget), so TimeoutStopSec must exceed that or systemd
+# would SIGKILL mid-drain. An in-progress pull is abandoned; committed layer
+# indexes survive, so the retry after a restart resumes cheaply.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+TimeoutStartSec=120s
+Restart=on-failure
+RestartSec=2s
+
+# ---------------------------------------------------------------------------
+# State. StateDirectory creates /var/lib/layerlens owned by the service user,
+# with the correct SELinux/AppArmor labels, and makes it the ONE writable path
+# under ProtectSystem=strict. --data-dir is a subdirectory of it, created by the
+# server at startup. The server writes nowhere else: the cache stages, fsyncs
+# and renames inside its own root, and layer ingestion is streamed, never
+# spooled to a temp file (ARCHITECTURE §5).
+# ---------------------------------------------------------------------------
+StateDirectory=layerlens
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/layerlens
+
+# ---------------------------------------------------------------------------
+# Sandbox
+# ---------------------------------------------------------------------------
+NoNewPrivileges=yes
+# The whole hierarchy read-only (/usr, /boot, /etc included) except the API
+# filesystems and StateDirectory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+# Pure Go, no JIT and no cgo, so W^X costs nothing.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# No capabilities at all. The listen port is >1024, so CAP_NET_BIND_SERVICE is
+# not needed either; an operator who moves LAYERLENS_LISTEN to :80 must add
+# `AmbientCapabilities=CAP_NET_BIND_SERVICE` and the matching bounding-set entry
+# via a drop-in.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# AF_INET/AF_INET6: the listener and outbound registry pulls.
+# AF_UNIX: journald, and the Docker socket if it is ever enabled.
+# AF_NETLINK: Go's netgo resolver and interface lookups reach for it on Linux;
+#   denying it turns a name resolution into an obscure failure on a host we
+#   cannot test against, for no meaningful attack-surface gain.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# PrivateUsers is deliberately NOT set: a user namespace maps supplementary
+# groups to nobody, which would silently break the Docker-socket opt-in below.
+
+# --- Docker daemon source (opt-in) ------------------------------------------
+# Uncomment BOTH lines and set LAYERLENS_DOCKER_HOST=unix:///run/docker.sock in
+# /etc/layerlens/layerlens.env. Membership in `docker` grants root-equivalent
+# control of the host to this service — only do this on a host where that is
+# already the trust model.
+#SupplementaryGroups=docker
+#BindReadOnlyPaths=/run/docker.sock
+
+# ---------------------------------------------------------------------------
+# Resource limits. ARCHITECTURE §4.6 puts the ceiling at ~1.5 GiB RSS for a pair
+# of 500k-file images; MemoryHigh throttles via reclaim before MemoryMax turns
+# into an OOM kill, and Restart=on-failure picks the process back up if it does.
+# ---------------------------------------------------------------------------
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=512
+LimitNOFILE=8192
+LimitCORE=0
+OOMPolicy=stop
+
+# ---------------------------------------------------------------------------
+# Logging: the server writes structured slog lines to stderr; journald collects
+# them under the `layerlens` identifier (`journalctl -u layerlens`).
+# ---------------------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=layerlens
+
+[Install]
+WantedBy=multi-user.target

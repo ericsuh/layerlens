@@ -281,11 +281,19 @@ func (p *saveParser) streamLayer(ctx context.Context, name string, size int64, r
 		// No declared DiffID: in a save stream the config that would
 		// declare it has not necessarily been seen yet, so the digest is
 		// computed here and reconciled below.
-		Progress: p.progress.Bytes(),
+		Progress:   p.progress.Bytes(),
+		MaxEntries: p.ingester.maxLayerEntries,
 	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, analyze.ErrTooManyEntries) {
+			// Not a "this member was not a layer after all" case:
+			// the member *is* a layer and it is past the cap.
+			// Draining on would let the very allocation the cap
+			// exists to refuse be paid for by the next member.
+			return err
 		}
 		p.ingester.log.Warn("ingest: member of docker save stream is not a layer", "member", name, "err", err)
 		_, _ = io.Copy(io.Discard, buffered)
@@ -410,10 +418,11 @@ func (p *saveParser) indexBuffered(ctx context.Context, l saveLayer, diffID doma
 		mediaType = sniffed
 	}
 	idx, err := analyze.IndexLayer(ctx, analyze.LayerSource{
-		Reader:    reader,
-		MediaType: mediaType,
-		DiffID:    diffID,
-		Progress:  p.progress.Bytes(),
+		Reader:     reader,
+		MediaType:  mediaType,
+		DiffID:     diffID,
+		Progress:   p.progress.Bytes(),
+		MaxEntries: p.ingester.maxLayerEntries,
 	})
 	if err != nil {
 		return cachestore.LayerSummary{}, fmt.Errorf("ingest: index layer %s: %w", diffID, err)

@@ -623,3 +623,99 @@ func fillerDigest(t *testing.T, n int64, pattern byte) domain.Digest {
 	require.NoError(t, err)
 	return domain.DigestFromHash(h)
 }
+
+// TestIndexLayerEntryCap is the H1 regression: entry *count* is the one input
+// the streaming design does not bound on its own, and an empty tar member is
+// ~5 bytes of gzip that becomes a ~640-byte Entry. Before the cap, 14.8 MB of
+// gzip on the wire became 1.9 GB of heap (a 129:1 amplification) and the
+// process kept going.
+func TestIndexLayerEntryCap(t *testing.T) {
+	build := func(n int) []byte {
+		b := tartest.New()
+		for i := range n {
+			b.File(fmt.Sprintf("d/f%04d", i), "")
+		}
+		return b.Bytes()
+	}
+
+	t.Run("refuses a layer past the cap", func(t *testing.T) {
+		raw := build(10)
+		_, err := analyze.IndexLayer(t.Context(), analyze.LayerSource{
+			Reader:     bytes.NewReader(raw),
+			MediaType:  analyze.MediaTypeOCILayerTar,
+			MaxEntries: 4,
+		})
+		require.ErrorIs(t, err, analyze.ErrTooManyEntries)
+		assert.Contains(t, err.Error(), "4", "the message names the cap that was hit")
+	})
+
+	t.Run("accepts a layer exactly at the cap", func(t *testing.T) {
+		raw := build(4)
+		idx, err := analyze.IndexLayer(t.Context(), analyze.LayerSource{
+			Reader:     bytes.NewReader(raw),
+			MediaType:  analyze.MediaTypeOCILayerTar,
+			MaxEntries: 4,
+		})
+		require.NoError(t, err)
+		assert.Len(t, idx.Entries, 4)
+	})
+
+	t.Run("counts distinct paths, not tar members", func(t *testing.T) {
+		// Three members, one path: last-in-tar-wins costs one entry, so a
+		// layer that rewrites the same file is not refused by a cap of 1.
+		raw := tartest.New().File("a", "1").File("a", "22").File("a", "333").Bytes()
+		idx, err := analyze.IndexLayer(t.Context(), analyze.LayerSource{
+			Reader:     bytes.NewReader(raw),
+			MediaType:  analyze.MediaTypeOCILayerTar,
+			MaxEntries: 1,
+		})
+		require.NoError(t, err)
+		require.Len(t, idx.Entries, 1)
+		assert.Equal(t, int64(3), idx.ContentBytes)
+	})
+
+	t.Run("markers are charged too", func(t *testing.T) {
+		// A whiteout lives in its own keyspace but costs the same memory,
+		// so a layer of nothing but markers must not be a way past the cap.
+		raw := tartest.New().Whiteout("a").Whiteout("b").Whiteout("c").Bytes()
+		_, err := analyze.IndexLayer(t.Context(), analyze.LayerSource{
+			Reader:     bytes.NewReader(raw),
+			MediaType:  analyze.MediaTypeOCILayerTar,
+			MaxEntries: 2,
+		})
+		require.ErrorIs(t, err, analyze.ErrTooManyEntries)
+	})
+
+	t.Run("a zero cap means the default", func(t *testing.T) {
+		raw := build(3)
+		idx, err := analyze.IndexLayer(t.Context(), analyze.LayerSource{
+			Reader:    bytes.NewReader(raw),
+			MediaType: analyze.MediaTypeOCILayerTar,
+		})
+		require.NoError(t, err)
+		assert.Len(t, idx.Entries, 3)
+		assert.Positive(t, analyze.DefaultMaxEntries)
+	})
+}
+
+// The refusal must happen before the body of the offending member is drained:
+// the point of the cap is that the work is never done, and hashing a gigabyte
+// on the way to refusing it would defeat it.
+func TestIndexLayerEntryCapRefusesBeforeHashingTheBody(t *testing.T) {
+	raw := tartest.New().
+		File("a", "aaaa").
+		File("b", strings.Repeat("b", 4096)).
+		Bytes()
+	counter := &analyze.ByteCounter{}
+	_, err := analyze.IndexLayer(t.Context(), analyze.LayerSource{
+		Reader:     bytes.NewReader(raw),
+		MediaType:  analyze.MediaTypeOCILayerTar,
+		MaxEntries: 1,
+		Progress:   counter,
+	})
+	require.ErrorIs(t, err, analyze.ErrTooManyEntries)
+	// The tar reader has read the second header (one 512-byte block past the
+	// first member), but nothing of the 4 KiB body it introduces.
+	assert.Less(t, counter.Load(), int64(2048),
+		"the cap must fire on the header, not after draining the body")
+}

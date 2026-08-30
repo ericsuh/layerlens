@@ -32,8 +32,14 @@ const (
 	CodeDockerUnavailable  = "docker_unavailable"
 	CodeCacheFull          = "cache_full"
 	CodePullConflict       = "pull_conflict"
-	CodeBadRequest         = "bad_request"
-	CodeInternal           = "internal"
+	// CodeTooManyPulls is the admission control on POST /api/v1/pulls: the
+	// server is already running as many pulls as it will run at once.
+	CodeTooManyPulls = "too_many_pulls"
+	// CodePullTooLarge mirrors the ingest code of the same name: an image
+	// past a structural bound on work (layer count, entries in one layer).
+	CodePullTooLarge = "pull_too_large"
+	CodeBadRequest   = "bad_request"
+	CodeInternal     = "internal"
 	// CodeNotFound covers an unrouted path inside the reserved /api namespace.
 	CodeNotFound = "not_found"
 	// CodeMethodNotAllowed covers a known path reached with the wrong method.

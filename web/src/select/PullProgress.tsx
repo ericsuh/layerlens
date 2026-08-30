@@ -93,6 +93,11 @@ const ERROR_HEADINGS: Record<string, string> = {
   cache_full: "That image does not fit in the cache",
   docker_unavailable: "The Docker daemon is not reachable",
   pull_failed: "That image could not be analyzed",
+  // Structural bounds on work, and the admission control in front of them
+  // (ARCHITECTURE §6.1). Both are recoverable by the user, so they get their
+  // own heading rather than the generic one.
+  pull_too_large: "That image is too large for layerlens to analyze",
+  too_many_pulls: "This server is already busy with other pulls",
 };
 
 export function pullErrorHeading(code: string): string {

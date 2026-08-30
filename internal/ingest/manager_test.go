@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,6 +100,16 @@ func newManager(t *testing.T, store *cachestore.Store, opts ingest.ManagerOption
 	}
 	opts.Logger = discard()
 	return ingest.NewManager(opts)
+}
+
+// requireNoPullsInFlight waits for every admission slot to come back. A pull's
+// status goes terminal a moment before its goroutine returns the slot — the
+// status is written by the run, the slot is released by the deferred cleanup —
+// so this is a state transition to wait for, not one to assert on directly.
+func requireNoPullsInFlight(t *testing.T, m *ingest.Manager) {
+	t.Helper()
+	require.Eventually(t, func() bool { return m.InFlight() == 0 }, 10*time.Second, 2*time.Millisecond,
+		"every slot is returned when the run goroutine exits")
 }
 
 // waitFor polls until the predicate holds; every wait in this file is on a
@@ -460,4 +471,255 @@ func TestPullTableIsBounded(t *testing.T) {
 	}
 	assert.LessOrEqual(t, len(m.Pulls()), 64)
 	assert.NotEmpty(t, m.Pulls())
+}
+
+// TestPullEntryCapSurfacesAsAClassifiedFailure is the client-visible half of
+// H1: a layer past the entry cap must end the pull with a code the UI knows,
+// not with a generic 500 or a message quoting the upstream.
+func TestPullEntryCapSurfacesAsAClassifiedFailure(t *testing.T) {
+	store := newStore(t, t.TempDir(), 1<<30)
+	// One entry per layer is enough to refuse every fixture, and it proves
+	// the cap is the ingester's to set rather than a compile-time constant.
+	ingester := ingest.New(store, ingest.Options{Logger: discard(), MaxLayerEntries: 1})
+	m := newManager(t, store, ingest.ManagerOptions{
+		Ingester: ingester,
+		Registry: &fakeRegistrySource{img: fixtureImage(t, "example", "example:v1")},
+	})
+
+	started, err := m.Start(context.Background(), domain.IngestRequest{
+		Source: domain.IngestSourceRegistry, Reference: "ghcr.io/demo/app:v1",
+	})
+	require.NoError(t, err, "the refusal is a pull outcome, not a rejected request")
+
+	status := waitFor(t, m, started.ID, terminal)
+	require.Equal(t, domain.PullFailed, status.State)
+	require.NotNil(t, status.Error)
+	assert.Equal(t, ingest.CodePullTooLarge, status.Error.Code)
+	assert.Contains(t, status.Error.Message, "files")
+
+	// And nothing was committed: a layer that was refused mid-index is not
+	// a layer the cache may serve.
+	images, err := store.Images(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, images)
+}
+
+// TestConcurrentPullsAreBounded is H2. Before admission control, 400 concurrent
+// POSTs produced 400 goroutines, 400 outbound sessions, and a pull table of
+// 400 despite maxRetainedPulls = 64.
+func TestConcurrentPullsAreBounded(t *testing.T) {
+	const (
+		submissions = 400
+		limit       = 4
+	)
+	store := newStore(t, t.TempDir(), 1<<30)
+	// Every pull blocks on its first layer until the test releases it, so
+	// all of them are genuinely in flight at once.
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	source := &blockingRegistrySource{img: fixtureImage(t, "example", "example:v1"), release: release}
+	m := newManager(t, store, ingest.ManagerOptions{Registry: source, MaxInFlight: limit})
+
+	var accepted, refused atomic.Int64
+	var wg sync.WaitGroup
+	for i := range submissions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := m.Start(context.Background(), domain.IngestRequest{
+				Source:    domain.IngestSourceRegistry,
+				Reference: fmt.Sprintf("ghcr.io/demo/app%d:v1", i),
+			})
+			switch {
+			case err == nil:
+				accepted.Add(1)
+			case errors.Is(err, ingest.ErrTooManyPulls):
+				refused.Add(1)
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.LessOrEqual(t, accepted.Load(), int64(limit),
+		"no more pulls may be admitted than the limit allows")
+	assert.Equal(t, int64(submissions), accepted.Load()+refused.Load())
+	assert.Positive(t, refused.Load())
+	assert.LessOrEqual(t, m.InFlight(), limit)
+
+	// The outbound sessions are the point: a refused submit must not have
+	// reached the registry at all.
+	assert.LessOrEqual(t, source.opens.Load(), int64(limit))
+
+	// The table cannot grow with the submissions either. Its ceiling is the
+	// retained-history cap plus whatever is live, never the request count.
+	assert.LessOrEqual(t, len(m.Pulls()), 64+limit)
+
+	close(release)
+	for _, p := range m.Pulls() {
+		waitFor(t, m, p.ID, terminal)
+	}
+	requireNoPullsInFlight(t, m)
+}
+
+// A resubmission of a pull that is already running is idempotent by contract
+// (§6.3), so it must be answered from the table rather than charged an
+// admission slot — otherwise a browser retrying its own POST would lock itself
+// out of the limit it is already inside.
+func TestIdempotentResubmissionDoesNotConsumeASlot(t *testing.T) {
+	store := newStore(t, t.TempDir(), 1<<30)
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	source := &blockingRegistrySource{img: fixtureImage(t, "example", "example:v1"), release: release}
+	m := newManager(t, store, ingest.ManagerOptions{Registry: source, MaxInFlight: 1})
+
+	first, err := m.Start(context.Background(), domain.IngestRequest{
+		Source: domain.IngestSourceRegistry, Reference: "ghcr.io/demo/app:v1",
+	})
+	require.NoError(t, err)
+	require.True(t, first.Created)
+
+	// Twenty resubmissions of the same reference against a limit of one.
+	for range 20 {
+		again, err := m.Start(context.Background(), domain.IngestRequest{
+			Source: domain.IngestSourceRegistry, Reference: "ghcr.io/demo/app:v1",
+		})
+		require.NoError(t, err)
+		assert.False(t, again.Created)
+		assert.Equal(t, first.ID, again.ID)
+	}
+	assert.Equal(t, 1, m.InFlight())
+	require.Eventually(t, func() bool { return source.opens.Load() == 1 }, 10*time.Second, 5*time.Millisecond,
+		"one reference, one outbound session")
+	assert.Equal(t, int64(1), source.opens.Load())
+
+	// A *different* reference is still refused: the slot is genuinely taken.
+	_, err = m.Start(context.Background(), domain.IngestRequest{
+		Source: domain.IngestSourceRegistry, Reference: "ghcr.io/demo/other:v1",
+	})
+	assert.ErrorIs(t, err, ingest.ErrTooManyPulls)
+
+	close(release)
+	waitFor(t, m, first.ID, terminal)
+	requireNoPullsInFlight(t, m)
+}
+
+// Pull ids are unguessable. Any client can cancel any pull and that is
+// acceptable on the trusted network layerlens is specified for, but the ids
+// should not also be derivable from a wall clock (ARCHITECTURE §7.3).
+func TestPullIDsAreUnguessable(t *testing.T) {
+	store := newStore(t, t.TempDir(), 1<<30)
+	m := newManager(t, store, ingest.ManagerOptions{
+		Registry: &fakeRegistrySource{img: fixtureImage(t, "example", "example:v1")},
+	})
+	seen := map[domain.PullID]struct{}{}
+	for i := range 8 {
+		started, err := m.Start(context.Background(), domain.IngestRequest{
+			Source:    domain.IngestSourceRegistry,
+			Reference: fmt.Sprintf("ghcr.io/demo/app%d:v1", i),
+		})
+		require.NoError(t, err)
+		waitFor(t, m, started.ID, terminal)
+		_, dup := seen[started.ID]
+		require.False(t, dup, "ids must be unique")
+		seen[started.ID] = struct{}{}
+		assert.Len(t, string(started.ID), 33, "p + 16 random bytes as hex")
+		assert.NotContains(t, string(started.ID), "-", "no sequence counter to walk")
+	}
+}
+
+// blockingRegistrySource holds every pull open on its first layer until
+// release is closed, so a test can have N pulls genuinely in flight at once.
+type blockingRegistrySource struct {
+	img     v1.Image
+	release <-chan struct{}
+	opens   atomic.Int64
+}
+
+func (b *blockingRegistrySource) Open(ctx context.Context, _ domain.ImageRef) (*ingest.RemoteImage, error) {
+	b.opens.Add(1)
+	manifest, err := b.img.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	out := &ingest.RemoteImage{
+		Image:      &heldImage{Image: b.img, ctx: ctx, release: b.release},
+		LayerCount: len(manifest.Layers),
+	}
+	for _, l := range manifest.Layers {
+		out.BytesTotal += l.Size
+	}
+	return out, nil
+}
+
+type heldImage struct {
+	v1.Image
+	ctx     context.Context
+	release <-chan struct{}
+}
+
+func (h *heldImage) Layers() ([]v1.Layer, error) {
+	layers, err := h.Image.Layers()
+	if err != nil {
+		return nil, err
+	}
+	if len(layers) > 0 {
+		layers[0] = &heldLayer{Layer: layers[0], ctx: h.ctx, release: h.release}
+	}
+	return layers, nil
+}
+
+type heldLayer struct {
+	v1.Layer
+	ctx     context.Context
+	release <-chan struct{}
+}
+
+func (h *heldLayer) Compressed() (io.ReadCloser, error) {
+	select {
+	case <-h.release:
+	case <-h.ctx.Done():
+		return nil, h.ctx.Err()
+	}
+	return h.Layer.Compressed()
+}
+
+// The wall-clock backstop is the second half of M2: safehttp's throughput floor
+// cannot see the docker-save path, and nothing else bounded a pull's lifetime.
+// A pull that hits it is a failure, not a cancellation — nobody asked for it.
+func TestPullTimeoutFailsTheStalledPull(t *testing.T) {
+	store := newStore(t, t.TempDir(), 1<<30)
+	blocked := make(chan struct{}) // never closed: the source hangs forever
+	t.Cleanup(func() { close(blocked) })
+	source := &blockingRegistrySource{img: fixtureImage(t, "example", "example:v1"), release: blocked}
+	m := newManager(t, store, ingest.ManagerOptions{
+		Registry:    source,
+		PullTimeout: 50 * time.Millisecond,
+	})
+
+	started, err := m.Start(context.Background(), domain.IngestRequest{
+		Source: domain.IngestSourceRegistry, Reference: "ghcr.io/demo/app:v1",
+	})
+	require.NoError(t, err)
+
+	status := waitFor(t, m, started.ID, terminal)
+	assert.Equal(t, domain.PullFailed, status.State,
+		"a deadline nobody asked for is a failure, not a cancellation")
+	require.NotNil(t, status.Error)
+	assert.Equal(t, ingest.CodePullFailed, status.Error.Code)
+	assert.Contains(t, status.Error.Message, "longer")
+	requireNoPullsInFlight(t, m)
 }

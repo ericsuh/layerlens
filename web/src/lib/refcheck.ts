@@ -92,7 +92,15 @@ function normalizeRegistry(raw: string): string | null {
   // The alias rewrite is case-sensitive upstream, so it happens before the
   // lowercasing rather than after it.
   const rewritten = raw === DEFAULT_REGISTRY_ALIAS ? DEFAULT_REGISTRY : raw;
-  return rewritten.toLowerCase().replace(/\.$/, "");
+  // Exactly one trailing root dot is trimmed, and what remains must have no
+  // empty label. "ghcr.io.." is not a second spelling of "ghcr.io": the root
+  // dot is a legal suffix, a second one is an empty label, and an empty label
+  // is not a name. The server refuses it as invalid, so this must too.
+  const host = rewritten.toLowerCase().replace(/\.$/, "");
+  if (host === "" || host.split(".").some((label) => label === "")) {
+    return null;
+  }
+  return host;
 }
 
 /**
@@ -218,6 +226,11 @@ export function isAllowedRegistry(host: string, patterns: readonly string[]): bo
   });
 }
 
+/** Whether a reference carries a `.`, `..` or empty path segment. */
+function hasTraversalSegment(reference: string): boolean {
+  return reference.split("/").some((segment) => segment === "." || segment === ".." || segment === "");
+}
+
 /**
  * The whole pre-flight verdict for one reference. Pure: the pattern list is an
  * argument so the caller can pass the list `/api/v1/meta` reported and the
@@ -230,6 +243,14 @@ export function checkReference(
   const trimmed = raw.trim();
   if (trimmed === "") {
     return { kind: "empty" };
+  }
+  // A "." or ".." path segment is refused before anything else, mirroring
+  // `imgref.ValidatePathSegments`. The upstream grammar allows them and passes
+  // them through un-normalized, so `ghcr.io/../../secret` would otherwise show
+  // a green verdict for a reference that becomes a literal
+  // `GET /v2/../../secret/manifests/…` on the wire.
+  if (hasTraversalSegment(trimmed)) {
+    return { kind: "invalid" };
   }
   // Tag first, then digest — the upstream order, and the one that makes
   // `repo@sha256:…` (whose tag parse fails on the "@") resolve correctly.

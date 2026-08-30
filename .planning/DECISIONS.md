@@ -1150,6 +1150,140 @@ optional field, no rename, removal or reinterpretation of an existing one.
   Registry user sees `*.pkg.dev` there and gets a `✓ allowed` verdict on the
   reference itself.
 
+### Phase 009 (deployment & release hardening), 2026-08-30
+
+- **ARCHITECTURE §9.5 item 14 was written against the wrong unit of measure.**
+  It said: start with `--cache-max-bytes=1000000` and "ingest a fixture larger
+  than that". The cache stores layer *indexes*, never blobs (§5), so the cap
+  bounds index bytes: with a 1,000,000-byte cap the UAT actually ingested a
+  57 MB image successfully (its index is a few hundred KB). Executing the
+  item's *intent* needs a cap just above what the pinned fixtures occupy
+  (~195 KB). **§9.5 item 14 updated** to say so, with the unit-of-measure
+  caveat spelled out; the refusal path itself behaves exactly as RESEARCH Q7
+  requires — verified: cap 250000, fixtures at 195256, ingest of
+  `node:22-alpine` refused with `cache_full` ("This image does not fit in the
+  server's cache budget.") and all ten pinned fixtures untouched. The same
+  caveat is now in the README's known limitations, because sizing the cap
+  against image sizes would over-provision it by three orders of magnitude.
+
+- **`--docker-host off` was indistinguishable from "no socket found".** Both
+  left `cfg.dockerHost` empty, so the daemon tab told the user "No Docker
+  socket found at /var/run/docker.sock" even when the operator had explicitly
+  turned the source off. This mattered because the systemd unit this phase
+  ships sets `off` by **default** (the socket needs a root-equivalent group),
+  so every deployment would have shown the wrong explanation. Fixed:
+  `ingest.DockerOptions.Disabled` carries the operator's decision through to
+  `unavailableReason`, which now answers "The Docker daemon source is turned
+  off on this server (--docker-host off)." **ARCHITECTURE §1.3 updated** to
+  record that the two states are distinct. Covered by
+  `TestDockerListingWhenExplicitlyDisabled`.
+
+- **The unit parameterizes its flags through `Environment=` +
+  `EnvironmentFile=-/etc/layerlens/layerlens.env`** rather than hardcoding them
+  in `ExecStart` as §1.3 sketched. Reason: the deploy overwrites the unit file
+  every time, so an operator who tuned `--cache-max-bytes` on the box would
+  lose it on the next deploy. §1.3 updated.
+
+- **Fixture swap is not atomic, and cannot be.** The binary swap is a single
+  `rename(2)` into the same filesystem (staging path inside the install
+  directory) and is genuinely atomic; a directory has no such primitive, so
+  `fixtures/` is swapped in two steps keeping one previous copy. Harmless: the
+  server reads fixtures once at startup, and the restart follows the swap.
+
+- **Not fixed, reported instead (out of phase-009 scope):** layer indexes
+  committed by a pull that never produces an image record — one refused with
+  `cache_full`, or cancelled and never retried — are counted against the cache
+  cap and are never reclaimed. Eviction only drops layers when an *image* that
+  references them is evicted (`lru.go` `layerReferencedLocked`), and the
+  startup sweep deliberately keeps complete-but-unreferenced layer directories
+  because that is what makes a retry cheap. Observed during UAT: a refused pull
+  left ~7.8 KB behind. Bounded in practice (kilobytes per abandoned pull against
+  a 50 GiB default) but unbounded in principle; the fix is an orphan-layer
+  reclamation pass in `cachestore`, which is phase 005 surface.
+
+### Security review fixes (phase 008 adversarial review), 2026-08-30
+
+Applied from `REVIEW-phase-008-security.md`. The review's verdict — "safe on a
+trusted network as specified; not safe if exposed publicly, and the reason is
+availability, not SSRF" — is unchanged in kind: none of these are exploits of
+the trust boundary, they are missing bounds on work. Every finding marked
+`[repro]` was re-reproduced before and after the fix.
+
+- **H1 — entry count per layer is now capped** (ARCHITECTURE §4.6, §7.2
+  updated). `analyze.IndexLayer` grew `entries` without limit. `MaxLayers`,
+  manifest size and config size were capped; entry *count*, the one input that
+  is O(retained memory), was not. Reproduced at **14.8 MB of gzip → 1,905 MB of
+  heap, 129:1** (the review measured 7.0 MB → 494 MB, 74:1 with a different
+  member shape). New `analyze.DefaultMaxEntries` = 2,000,000, injectable via
+  `LayerSource.MaxEntries` / `ingest.Options.MaxLayerEntries` /
+  `--max-layer-entries`, refusing with `analyze.ErrTooManyEntries`. After: the
+  same blob is refused with heap flat at the cap. The cap counts **distinct
+  paths** (last-in-tar-wins costs one) and charges whiteout/opaque markers too,
+  and it fires on the header rather than after draining the member's body.
+- **H1 wire surface — new pull failure code `pull_too_large`.** `ErrTooManyEntries`
+  and the pre-existing `ErrTooManyLayers` both classify to it. `ErrTooManyLayers`
+  previously reported `pull_failed`; the message was already specific, only the
+  code changes, and unknown codes already fall back to a generic heading in the
+  SPA. Added to ARCHITECTURE §6.1 and to `PullProgress.tsx`'s heading map.
+- **H2 — admission control on pulls** (ARCHITECTURE §6.3, §1.3 updated). Every
+  POST bought a goroutine and a real outbound registry session with nothing in
+  between. Reproduced: **400 concurrent submits → 400 accepted, 400 goroutines,
+  399 outbound sessions, pull table of 400** despite `maxRetainedPulls = 64`
+  (`evictLocked` only drops *terminal* pulls, so the cap could never bite while
+  everything was live). After, with the default limit of 4: **4 accepted,
+  396 refused with 429 `too_many_pulls`, 4 outbound sessions, table of 4.**
+  The duplicate check and the slot acquisition now happen under one hold of the
+  manager mutex, which is what makes idempotent resubmission free *and* stops
+  two identical concurrent submits from both being admitted — the old
+  check-then-launch had that race too.
+- **M1 — `--cache-max-bytes` now bounds peak disk, not just steady state**
+  (ARCHITECTURE §5 updated). The staged index was written in full and only then
+  measured. Reproduced at a 1 MiB cap: **20,173,648 bytes on disk (19.2x)**
+  before `ErrCacheFull` (the review measured 12,104,078, 11.5x, on a smaller
+  index). The staged write is now charged against `cap − pinned − txn.ownBytes`
+  as it streams, with the limiter *under* the buffered writer so the overshoot
+  is at most one flush. After: **1,046,367 bytes (1.00x)**. `reserve` still runs
+  afterwards and still produces the error message, so the wording a user sees
+  does not depend on which of the two checks fired first.
+- **M2 — a throughput floor, deliberately not a total deadline** (ARCHITECTURE
+  §7.2). `safehttp` bounded only time-to-first-byte and the manager ran on
+  `context.Background()`. Every response body is now wrapped in a watchdog
+  requiring `MinThroughput` bytes/s over a `StallWindow` (4 KiB/s over 30 s by
+  default), which aborts the request context — the only mechanism net/http
+  offers for unblocking a `Read` already parked in the kernel. A floor was
+  chosen over a deadline because it cannot misjudge a slow-but-progressing
+  25 GiB pull, which is the case any deadline generous enough for that image is
+  also generous enough to hide inside. `--pull-timeout` (6h, `0` disables) is
+  the backstop for what the floor cannot see, chiefly the docker-save stream;
+  6h carries 25 GiB at ~1.2 MB/s sustained. A pull that hits it reports
+  `error`, not `cancelled`: nobody asked for it.
+- **L1 — `.`/`..`/empty path segments refused on the registry path**
+  (ARCHITECTURE §7.1). The rule already existed ten lines away for the Docker
+  path; it is now one exported helper (`imgref.ValidatePathSegments`) used by
+  both, and mirrored in the SPA's `refcheck.ts` so the shared
+  `testdata/refs.json` vectors stay honest.
+- **L2 — trailing dots normalized exactly once** (ARCHITECTURE §7.1). `Parse`
+  trimmed one and `Allows` trimmed a second, so `ghcr.io../o/i` was accepted and
+  carried as the registry `ghcr.io.`. Normalization is now one function that
+  trims one dot and then requires every label to be non-empty. The SPA mirror
+  had the same shape and now agrees (it previously answered `not-allowed` where
+  the server now answers `invalid`).
+- **Informational, all four taken.** `--docker-host` must name a unix socket
+  (path or `unix://`) unless `--docker-allow-tcp` is passed, including when the
+  endpoint comes from `DOCKER_HOST` — the daemon path is the one egress the
+  dial-time screen never sees. `5f00::/16` added to `reservedV6`, which its own
+  comment already named. `MaxResponseHeaderBytes = 64 KiB` on the transport (the
+  stdlib default is 10 MiB per response). Pull ids are now `"p" + 16
+  crypto/rand bytes in hex` rather than `p<unixnano>-<seq>`: any client can
+  still cancel any pull, which is acceptable on a trusted network and is what
+  `GET /api/v1/pulls` already implies, but it need not also be guessable — and
+  §7.3 had already specified random hex.
+- **Not done: an auth gate.** The review names it as required *if this were ever
+  exposed publicly*. It is out of scope per RESEARCH Q3 (private/trusted
+  deployment) and is a product decision, not a bug fix; the four availability
+  bounds above are the part that was in scope.
+
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.

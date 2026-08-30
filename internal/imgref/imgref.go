@@ -89,19 +89,16 @@ func (a *Allowlist) Patterns() []string {
 // Allows reports whether host is on the allowlist. host must already be a bare
 // registry host with no port.
 func (a *Allowlist) Allows(host string) bool {
-	host = strings.ToLower(host)
-	// A trailing dot makes "ghcr.io." the same name to DNS but a different
-	// string here; normalizing it away closes that spelling.
-	host = strings.TrimSuffix(host, ".")
-	if host == "" {
+	// Normalization is shared with Parse rather than repeated here. Doing it
+	// in both places was a bug, not redundancy: Parse trimmed one trailing
+	// dot and this function trimmed a second, so "ghcr.io.." was accepted
+	// and then carried as the registry "ghcr.io." — a second idempotency
+	// key for one image and a non-canonical TLS ServerName.
+	host, ok := normalizeRegistry(host)
+	if !ok {
 		return false
 	}
 	labels := strings.Split(host, ".")
-	for _, l := range labels {
-		if l == "" {
-			return false
-		}
-	}
 	for _, p := range a.patterns {
 		if matchLabels(strings.Split(p, "."), labels) {
 			return true
@@ -153,15 +150,32 @@ func (a *Allowlist) Parse(raw string) (domain.ImageRef, error) {
 		return domain.ImageRef{}, fmt.Errorf("%w: %s", ErrInvalidReference, trimmed)
 	}
 
+	// A "." or ".." segment is refused before anything else is decided. The
+	// host cannot change — the allowlist has already fixed it — but
+	// go-containerregistry's grammar allows traversal segments in the
+	// repository path and passes them through un-normalized, so
+	// "ghcr.io/../../secret" becomes a literal
+	// "GET /v2/../../secret/manifests/v1" and a token scope of
+	// "repository:../../secret:pull". It is an arbitrary anonymous GET path
+	// on a vetted registry, which is not much, but it is also not anything
+	// anyone means to type. The Docker path already refuses these
+	// (validLocalReference); this is the same rule for the registry path.
+	if err := ValidatePathSegments(trimmed); err != nil {
+		return domain.ImageRef{}, err
+	}
+
 	// DNS is case-insensitive and a trailing root dot names the same host,
 	// so both spellings are normalized away here rather than being carried
 	// into the allowlist check, the pull manager's idempotency key and the
 	// TLS ServerName downstream.
-	registry := strings.TrimSuffix(strings.ToLower(ref.Context().RegistryStr()), ".")
+	registry, ok := normalizeRegistry(ref.Context().RegistryStr())
+	if !ok {
+		return domain.ImageRef{}, fmt.Errorf("%w: %s", ErrInvalidReference, trimmed)
+	}
 	// An explicit port is refused rather than allowlisted per-port: the
 	// allowlist names registries, and "ghcr.io:8443" is a different service
 	// from the one the operator vetted.
-	if _, _, ok := splitPort(registry); ok {
+	if _, _, hasPort := splitPort(registry); hasPort {
 		return domain.ImageRef{}, fmt.Errorf(
 			"%w: %s names an explicit port; layerlens pulls over https on port 443 only",
 			ErrInvalidReference, trimmed)
@@ -196,6 +210,44 @@ func (a *Allowlist) Parse(raw string) (domain.ImageRef, error) {
 		out.Digest = digest
 	}
 	return out, nil
+}
+
+// normalizeRegistry lowercases a registry host and removes the single trailing
+// root dot DNS allows, reporting false for anything that is not a well-formed
+// host.
+//
+// Exactly one dot is trimmed, and what remains must have no empty label. That
+// is what makes "ghcr.io.." invalid rather than a second spelling of
+// "ghcr.io": the root dot is a legal suffix, a second one is an empty label,
+// and an empty label is not a name.
+func normalizeRegistry(host string) (string, bool) {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" {
+		return "", false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return "", false
+		}
+	}
+	return host, true
+}
+
+// ValidatePathSegments refuses a reference carrying a "." or ".." path segment,
+// or an empty one.
+//
+// It is checked on the raw string rather than on a parsed repository because
+// the parse is exactly what hides the problem: go-containerregistry reads a
+// leading "." as a *registry* (it contains a dot), so "./x" parses cleanly with
+// an innocuous-looking repository and is still concatenated verbatim into a
+// request path downstream.
+func ValidatePathSegments(reference string) error {
+	for _, segment := range strings.Split(reference, "/") {
+		if segment == "." || segment == ".." || segment == "" {
+			return fmt.Errorf("%w: %s", ErrInvalidReference, reference)
+		}
+	}
+	return nil
 }
 
 // splitPort reports whether host carries an explicit ":port" suffix.

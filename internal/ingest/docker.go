@@ -66,6 +66,13 @@ type DockerOptions struct {
 	// empty host means "no daemon configured" and every call reports
 	// unavailability rather than failing.
 	Host string
+	// Disabled distinguishes `--docker-host off` from "nothing was found".
+	// Both leave Host empty, but only one of them is a decision the
+	// operator made, and telling them apart is the difference between
+	// "your server has no Docker" and "your server was told not to use
+	// it" — the deployed systemd unit sets `off` by default, so the
+	// wrong one of those is what every deployment would show.
+	Disabled bool
 	// Images is consulted to mark rows that are already analyzed.
 	Images domain.ImageStore
 	Logger *slog.Logger
@@ -87,10 +94,11 @@ type DockerSource interface {
 
 // Docker is the local-daemon image source.
 type Docker struct {
-	host   string
-	images domain.ImageStore
-	log    *slog.Logger
-	dial   func(host string) (DockerAPI, error)
+	host     string
+	disabled bool
+	images   domain.ImageStore
+	log      *slog.Logger
+	dial     func(host string) (DockerAPI, error)
 
 	mu  sync.Mutex
 	api DockerAPI
@@ -102,7 +110,7 @@ var _ DockerSource = (*Docker)(nil)
 // NewDocker builds the daemon source. It performs no I/O: a server with no
 // Docker must start exactly as fast as one with it.
 func NewDocker(opts DockerOptions) *Docker {
-	d := &Docker{host: opts.Host, images: opts.Images, log: opts.Logger, dial: opts.Dial}
+	d := &Docker{host: opts.Host, disabled: opts.Disabled, images: opts.Images, log: opts.Logger, dial: opts.Dial}
 	if d.log == nil {
 		d.log = slog.Default()
 	}
@@ -147,6 +155,9 @@ func (d *Docker) client() (DockerAPI, error) {
 
 // unavailableReason renders the DESIGN §9 state-#4 explanation.
 func (d *Docker) unavailableReason(err error) string {
+	if d.disabled {
+		return "The Docker daemon source is turned off on this server (--docker-host off)."
+	}
 	if d.host == "" {
 		return "No Docker socket found at /var/run/docker.sock — the daemon source is unavailable on this server."
 	}

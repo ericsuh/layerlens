@@ -1,11 +1,13 @@
 package safehttp_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,8 +70,9 @@ func TestScreenAddrRejectsNonPublic(t *testing.T) {
 		"100.64.0.1", "192.0.0.1", "198.18.0.1", "240.0.0.1", "255.255.255.255",
 		// v6 transition forms that deliver to a private v4
 		"64:ff9b::a00:1", "64:ff9b::a9fe:a9fe", "2002:0a00:0001::", "2001::1",
-		// documentation/discard
-		"2001:db8::1", "100::1",
+		// documentation/discard, and 5f00::/16, which the comment on
+		// reservedV6 named but the slice omitted
+		"2001:db8::1", "100::1", "5f00::1", "5f00:ffff::ffff",
 	}
 	for _, s := range refused {
 		ip, err := netip.ParseAddr(s)
@@ -382,4 +386,150 @@ func loopbackClientWithLimit(t *testing.T, server *httptest.Server, table map[st
 		RootCAs:          pool,
 	})
 	return transport.Client(), transport
+}
+
+// TestStallDetectorRefusesATricklingBody is M2. Before it, safehttp bounded
+// only time-to-first-byte, Client() set no Timeout and the pull manager ran on
+// context.Background(), so an upstream that dribbled 1000 bytes over 29.8 s
+// could hold a connection, a goroutine and a slot indefinitely.
+func TestStallDetectorRefusesATricklingBody(t *testing.T) {
+	const window = 100 * time.Millisecond
+	server := newLoopbackTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		// One byte per window, forever: always progressing, never
+		// arriving. This is exactly what a fixed total deadline cannot
+		// distinguish from a slow-but-honest transfer.
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(window / 4):
+			}
+			if _, err := w.Write([]byte{'x'}); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	})
+	host, port := splitHostPort(t, server.URL)
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	transport := safehttp.New(safehttp.Options{
+		Resolver:       &tableResolver{table: map[string][]netip.Addr{host: addrs(t, host)}},
+		PermitLoopback: true,
+		RootCAs:        pool,
+		StallWindow:    window,
+		MinThroughput:  1 << 20, // 1 MiB/s: a trickle cannot meet it
+	})
+	t.Cleanup(transport.CloseIdleConnections)
+
+	// A blob path so the metadata size cap is not what stops it.
+	resp, err := transport.Client().Get(
+		"https://" + net.JoinHostPort(host, port) + "/v2/o/i/blobs/sha256:beef")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	started := time.Now()
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.Error(t, err, "a body that never meets the floor must not read to EOF")
+	assert.ErrorIs(t, err, safehttp.ErrStalled)
+	assert.Less(t, time.Since(started), 5*time.Second,
+		"the refusal comes within a window or two, not eventually")
+}
+
+// The control that matters most is the one that must NOT fire: a legitimately
+// slow but progressing transfer — the 25 GiB pull the whole design exists for —
+// has to run to completion.
+func TestStallDetectorPassesASlowButProgressingBody(t *testing.T) {
+	const (
+		window = 100 * time.Millisecond
+		chunks = 12
+		chunk  = 4096
+	)
+	server := newLoopbackTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		payload := bytes.Repeat([]byte{'a'}, chunk)
+		for range chunks {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(window / 3):
+			}
+			if _, err := w.Write(payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	})
+	host, port := splitHostPort(t, server.URL)
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	transport := safehttp.New(safehttp.Options{
+		Resolver:       &tableResolver{table: map[string][]netip.Addr{host: addrs(t, host)}},
+		PermitLoopback: true,
+		RootCAs:        pool,
+		StallWindow:    window,
+		// A floor this transfer clears with room to spare, and which a
+		// 25 GiB pull on any real link clears by orders of magnitude.
+		MinThroughput: 1024,
+	})
+	t.Cleanup(transport.CloseIdleConnections)
+
+	resp, err := transport.Client().Get(
+		"https://" + net.JoinHostPort(host, port) + "/v2/o/i/blobs/sha256:beef")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	n, err := io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err, "a progressing transfer must never be killed")
+	assert.Equal(t, int64(chunks*chunk), n)
+}
+
+// A negative window turns the detector off; the rest of the transport is
+// unaffected.
+func TestStallDetectorCanBeDisabled(t *testing.T) {
+	server := newLoopbackTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	host, port := splitHostPort(t, server.URL)
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	transport := safehttp.New(safehttp.Options{
+		Resolver:       &tableResolver{table: map[string][]netip.Addr{host: addrs(t, host)}},
+		PermitLoopback: true,
+		RootCAs:        pool,
+		StallWindow:    -1,
+	})
+	t.Cleanup(transport.CloseIdleConnections)
+
+	resp, err := transport.Client().Get("https://" + net.JoinHostPort(host, port) + "/v2/")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(raw))
+}
+
+// The stdlib's 10 MiB default response-header budget is real memory, spent per
+// concurrent response, on something whose largest legitimate value is a
+// WWW-Authenticate line.
+func TestResponseHeadersAreCapped(t *testing.T) {
+	server := newLoopbackTLSServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// One header far past any cap a registry would need.
+		w.Header().Set("X-Bloat", strings.Repeat("a", 1<<20))
+		w.WriteHeader(http.StatusOK)
+	})
+	host, port := splitHostPort(t, server.URL)
+	client, transport := loopbackClient(t, server, map[string][]netip.Addr{host: addrs(t, host)})
+	t.Cleanup(transport.CloseIdleConnections)
+
+	resp, err := client.Get("https://" + net.JoinHostPort(host, port) + "/v2/")
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err, "an oversized response head must be refused, not buffered")
 }

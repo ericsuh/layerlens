@@ -96,6 +96,20 @@ func TestDockerListingWithoutASocket(t *testing.T) {
 	assert.NotNil(t, listing.Images, "the client's empty state keys on length, so null is not acceptable")
 }
 
+// `--docker-host off` and "nothing was found" both leave the host empty, but
+// they are different answers and the deployed systemd unit sets `off` by
+// default — so a deployment must not tell every operator that their server has
+// no Docker socket when they are the one who turned the source off.
+func TestDockerListingWhenExplicitlyDisabled(t *testing.T) {
+	d := ingest.NewDocker(ingest.DockerOptions{Disabled: true, Logger: discard()})
+	listing, err := d.List(context.Background())
+	require.NoError(t, err)
+	assert.False(t, listing.Available)
+	assert.Contains(t, listing.Reason, "turned off")
+	assert.NotContains(t, listing.Reason, "No Docker socket found")
+	assert.NotNil(t, listing.Images)
+}
+
 func TestDockerListingWhenThePingFails(t *testing.T) {
 	d := newFakeDocker(t, &fakeDaemon{pingErr: errors.New("permission denied")}, nil)
 	listing, err := d.List(context.Background())

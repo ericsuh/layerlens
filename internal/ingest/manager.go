@@ -2,6 +2,8 @@ package ingest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,15 +36,61 @@ const (
 	// CodePullFailed is everything else. The message is generic; the cause
 	// is logged server-side.
 	CodePullFailed = "pull_failed"
+	// CodePullTooLarge is an image that exceeds one of the structural
+	// bounds on work: too many layers, or one layer with too many entries.
+	// Distinct from CodeCacheFull, which is about the configured disk
+	// budget, and from CodePullFailed, which says nothing actionable.
+	CodePullTooLarge = "pull_too_large"
 )
 
 // maxRetainedPulls bounds the in-memory pull table. Statuses are process-local
 // and lost on restart by design (ARCHITECTURE §10.4); this bounds them within
 // one process's lifetime too.
+//
+// It is a cap on *terminal* history only: evictLocked will not cancel live
+// work to honour it, so on its own it bounded nothing — 400 concurrent submits
+// produced a 400-entry table. What actually bounds the table is
+// DefaultMaxInFlightPulls below; this cap then trims the finished ones behind
+// it, and the table's true ceiling is the sum of the two.
 const maxRetainedPulls = 64
+
+// DefaultMaxInFlightPulls bounds how many pulls may be running at once.
+//
+// Without it, every POST /api/v1/pulls bought the caller a goroutine and a real
+// outbound registry session, with nothing in between: 400 concurrent submits
+// produced 400 of each, aimed at five major registries from the server's own
+// IP, and multiplied the cost of every other bound in the system (each in-flight
+// pull can hold a layer index of up to analyze.DefaultMaxEntries in memory).
+//
+// The number is small on purpose. A pull is a foreground action a human is
+// watching, and a machine that is already streaming four images is not made
+// faster by starting a fifth; the surplus is refused with 429 rather than
+// queued, so the client learns immediately instead of waiting behind work it
+// cannot see.
+const DefaultMaxInFlightPulls = 4
+
+// DefaultPullTimeout is the wall-clock ceiling on a single pull.
+//
+// It is deliberately far larger than any real pull. The finding it answers is
+// that a pull had no deadline at all — safehttp bounded only time-to-first-byte,
+// and the manager ran on context.Background() — so a trickling upstream could
+// hold a goroutine, a slot and a socket forever. The primary control for that
+// is safehttp's stall detector (a *throughput* floor, which cannot misjudge a
+// slow-but-progressing transfer); this is the backstop for what the detector
+// cannot see, chiefly a docker-save stream over the unix socket.
+//
+// Six hours carries a 25 GiB image at ~1.2 MB/s sustained, which is slower than
+// any link worth pulling over and roughly two orders of magnitude below what
+// the design envelope assumes. A legitimate pull that hits this was never going
+// to finish.
+const DefaultPullTimeout = 6 * time.Hour
 
 // ErrPullNotFound reports an unknown pull id.
 var ErrPullNotFound = errors.New("ingest: no such pull")
+
+// ErrTooManyPulls reports that the concurrent-pull limit is reached. It is the
+// admission control the API surfaces as 429 (§6.1).
+var ErrTooManyPulls = errors.New("ingest: too many pulls are already in flight")
 
 // ManagerOptions configures a Manager.
 type ManagerOptions struct {
@@ -53,6 +101,13 @@ type ManagerOptions struct {
 	Images    domain.ImageStore
 	Logger    *slog.Logger
 	Now       func() time.Time
+	// MaxInFlight bounds concurrent running pulls. Zero means
+	// DefaultMaxInFlightPulls; negative means unbounded, which nothing in
+	// production asks for.
+	MaxInFlight int
+	// PullTimeout is the wall-clock ceiling on one pull. Zero means
+	// DefaultPullTimeout; negative means none.
+	PullTimeout time.Duration
 }
 
 // Manager owns the lifecycle of every pull: validation, deduplication, the
@@ -72,25 +127,36 @@ type Manager struct {
 	log      *slog.Logger
 	now      func() time.Time
 
-	mu    sync.Mutex
-	pulls map[domain.PullID]*pull
-	order []domain.PullID
-	byKey map[string]domain.PullID
-	seq   uint64
+	maxInFlight int
+	pullTimeout time.Duration
+
+	mu       sync.Mutex
+	pulls    map[domain.PullID]*pull
+	order    []domain.PullID
+	byKey    map[string]domain.PullID
+	inFlight int
 }
 
 // NewManager builds a pull manager.
 func NewManager(opts ManagerOptions) *Manager {
 	m := &Manager{
-		ingester: opts.Ingester,
-		registry: opts.Registry,
-		docker:   opts.Docker,
-		allow:    opts.Allowlist,
-		images:   opts.Images,
-		log:      opts.Logger,
-		now:      opts.Now,
-		pulls:    map[domain.PullID]*pull{},
-		byKey:    map[string]domain.PullID{},
+		ingester:    opts.Ingester,
+		registry:    opts.Registry,
+		docker:      opts.Docker,
+		allow:       opts.Allowlist,
+		images:      opts.Images,
+		log:         opts.Logger,
+		now:         opts.Now,
+		maxInFlight: opts.MaxInFlight,
+		pullTimeout: opts.PullTimeout,
+		pulls:       map[domain.PullID]*pull{},
+		byKey:       map[string]domain.PullID{},
+	}
+	if m.maxInFlight == 0 {
+		m.maxInFlight = DefaultMaxInFlightPulls
+	}
+	if m.pullTimeout == 0 {
+		m.pullTimeout = DefaultPullTimeout
 	}
 	if m.log == nil {
 		m.log = slog.Default()
@@ -170,10 +236,13 @@ func (m *Manager) startRegistry(ctx context.Context, req domain.IngestRequest) (
 	if id, ok := m.existing(ctx, domain.IngestSourceRegistry, canonical); ok {
 		return domain.StartResult{ID: id}, nil
 	}
-	id := m.launch(domain.IngestSourceRegistry, canonical, func(ctx context.Context, p *pull) error {
+	id, joined, err := m.launch(domain.IngestSourceRegistry, canonical, func(ctx context.Context, p *pull) error {
 		return m.runRegistry(ctx, p, ref)
 	})
-	return domain.StartResult{ID: id, Created: true}, nil
+	if err != nil {
+		return domain.StartResult{}, err
+	}
+	return domain.StartResult{ID: id, Created: !joined}, nil
 }
 
 func (m *Manager) startDocker(ctx context.Context, req domain.IngestRequest) (domain.StartResult, error) {
@@ -193,10 +262,13 @@ func (m *Manager) startDocker(ctx context.Context, req domain.IngestRequest) (do
 	if id, ok := m.existing(ctx, domain.IngestSourceDocker, reference); ok {
 		return domain.StartResult{ID: id}, nil
 	}
-	id := m.launch(domain.IngestSourceDocker, reference, func(ctx context.Context, p *pull) error {
+	id, joined, err := m.launch(domain.IngestSourceDocker, reference, func(ctx context.Context, p *pull) error {
 		return m.runDocker(ctx, p, reference)
 	})
-	return domain.StartResult{ID: id, Created: true}, nil
+	if err != nil {
+		return domain.StartResult{}, err
+	}
+	return domain.StartResult{ID: id, Created: !joined}, nil
 }
 
 // validLocalReference checks a reference destined for the Docker Engine API.
@@ -213,16 +285,10 @@ func validLocalReference(reference string) error {
 	if _, err := name.ParseReference(reference); err != nil {
 		return fmt.Errorf("%w: %s", imgref.ErrInvalidReference, reference)
 	}
-	// Checked on the raw string, not on the parsed repository: gcr reads a
-	// leading "." as a *registry* (it contains a dot), so "./x" parses
-	// cleanly with an empty-looking repository and would still be
-	// concatenated verbatim into the request path.
-	for _, segment := range strings.Split(reference, "/") {
-		if segment == "." || segment == ".." || segment == "" {
-			return fmt.Errorf("%w: %s", imgref.ErrInvalidReference, reference)
-		}
-	}
-	return nil
+	// Checked on the raw string, not on the parsed repository, for the
+	// reason ValidatePathSegments documents. The registry path applies the
+	// same rule inside imgref.Parse.
+	return imgref.ValidatePathSegments(reference)
 }
 
 // existing implements the idempotency of §6.3: an identical request that is
@@ -267,9 +333,14 @@ func (m *Manager) cachedByRef(ctx context.Context, reference string) (*domain.Im
 }
 
 // record inserts a pull that is already finished.
+//
+// It takes no admission slot: nothing is running, so there is nothing for the
+// concurrency limit to protect against.
 func (m *Manager) record(source, reference string, id domain.Digest) domain.PullID {
+	m.mu.Lock()
 	// No cancel function: there is nothing running to cancel.
-	p := m.newPull(source, reference, nil)
+	p := m.newPullLocked(source, reference, nil)
+	m.mu.Unlock()
 	p.mu.Lock()
 	p.state = domain.PullDone
 	p.imageID = id
@@ -283,34 +354,107 @@ func (m *Manager) record(source, reference string, id domain.Digest) domain.Pull
 //
 // The context is deliberately not the HTTP request's: a pull outlives the POST
 // that started it, and tying it to the request would cancel a 25 GiB download
-// the moment the browser got its 202.
-func (m *Manager) launch(source, reference string, run func(context.Context, *pull) error) domain.PullID {
+// the moment the browser got its 202. It carries a generous wall-clock
+// deadline instead (see DefaultPullTimeout).
+//
+// It reports joined=true when an identical pull was already in flight, in
+// which case that pull's id comes back and no admission slot is consumed —
+// idempotent resubmission is free by construction, because the duplicate check
+// and the slot acquisition happen under one hold of the same lock.
+func (m *Manager) launch(source, reference string, run func(context.Context, *pull) error) (domain.PullID, bool, error) {
 	// The cancel function is installed before the pull is published, not
 	// after: a DELETE that arrived in between would otherwise read the
 	// field while this goroutine wrote it, and would mark the pull
 	// cancelled without actually stopping the stream.
-	ctx, cancel := context.WithCancel(context.Background())
-	p := m.newPull(source, reference, cancel)
+	ctx, cancel := m.pullContext()
+	p, joined, err := m.admit(source, reference, cancel)
+	if err != nil || joined {
+		// Nothing was started, so the context this call built is dead
+		// on arrival; releasing it here is what keeps a refused submit
+		// from leaking a timer.
+		cancel()
+		if err != nil {
+			return "", false, err
+		}
+		return p.id, true, nil
+	}
 
 	go func() {
 		defer close(p.done)
 		defer cancel()
+		defer m.releaseSlot()
 		err := run(ctx, p)
 		p.finish(ctx, err)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			m.log.Warn("pull failed", "id", p.id, "reference", reference, "err", err)
 		}
 	}()
-	return p.id
+	return p.id, false, nil
 }
 
-// newPull allocates an entry and evicts the oldest terminal ones.
-func (m *Manager) newPull(source, reference string, cancel context.CancelFunc) *pull {
+// pullContext builds the context one pull runs on.
+//
+// The deadline is a backstop, not a service-level expectation: the thing that
+// actually kills a hostile trickle is safehttp's stall detector, which needs no
+// guess about how long legitimate work takes. This exists for the cases the
+// stall detector cannot see — a docker-save stream, or an upstream that keeps
+// meeting the throughput floor forever — and is set generously enough that a
+// real 25 GiB pull never reaches it (see DefaultPullTimeout).
+func (m *Manager) pullContext() (context.Context, context.CancelFunc) {
+	if m.pullTimeout <= 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), m.pullTimeout)
+}
+
+// admit is the single lock hold that decides a submission's fate: join an
+// identical in-flight pull, take an admission slot, or be refused.
+//
+// Doing all three here is what makes the guarantees composable. Checking for a
+// duplicate and then acquiring a slot in two steps would let two identical
+// concurrent submits both miss and both take a slot, which is the case a burst
+// of retries from one browser produces.
+func (m *Manager) admit(source, reference string, cancel context.CancelFunc) (*pull, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.seq++
+	if id, ok := m.byKey[source+"|"+reference]; ok {
+		if existing, live := m.pulls[id]; live && !existing.isTerminal() {
+			return existing, true, nil
+		}
+	}
+	if m.maxInFlight > 0 && m.inFlight >= m.maxInFlight {
+		return nil, false, fmt.Errorf("%w: %d are running and the limit is %d",
+			ErrTooManyPulls, m.inFlight, m.maxInFlight)
+	}
+	m.inFlight++
+	return m.newPullLocked(source, reference, cancel), false, nil
+}
+
+// releaseSlot returns an admission slot once the run goroutine has exited.
+func (m *Manager) releaseSlot() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.inFlight > 0 {
+		m.inFlight--
+	}
+	// The table could not be trimmed while this pull was live; now that it
+	// is terminal, the retention cap can take effect.
+	m.evictLocked()
+}
+
+// InFlight reports how many pulls are currently running. Exported for tests
+// and for the operator-facing log line; it is not on the wire.
+func (m *Manager) InFlight() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inFlight
+}
+
+// newPullLocked allocates an entry and evicts the oldest terminal ones. The
+// caller holds m.mu.
+func (m *Manager) newPullLocked(source, reference string, cancel context.CancelFunc) *pull {
 	p := &pull{
-		id:        domain.PullID(fmt.Sprintf("p%d-%d", m.now().UnixNano(), m.seq)),
+		id:        newPullID(),
 		reference: reference,
 		source:    source,
 		startedAt: m.now(),
@@ -323,6 +467,26 @@ func (m *Manager) newPull(source, reference string, cancel context.CancelFunc) *
 	m.byKey[source+"|"+reference] = p.id
 	m.evictLocked()
 	return p
+}
+
+// newPullID mints an unguessable pull id.
+//
+// A sequence number would do for uniqueness — ids are process-local and the
+// table is behind a mutex. Randomness buys something else: any client can
+// cancel any pull, and on a trusted network that is acceptable, but a
+// guessable "p<unixnano>-<seq>" makes it acceptable *and* trivial. Sixteen
+// bytes from crypto/rand costs nothing and removes the guessing half.
+// (GET /api/v1/pulls still lists every id, so this is a speed bump, not
+// authorization; §7.3 already specified server-generated random hex.)
+func newPullID() domain.PullID {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand.Read never fails on any platform layerlens runs
+		// on; if it somehow did, refusing to mint an id would take the
+		// server down for a cosmetic property.
+		panic("ingest: crypto/rand is unavailable: " + err.Error())
+	}
+	return domain.PullID("p" + hex.EncodeToString(b[:]))
 }
 
 // evictLocked drops the oldest terminal pulls once the table is over its cap.
@@ -639,6 +803,12 @@ func (p *pull) finish(ctx context.Context, err error) {
 	switch {
 	case err == nil:
 		p.state = domain.PullDone
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// The wall-clock backstop expired. That is a failure, not a
+		// cancellation: nobody asked for it, and reporting it as
+		// "cancelled" would tell the user they did.
+		p.state = domain.PullFailed
+		p.failure = classifyPullFailure(context.DeadlineExceeded)
 	case errors.Is(err, context.Canceled), ctx.Err() != nil:
 		p.state = domain.PullCancelled
 	default:
@@ -715,8 +885,19 @@ func classifyPullFailure(err error) *domain.PullFailure {
 		}
 	case errors.Is(err, ErrTooManyLayers):
 		return &domain.PullFailure{
-			Code:    CodePullFailed,
+			Code:    CodePullTooLarge,
 			Message: "That image has more layers than layerlens will analyze.",
+		}
+	case errors.Is(err, analyze.ErrTooManyEntries):
+		return &domain.PullFailure{
+			Code: CodePullTooLarge,
+			Message: "One of that image's layers contains more files than layerlens will index. " +
+				"Analyzing it would cost more memory than this server is allowed to spend.",
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		return &domain.PullFailure{
+			Code:    CodePullFailed,
+			Message: "The pull took longer than this server allows and was stopped.",
 		}
 	case errors.Is(err, ErrNoAmd64Manifest):
 		return &domain.PullFailure{

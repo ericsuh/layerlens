@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ericsuh/layerlens/internal/ingest"
 	"github.com/ericsuh/layerlens/internal/safehttp"
 	"github.com/ericsuh/layerlens/internal/webui"
 )
@@ -43,10 +44,13 @@ func TestParseFlags(t *testing.T) {
 			name: "defaults match ARCHITECTURE 1.3",
 			args: nil,
 			want: config{
-				listen:        ":8080",
-				dataDir:       "/var/lib/layerlens/images",
-				cacheMaxBytes: 50 << 30,
-				fixturesDir:   "fixtures",
+				listen:          ":8080",
+				dataDir:         "/var/lib/layerlens/images",
+				cacheMaxBytes:   50 << 30,
+				fixturesDir:     "fixtures",
+				maxPulls:        ingest.DefaultMaxInFlightPulls,
+				pullTimeout:     ingest.DefaultPullTimeout,
+				maxLayerEntries: ingest.MaxLayerEntries,
 			},
 		},
 		{
@@ -58,14 +62,20 @@ func TestParseFlags(t *testing.T) {
 				"--fixtures-dir", "./fx",
 				"--docker-host", "unix:///run/docker.sock",
 				"--ui-dir", "internal/webui/dist",
+				"--max-concurrent-pulls", "2",
+				"--pull-timeout", "45m",
+				"--max-layer-entries", "1000",
 			},
 			want: config{
-				listen:        "127.0.0.1:9999",
-				dataDir:       "/tmp/ll",
-				cacheMaxBytes: 1 << 20,
-				fixturesDir:   "./fx",
-				dockerHost:    "unix:///run/docker.sock",
-				uiDir:         "internal/webui/dist",
+				listen:          "127.0.0.1:9999",
+				dataDir:         "/tmp/ll",
+				cacheMaxBytes:   1 << 20,
+				fixturesDir:     "./fx",
+				dockerHost:      "unix:///run/docker.sock",
+				uiDir:           "internal/webui/dist",
+				maxPulls:        2,
+				pullTimeout:     45 * time.Minute,
+				maxLayerEntries: 1000,
 			},
 		},
 		{
@@ -79,8 +89,25 @@ func TestParseFlags(t *testing.T) {
 				dataDir:       "/var/lib/layerlens/images",
 				cacheMaxBytes: 50 << 30,
 				fixturesDir:   "fixtures",
-				dockerHost:    "",
+				// Empty host AND the explicit-off marker: the UI has to
+				// say "turned off", not "none found" (the deployed unit
+				// sets `off` by default).
+				dockerHost:      "",
+				dockerOff:       true,
+				maxPulls:        ingest.DefaultMaxInFlightPulls,
+				pullTimeout:     ingest.DefaultPullTimeout,
+				maxLayerEntries: ingest.MaxLayerEntries,
 			},
+		},
+		{
+			name:    "non-positive concurrent-pull cap is rejected",
+			args:    []string{"--max-concurrent-pulls", "0"},
+			wantErr: "--max-concurrent-pulls must be positive",
+		},
+		{
+			name:    "non-positive layer entry cap is rejected",
+			args:    []string{"--max-layer-entries", "0"},
+			wantErr: "--max-layer-entries must be positive",
 		},
 		{
 			name:    "non-positive cache cap is rejected",
@@ -136,18 +163,51 @@ func TestParseFlags(t *testing.T) {
 }
 
 func TestParseFlagsDefaultsDockerHostFromEnv(t *testing.T) {
-	t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+	t.Setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
 	noDockerSocket(t)
 	got, err := parseFlags(nil, io.Discard)
 	require.NoError(t, err)
-	assert.Equal(t, "tcp://127.0.0.1:2375", got.dockerHost)
+	assert.Equal(t, "unix:///run/user/1000/docker.sock", got.dockerHost)
+}
+
+// The Docker path is the one egress safehttp never screens, so it may only
+// reach a local socket unless the operator opts in out loud — including when
+// the endpoint arrives through the environment rather than a flag.
+func TestParseFlagsRefusesTCPDockerHostWithoutOptIn(t *testing.T) {
+	noDockerSocket(t)
+	t.Run("from the environment", func(t *testing.T) {
+		t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+		_, err := parseFlags(nil, io.Discard)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--docker-allow-tcp")
+	})
+	t.Run("from the flag", func(t *testing.T) {
+		_, err := parseFlags([]string{"--docker-host", "tcp://10.0.0.5:2375"}, io.Discard)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--docker-allow-tcp")
+	})
+	t.Run("opted in", func(t *testing.T) {
+		got, err := parseFlags([]string{"--docker-host", "tcp://10.0.0.5:2375", "--docker-allow-tcp"}, io.Discard)
+		require.NoError(t, err)
+		assert.Equal(t, "tcp://10.0.0.5:2375", got.dockerHost)
+	})
+	t.Run("nonsense endpoint", func(t *testing.T) {
+		_, err := parseFlags([]string{"--docker-host", "ssh://box/docker.sock"}, io.Discard)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not a supported endpoint")
+	})
+	t.Run("a bare socket path", func(t *testing.T) {
+		got, err := parseFlags([]string{"--docker-host", "/var/run/docker.sock"}, io.Discard)
+		require.NoError(t, err)
+		assert.Equal(t, "/var/run/docker.sock", got.dockerHost)
+	})
 }
 
 // TestDockerHostDefaultIsNotPrintedInHelp is the point of resolving the
 // environment after parsing: flag defaults land in -h output, and DOCKER_HOST
 // can carry a hostname and credentials.
 func TestDockerHostDefaultIsNotPrintedInHelp(t *testing.T) {
-	t.Setenv("DOCKER_HOST", "tcp://secret.internal:2376")
+	t.Setenv("DOCKER_HOST", "unix:///run/secret.internal/docker.sock")
 	noDockerSocket(t)
 
 	var help stringWriter

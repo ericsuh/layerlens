@@ -558,11 +558,21 @@ func (t *Txn) PutLayer(idx *domain.LayerIndex) error {
 	// Both files are written before anything is reserved or renamed: the
 	// compressed index size is not knowable in advance (§5), so the budget
 	// check is enforced here, against the real number.
-	indexBytes, err := writeStaged(stagedIndex, func(w io.Writer) error {
+	//
+	// The write is nevertheless charged against the budget *as it streams*.
+	// Reserving only afterwards made --cache-max-bytes a bound on what the
+	// cache retains and not on what it ever touches: a 1 MiB cap was
+	// observed with 12,104,078 bytes staged on disk (11.5x) before the
+	// refusal came. The ceiling below is the most this transaction could
+	// possibly be allowed to reserve, so a write that passes it is a write
+	// reserve was always going to refuse.
+	ceiling := t.s.reserveCeiling(t)
+	indexBytes, err := writeStagedLimit(stagedIndex, ceiling, func(w io.Writer) error {
 		return index.Write(w, idx)
 	})
 	if err != nil {
-		return err
+		_ = os.Remove(stagedIndex)
+		return t.overBudget(err)
 	}
 	doc := layerDoc{
 		V:               RecordSchemaVersion,
@@ -573,11 +583,13 @@ func (t *Txn) PutLayer(idx *domain.LayerIndex) error {
 		IndexBytes:      indexBytes,
 		Warnings:        idx.Warnings,
 	}
-	docBytes, err := writeStaged(stagedDoc, func(w io.Writer) error {
+	docBytes, err := writeStagedLimit(stagedDoc, ceiling-indexBytes, func(w io.Writer) error {
 		return json.NewEncoder(w).Encode(&doc)
 	})
 	if err != nil {
-		return err
+		_ = os.Remove(stagedIndex)
+		_ = os.Remove(stagedDoc)
+		return t.overBudget(err)
 	}
 
 	total := indexBytes + docBytes
@@ -616,6 +628,31 @@ func (t *Txn) PutLayer(idx *domain.LayerIndex) error {
 	t.layers[idx.DiffID] = struct{}{}
 	t.s.mu.Unlock()
 	return nil
+}
+
+// overBudget turns a staged write that ran past its ceiling into the refusal
+// reserve would have produced.
+//
+// Which of the two checks fires first is an implementation detail — the
+// streaming ceiling exists to stop the bytes reaching the disk, not to write
+// the error message — so the message the user sees is asked for here from the
+// one place that knows about the cap, the pinned set and what this transaction
+// already holds.
+func (t *Txn) overBudget(err error) error {
+	if !errors.Is(err, ErrCacheFull) {
+		return err
+	}
+	// One byte more than could ever be reserved: reserve's refusal test is
+	// exactly the test the staged write just failed, so this reproduces its
+	// wording without evicting anything.
+	n := t.s.reserveCeiling(t) + 1
+	if rerr := t.s.reserve(t, n); rerr != nil {
+		return rerr
+	}
+	// Unreachable in practice; if the budget really did open up between the
+	// two calls, give back what we just took and report the original.
+	t.s.release(t, n)
+	return err
 }
 
 // lockLayer acquires the per-digest write lock and returns its release.
@@ -704,11 +741,12 @@ func (t *Txn) Commit(rec *domain.ImageRecord) error {
 	stored.LastUsedAt = now
 
 	staged := filepath.Join(t.dir, rec.ID.Hex()+recordFileExt+tmpFileSuffix)
-	size, err := writeStaged(staged, func(w io.Writer) error {
+	size, err := writeStagedLimit(staged, t.s.reserveCeiling(t), func(w io.Writer) error {
 		return json.NewEncoder(w).Encode(&imageDoc{V: RecordSchemaVersion, ImageRecord: stored})
 	})
 	if err != nil {
-		return err
+		_ = os.Remove(staged)
+		return t.overBudget(err)
 	}
 	if err := t.s.reserve(t, size); err != nil {
 		_ = os.Remove(staged)
@@ -878,11 +916,27 @@ func (s *Store) writeRecord(rec *domain.ImageRecord) error {
 // writeStaged writes a staging file durably and returns its size. The fsync is
 // what makes the subsequent rename a commit rather than a promise.
 func writeStaged(path string, write func(io.Writer) error) (int64, error) {
+	return writeStagedLimit(path, -1, write)
+}
+
+// writeStagedLimit is writeStaged with a hard ceiling on how many bytes may
+// reach the disk. A negative limit means unbounded.
+//
+// The limiter sits *under* the buffered writer, so what it counts is what the
+// filesystem actually receives; the overshoot before a refusal is therefore at
+// most one bufio flush, not the whole encoded index. That is the difference
+// between --cache-max-bytes bounding peak disk and merely bounding steady
+// state (RESEARCH Q7).
+func writeStagedLimit(path string, limit int64, write func(io.Writer) error) (int64, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, filePerm) //nolint:gosec // path is under the data dir, built from a validated digest
 	if err != nil {
 		return 0, fmt.Errorf("cachestore: create %s: %w", path, err)
 	}
-	bw := bufio.NewWriter(f)
+	var sink io.Writer = f
+	if limit >= 0 {
+		sink = &budgetWriter{w: f, remaining: limit, path: path}
+	}
+	bw := bufio.NewWriter(sink)
 	if err := write(bw); err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
@@ -931,4 +985,24 @@ func syncDir(dir string) error {
 		return nil //nolint:nilerr // documented above
 	}
 	return nil
+}
+
+// budgetWriter fails a staged write once it would put more bytes on disk than
+// the cache is allowed to spend on it.
+type budgetWriter struct {
+	w         io.Writer
+	remaining int64
+	path      string
+}
+
+func (b *budgetWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > b.remaining {
+		// Nothing of this chunk is written: the point is that the bytes
+		// never reach the disk, so a partial write of the part that
+		// still fits would only make the refusal less exact.
+		return 0, fmt.Errorf("%w: writing %s would exceed the remaining cache budget", ErrCacheFull, filepath.Base(b.path))
+	}
+	n, err := b.w.Write(p)
+	b.remaining -= int64(n)
+	return n, err
 }

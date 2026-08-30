@@ -52,6 +52,12 @@ const MaxLayers = 512
 // ErrTooManyLayers reports an image past MaxLayers.
 var ErrTooManyLayers = errors.New("ingest: image has too many layers")
 
+// MaxLayerEntries is the default per-layer entry cap handed to
+// analyze.IndexLayer (ARCHITECTURE §7.2). It is the count analogue of
+// MaxLayers: MaxLayers bounds how many blobs one image may cost us, this
+// bounds how much resident state any one of them may cost.
+const MaxLayerEntries = analyze.DefaultMaxEntries
+
 // Meta is the provenance an image cannot tell us about itself.
 type Meta struct {
 	// RefNames are the display references, e.g. ["example:v1"].
@@ -77,9 +83,10 @@ func (m Meta) reporter() Reporter {
 
 // Ingester runs the analysis pipeline against a cache store.
 type Ingester struct {
-	store *cachestore.Store
-	log   *slog.Logger
-	now   func() time.Time
+	store           *cachestore.Store
+	log             *slog.Logger
+	now             func() time.Time
+	maxLayerEntries int
 }
 
 // Options configures an Ingester.
@@ -87,16 +94,28 @@ type Options struct {
 	Logger *slog.Logger
 	// Now defaults to time.Now; tests pin it for deterministic records.
 	Now func() time.Time
+	// MaxLayerEntries caps the entries any one layer may contribute.
+	// Zero means MaxLayerEntries; negative means no cap. Injectable so a
+	// test can drive the refusal with a small number.
+	MaxLayerEntries int
 }
 
 // New builds an Ingester writing into store.
 func New(store *cachestore.Store, opts Options) *Ingester {
-	i := &Ingester{store: store, log: opts.Logger, now: opts.Now}
+	i := &Ingester{
+		store:           store,
+		log:             opts.Logger,
+		now:             opts.Now,
+		maxLayerEntries: opts.MaxLayerEntries,
+	}
 	if i.log == nil {
 		i.log = slog.Default()
 	}
 	if i.now == nil {
 		i.now = time.Now
+	}
+	if i.maxLayerEntries == 0 {
+		i.maxLayerEntries = MaxLayerEntries
 	}
 	return i
 }
@@ -289,7 +308,8 @@ func (i *Ingester) indexOne(ctx context.Context, txn *cachestore.Txn, blob v1.La
 		DiffID: diffID,
 		// The same counter for every layer, so it reads as bytes-done
 		// for the whole pull rather than for this layer alone.
-		Progress: progress.Bytes(),
+		Progress:   progress.Bytes(),
+		MaxEntries: i.maxLayerEntries,
 	})
 	closeErr := rc.Close()
 	if indexErr != nil {
