@@ -14,14 +14,23 @@ import { TooltipProvider } from "./components/ui/tooltip";
  */
 export function renderApp(
   ui: ReactElement,
-  options: { path?: string } = {},
+  options: {
+    path?: string;
+    /**
+     * `gcTime` defaults to 0 so suites cannot leak cache between tests. Raise
+     * it for the few tests that are *about* the cache — the diff tree's
+     * depth=2 prefetch writes a directory's page before anything observes it,
+     * and at gcTime 0 that write is collected before it can be read.
+     */
+    gcTime?: number;
+  } = {},
 ): RenderResult & { history: string[]; navigate: (to: string) => void } {
   const { hook, searchHook, navigate, history } = memoryLocation({
     path: options.path ?? "/",
     record: true,
   });
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    defaultOptions: { queries: { retry: false, gcTime: options.gcTime ?? 0 } },
   });
   const result = render(
     <QueryClientProvider client={client}>

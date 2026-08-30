@@ -9,7 +9,25 @@
  * that a link written today keeps working when the tree lands.
  */
 
-export type TreeFilter = "all" | "changed";
+/**
+ * The filter menu (DESIGN §5.3). The server understands only `all` and
+ * `changed` (§6.5); `added`/`removed`/`modified` are refinements applied to
+ * the rows a `changed` request already returned — see `serverFilter`. They
+ * still live in the URL so the whole menu is shareable, which is the point of
+ * putting filter state there at all.
+ */
+export type TreeFilter = "all" | "changed" | "added" | "removed" | "modified";
+
+const FILTERS: readonly TreeFilter[] = ["all", "changed", "added", "removed", "modified"];
+
+/**
+ * The `filter=` value to send to the API. A refinement narrows what the
+ * *client* shows within one server response, so all four non-`all` filters
+ * share a single query key and a single set of cached pages.
+ */
+export function serverFilter(filter: TreeFilter): "all" | "changed" {
+  return filter === "all" ? "all" : "changed";
+}
 
 export interface CompareUrlState {
   /** Image ids, or null when the param is missing or malformed. */
@@ -60,6 +78,10 @@ function parsePath(value: string | null): string {
   return collapsed === "" ? DEFAULT_PATH : collapsed;
 }
 
+function isTreeFilter(value: string | null): value is TreeFilter {
+  return value !== null && (FILTERS as readonly string[]).includes(value);
+}
+
 export function parseCompareSearch(search: string): CompareUrlState {
   const params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
   const left = params.get("left");
@@ -71,7 +93,7 @@ export function parseCompareSearch(search: string): CompareUrlState {
     l: parseLayerCount(params.get("l")),
     r: parseLayerCount(params.get("r")),
     path: parsePath(params.get("path")),
-    filter: filter === "all" || filter === "changed" ? filter : DEFAULT_FILTER,
+    filter: isTreeFilter(filter) ? filter : DEFAULT_FILTER,
   };
 }
 

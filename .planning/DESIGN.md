@@ -407,11 +407,16 @@ Comparing A @ layer 6 (…v1)  vs  B @ layer 7 (…v2)      + added − removed 
 - **Filter menu**: `All entries / Changed only (default) / Added / Removed /
   Modified`. "Changed only" default because unchanged is the overwhelming
   majority and the spec's purpose is the diff; the menu chip always shows the
-  active filter so hidden data is never a mystery. A count chip shows
-  "showing 214 of 48,112 entries".
+  active filter so hidden data is never a mystery. Only the first two are
+  server filters; the three polarities narrow the same response client-side.
+  A count chip shows "showing 214 of 2,500 entries" — loaded vs total **for
+  the current directory**, which is the number a windowed API can produce and
+  the one that answers "is this directory fully paged in?".
 - **Name filter** input: substring match on names beneath the current root;
-  matches auto-expand ancestor chain; debounce 150ms. Server-assisted beyond
-  the loaded window (§10).
+  matches auto-expand ancestor chain; debounce 150ms. Searches everything
+  *fetched* — including directories that are only prefetched, not expanded —
+  and says so in its empty state. Server-assisted search beyond that (§10.5)
+  needs an endpoint the API does not yet define; see DECISIONS, phase 007.
 - **Legend**: the three glyph+swatch(hatched) pairs; hover explains each.
 
 #### Tree columns & header

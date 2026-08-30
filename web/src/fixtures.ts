@@ -4,7 +4,7 @@
  * Regenerate with:
  *   curl -s "localhost:8080/api/v1/diff/layers?left=<v1>&right=<v2>"
  */
-import type { ImagesResponse, LayerGraph } from "./api/types";
+import type { ImagesResponse, LayerGraph, TreePage } from "./api/types";
 
 export const GOLDEN_GRAPH: LayerGraph = {
   "left": {
@@ -331,4 +331,518 @@ export const GOLDEN_IMAGES: ImagesResponse = {
       "pinned": true
     }
   ]
+};
+
+/**
+ * A real `/diff/tree` root page (depth=2, filter=changed) for
+ * `example:v1` @ 7 vs `example:v2` @ 8 — the golden selection. Captured from
+ * the running server so the adapter tests assert against the wire shape,
+ * including the omitted-when-zero change breakdowns.
+ * Regenerate with:
+ *   curl -s "localhost:8080/api/v1/diff/tree?left=<v1>&right=<v2>&leftLayers=7&rightLayers=8&filter=changed&depth=2"
+ */
+export const GOLDEN_TREE_ROOT: TreePage = {
+  "path": "/",
+  "rows": [
+    {
+      "name": "app",
+      "path": "/app",
+      "status": "modified",
+      "left": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "right": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "agg": {
+        "leftBytes": 8973541,
+        "rightBytes": 13966777,
+        "leftFiles": 249,
+        "rightFiles": 307,
+        "addedBytes": 4996672,
+        "removedBytes": 4270,
+        "modifiedBytesLeft": 7178,
+        "modifiedBytesRight": 8012,
+        "addedFiles": 61,
+        "removedFiles": 3,
+        "modifiedFiles": 2
+      },
+      "hasChildren": true,
+      "childCount": 5,
+      "children": [
+        {
+          "name": ".git",
+          "path": "/app/.git",
+          "status": "added",
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 0,
+            "rightBytes": 4834468,
+            "leftFiles": 0,
+            "rightFiles": 59,
+            "addedBytes": 4834468,
+            "addedFiles": 59
+          },
+          "hasChildren": true,
+          "childCount": 7
+        },
+        {
+          "name": "src",
+          "path": "/app/src",
+          "status": "modified",
+          "left": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 25119,
+            "rightBytes": 20988,
+            "leftFiles": 7,
+            "rightFiles": 4,
+            "removedBytes": 4270,
+            "modifiedBytesLeft": 2966,
+            "modifiedBytesRight": 3105,
+            "removedFiles": 3,
+            "modifiedFiles": 1
+          },
+          "hasChildren": true,
+          "childCount": 3
+        },
+        {
+          "name": ".env",
+          "path": "/app/.env",
+          "status": "added",
+          "right": {
+            "kind": "file",
+            "mode": 384,
+            "sizeBytes": 412
+          },
+          "agg": {
+            "leftBytes": 0,
+            "rightBytes": 412,
+            "leftFiles": 0,
+            "rightFiles": 1,
+            "addedBytes": 412,
+            "addedFiles": 1
+          },
+          "hasChildren": false,
+          "childCount": 0
+        },
+        {
+          "name": "debug.log",
+          "path": "/app/debug.log",
+          "status": "added",
+          "right": {
+            "kind": "file",
+            "mode": 420,
+            "sizeBytes": 161792
+          },
+          "agg": {
+            "leftBytes": 0,
+            "rightBytes": 161792,
+            "leftFiles": 0,
+            "rightFiles": 1,
+            "addedBytes": 161792,
+            "addedFiles": 1
+          },
+          "hasChildren": false,
+          "childCount": 0
+        },
+        {
+          "name": "main.js",
+          "path": "/app/main.js",
+          "status": "modified",
+          "left": {
+            "kind": "file",
+            "mode": 420,
+            "sizeBytes": 4212
+          },
+          "right": {
+            "kind": "file",
+            "mode": 420,
+            "sizeBytes": 4907
+          },
+          "agg": {
+            "leftBytes": 4212,
+            "rightBytes": 4907,
+            "leftFiles": 1,
+            "rightFiles": 1,
+            "modifiedBytesLeft": 4212,
+            "modifiedBytesRight": 4907,
+            "modifiedFiles": 1
+          },
+          "hasChildren": false,
+          "childCount": 0
+        }
+      ]
+    },
+    {
+      "name": "etc",
+      "path": "/etc",
+      "status": "modified",
+      "left": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "right": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "agg": {
+        "leftBytes": 398757,
+        "rightBytes": 398799,
+        "leftFiles": 69,
+        "rightFiles": 70,
+        "addedBytes": 42,
+        "addedFiles": 1
+      },
+      "hasChildren": true,
+      "childCount": 1,
+      "children": [
+        {
+          "name": "OpenCL",
+          "path": "/etc/OpenCL",
+          "status": "added",
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 0,
+            "rightBytes": 42,
+            "leftFiles": 0,
+            "rightFiles": 1,
+            "addedBytes": 42,
+            "addedFiles": 1
+          },
+          "hasChildren": true,
+          "childCount": 1
+        }
+      ]
+    },
+    {
+      "name": "usr",
+      "path": "/usr",
+      "status": "modified",
+      "left": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "right": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "agg": {
+        "leftBytes": 48274110,
+        "rightBytes": 61435269,
+        "leftFiles": 281,
+        "rightFiles": 329,
+        "addedBytes": 13161159,
+        "addedFiles": 48
+      },
+      "hasChildren": true,
+      "childCount": 3,
+      "children": [
+        {
+          "name": "bin",
+          "path": "/usr/bin",
+          "status": "modified",
+          "left": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 1954236,
+            "rightBytes": 2605500,
+            "leftFiles": 20,
+            "rightFiles": 23,
+            "addedBytes": 651264,
+            "addedFiles": 3
+          },
+          "hasChildren": true,
+          "childCount": 3
+        },
+        {
+          "name": "lib",
+          "path": "/usr/lib",
+          "status": "modified",
+          "left": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 23384971,
+            "rightBytes": 35882557,
+            "leftFiles": 68,
+            "rightFiles": 112,
+            "addedBytes": 12497586,
+            "addedFiles": 44
+          },
+          "hasChildren": true,
+          "childCount": 1
+        },
+        {
+          "name": "share",
+          "path": "/usr/share",
+          "status": "modified",
+          "left": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 6641639,
+            "rightBytes": 6653948,
+            "leftFiles": 64,
+            "rightFiles": 65,
+            "addedBytes": 12309,
+            "addedFiles": 1
+          },
+          "hasChildren": true,
+          "childCount": 1
+        }
+      ]
+    },
+    {
+      "name": "var",
+      "path": "/var",
+      "status": "modified",
+      "left": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "right": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "agg": {
+        "leftBytes": 1741598,
+        "rightBytes": 0,
+        "leftFiles": 31,
+        "rightFiles": 0,
+        "removedBytes": 1741598,
+        "removedFiles": 31
+      },
+      "hasChildren": true,
+      "childCount": 1,
+      "children": [
+        {
+          "name": "lib",
+          "path": "/var/lib",
+          "status": "modified",
+          "left": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "right": {
+            "kind": "dir",
+            "mode": 493,
+            "sizeBytes": 0
+          },
+          "agg": {
+            "leftBytes": 1741598,
+            "rightBytes": 0,
+            "leftFiles": 31,
+            "rightFiles": 0,
+            "removedBytes": 1741598,
+            "removedFiles": 31
+          },
+          "hasChildren": true,
+          "childCount": 4
+        }
+      ]
+    }
+  ],
+  "totalRows": 4,
+  "maxSiblingBytes": 109709379,
+  "pathStatus": "modified",
+  "pathAgg": {
+    "leftBytes": 60913040,
+    "rightBytes": 77325879,
+    "leftFiles": 648,
+    "rightFiles": 724,
+    "addedBytes": 18157873,
+    "removedBytes": 1745868,
+    "modifiedBytesLeft": 7178,
+    "modifiedBytesRight": 8012,
+    "addedFiles": 110,
+    "removedFiles": 34,
+    "modifiedFiles": 2
+  }
+};
+
+/** The same comparison's `/app` listing, depth 1. */
+export const GOLDEN_TREE_APP: TreePage = {
+  "path": "/app",
+  "rows": [
+    {
+      "name": ".git",
+      "path": "/app/.git",
+      "status": "added",
+      "right": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "agg": {
+        "leftBytes": 0,
+        "rightBytes": 4834468,
+        "leftFiles": 0,
+        "rightFiles": 59,
+        "addedBytes": 4834468,
+        "addedFiles": 59
+      },
+      "hasChildren": true,
+      "childCount": 7
+    },
+    {
+      "name": "src",
+      "path": "/app/src",
+      "status": "modified",
+      "left": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "right": {
+        "kind": "dir",
+        "mode": 493,
+        "sizeBytes": 0
+      },
+      "agg": {
+        "leftBytes": 25119,
+        "rightBytes": 20988,
+        "leftFiles": 7,
+        "rightFiles": 4,
+        "removedBytes": 4270,
+        "modifiedBytesLeft": 2966,
+        "modifiedBytesRight": 3105,
+        "removedFiles": 3,
+        "modifiedFiles": 1
+      },
+      "hasChildren": true,
+      "childCount": 3
+    },
+    {
+      "name": ".env",
+      "path": "/app/.env",
+      "status": "added",
+      "right": {
+        "kind": "file",
+        "mode": 384,
+        "sizeBytes": 412
+      },
+      "agg": {
+        "leftBytes": 0,
+        "rightBytes": 412,
+        "leftFiles": 0,
+        "rightFiles": 1,
+        "addedBytes": 412,
+        "addedFiles": 1
+      },
+      "hasChildren": false,
+      "childCount": 0
+    },
+    {
+      "name": "debug.log",
+      "path": "/app/debug.log",
+      "status": "added",
+      "right": {
+        "kind": "file",
+        "mode": 420,
+        "sizeBytes": 161792
+      },
+      "agg": {
+        "leftBytes": 0,
+        "rightBytes": 161792,
+        "leftFiles": 0,
+        "rightFiles": 1,
+        "addedBytes": 161792,
+        "addedFiles": 1
+      },
+      "hasChildren": false,
+      "childCount": 0
+    },
+    {
+      "name": "main.js",
+      "path": "/app/main.js",
+      "status": "modified",
+      "left": {
+        "kind": "file",
+        "mode": 420,
+        "sizeBytes": 4212
+      },
+      "right": {
+        "kind": "file",
+        "mode": 420,
+        "sizeBytes": 4907
+      },
+      "agg": {
+        "leftBytes": 4212,
+        "rightBytes": 4907,
+        "leftFiles": 1,
+        "rightFiles": 1,
+        "modifiedBytesLeft": 4212,
+        "modifiedBytesRight": 4907,
+        "modifiedFiles": 1
+      },
+      "hasChildren": false,
+      "childCount": 0
+    }
+  ],
+  "totalRows": 5,
+  "maxSiblingBytes": 4834468,
+  "pathStatus": "modified",
+  "pathAgg": {
+    "leftBytes": 8973541,
+    "rightBytes": 13966777,
+    "leftFiles": 249,
+    "rightFiles": 307,
+    "addedBytes": 4996672,
+    "removedBytes": 4270,
+    "modifiedBytesLeft": 7178,
+    "modifiedBytesRight": 8012,
+    "addedFiles": 61,
+    "removedFiles": 3,
+    "modifiedFiles": 2
+  }
 };

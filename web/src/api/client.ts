@@ -1,4 +1,4 @@
-import type { ApiErrorBody, ImagesResponse, LayerGraph, Meta } from "./types";
+import type { ApiErrorBody, ImagesResponse, LayerGraph, Meta, TreePage } from "./types";
 
 /**
  * A non-2xx response, parsed out of the §6.1 envelope.
@@ -93,4 +93,46 @@ export function fetchLayerGraph(
 
 export function fetchMeta(signal?: AbortSignal): Promise<Meta> {
   return request<Meta>("/meta", signal);
+}
+
+/** The `/diff/tree` query (§6.5), one directory's page of children. */
+export interface TreeQuery {
+  left: string;
+  right: string;
+  leftLayers: number;
+  rightLayers: number;
+  path: string;
+  filter: "all" | "changed";
+  /** Absent for the first page. */
+  cursor?: string;
+  /**
+   * 2 asks the server to embed one level of grandchildren so expanding a row
+   * costs no request (§8.4). Only ever sent on a first page: paging a wide
+   * directory must not re-pay for grandchildren it already has.
+   */
+  depth?: 1 | 2;
+  limit?: number;
+}
+
+export function fetchTreePage(query: TreeQuery, signal?: AbortSignal): Promise<TreePage> {
+  // The server parses these strictly (no "+1", no leading zeros, path already
+  // clean), so they are serialized exactly once, here.
+  const params = new URLSearchParams({
+    left: query.left,
+    right: query.right,
+    leftLayers: String(query.leftLayers),
+    rightLayers: String(query.rightLayers),
+    path: query.path,
+    filter: query.filter,
+  });
+  if (query.depth !== undefined) {
+    params.set("depth", String(query.depth));
+  }
+  if (query.limit !== undefined) {
+    params.set("limit", String(query.limit));
+  }
+  if (query.cursor !== undefined && query.cursor !== "") {
+    params.set("cursor", query.cursor);
+  }
+  return request<TreePage>(`/diff/tree?${params.toString()}`, signal);
 }

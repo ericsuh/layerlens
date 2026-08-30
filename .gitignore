@@ -15,3 +15,9 @@ internal/webui/dist/*
 
 # Dev-only SPA bundle (mise run dev); internal/webui/dist is build-only.
 .dev-dist/
+
+# Playwright
+web/.e2e-artifacts/
+.e2e-artifacts/
+test-results/
+playwright-report/

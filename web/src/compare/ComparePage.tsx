@@ -37,6 +37,16 @@ export function ComparePage() {
     [bounds, urlState],
   );
 
+  const updateUrl = useCallback(
+    (next: Partial<typeof urlState>) => {
+      // `replace`, like layer selection: drilling into a directory or
+      // switching the filter refines the same view, and Back should leave the
+      // comparison rather than replay every step inside it.
+      navigate(`/compare${buildCompareSearch({ ...urlState, ...next })}`, { replace: true });
+    },
+    [navigate, urlState],
+  );
+
   const dispatch = useCallback(
     (action: SelectionAction) => {
       if (bounds === null || selection === null) {
@@ -62,8 +72,12 @@ export function ComparePage() {
     );
   }
 
+  // The grid is one row, explicitly `minmax(0,1fr)`: with the default `auto`
+  // the row grows to the tallest column, both panels lose their internal
+  // scroll, and the virtualized tree ends up measuring a viewport the size of
+  // the whole list.
   return (
-    <div className="grid h-full min-h-0 grid-cols-[400px_minmax(560px,1fr)] gap-6 px-8 py-6 max-[1279px]:grid-cols-[360px_minmax(0,1fr)] max-[1279px]:gap-6 max-[1279px]:px-6">
+      <div className="grid h-full min-h-0 grid-cols-[400px_minmax(560px,1fr)] grid-rows-[minmax(0,1fr)] gap-6 px-8 py-6 max-[1279px]:grid-cols-[360px_minmax(0,1fr)] max-[1279px]:gap-6 max-[1279px]:px-6">
       <div className="flex min-h-0 flex-col">
         {query.isPending ? <LayerGraphSkeleton /> : null}
         {query.isError ? (
@@ -81,7 +95,7 @@ export function ComparePage() {
           <LayerGraphPanel graph={graph} selection={selection} onSelect={dispatch} />
         )}
       </div>
-      <FsDiffPanel selection={selection} />
+      <FsDiffPanel urlState={urlState} selection={selection} onUrlChange={updateUrl} />
     </div>
   );
 }

@@ -162,3 +162,11 @@ server_pid=$!
 # `wait` is interruptible by the trap; a foreground command would not be.
 wait "$server_pid"
 """
+
+[tasks.e2e]
+description = "Playwright end-to-end suite against the real binary on fixtures (no Docker, no network)"
+# `build` first: the suite drives bin/layerlens with the SPA embedded, which is
+# the artifact the acceptance criteria are about.
+depends = ["build", "deps"]
+dir = "{{config_root}}/web"
+run = "node_modules/.bin/playwright test"

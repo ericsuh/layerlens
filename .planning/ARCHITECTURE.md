@@ -1182,15 +1182,22 @@ Shareable state lives in the **URL** (wouter `useSearchParams`-style hook over
 ```
 
 - `left`/`right`: image ids (the pair). `l`/`r`: selected layer *counts*
-  (`leftLayers`/`rightLayers`). `path`: drill-down root. `filter`.
+  (`leftLayers`/`rightLayers`). `path`: drill-down root. `filter` — the URL
+  carries all five values of DESIGN §5.3's menu
+  (`all|changed|added|removed|modified`); the API understands only the first
+  two, and `added`/`removed`/`modified` are sent as `changed` and narrowed
+  client-side, so all four share one query key (phase 007 delta).
 - Pasting the URL reproduces the exact view — the acceptance criterion for
   shareability. Missing `l`/`r` defaults to full stacks (`len(left)`, `len(right)`).
 
 Ephemeral state (React state, never in URL):
 
 - **Disclosure**: `Set<string>` of expanded directory paths, held in
-  `<DiffTree>`; feeds headless-tree's controlled expanded-items state. Reset when
-  pair/selection changes (the tree content changed identity).
+  `<DiffTree>`; feeds headless-tree's controlled expanded-items state. Reset
+  when the **pair** changes — a different pair is a different filesystem, so
+  the paths themselves stop meaning anything. A *selection* change keeps it:
+  the paths are still the same paths, and state #24's dim-don't-blank
+  treatment has nothing to dim if the tree collapses first (phase 007 delta).
 - Hover/tooltip state, in-flight form text, which layer card is keyboard-focused.
 
 ### 8.4 Lazy tree expansion data flow
@@ -1203,8 +1210,13 @@ Ephemeral state (React state, never in URL):
 3. Scrolling near the end of a directory's loaded children (virtualizer index
    watermark) calls `fetchNextPage()` for that directory's query.
 4. Drill-down sets `path=` in the URL — the same machinery re-rooted; breadcrumb
-   segments link back up. Initial load prefetches `path=/` with `depth=2` so the
-   first paint has one level of grandchildren without a request waterfall.
+   segments link back up. Every directory's **first** page is requested with
+   `depth=2` (cursor pages are `depth=1`, so paging a wide directory does not
+   re-pay for grandchildren), and each returned row whose children are complete
+   is written straight into that child's own `['tree', …]` cache entry — so the
+   first expand of a prefetched directory costs no request at all. A row
+   carrying `childrenTruncated` is never seeded, and nothing is seeded from a
+   `keepPreviousData` placeholder (phase 007 delta).
 5. Size bars: `width = (row.agg.leftBytes + row.agg.rightBytes) / page.maxSiblingBytes`
    — denominator is per-directory and page-stable by contract (§6.5).
 
@@ -1324,8 +1336,10 @@ Worth testing (logic, not pixels):
 
 ### 9.4 Playwright e2e (against the real built binary, fixtures only, no network)
 
-`webServer` boots `./bin/layerlens --listen :43117 --data-dir .e2e-data
---fixtures-dir fixtures` and waits on `/healthz`.
+`web/playwright.config.ts` (under `web/` because that is where `node_modules`
+is; `webServer.cwd` is the repository root) boots `./bin/layerlens --listen
+127.0.0.1:43117 --data-dir .e2e-data --fixtures-dir fixtures` after wiping
+`.e2e-data`, and waits on `/healthz`. Specs live in `web/e2e/`.
 
 - **Golden workflow** (acceptance criterion): open app → pick `example:v1` and
   `example:v2` → layer view shows shared trunk + fork + per-image branches with

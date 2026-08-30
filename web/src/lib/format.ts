@@ -131,3 +131,48 @@ export function shortHex(digest: string, head = 4, tail = 4): string {
   }
   return `${hex.slice(0, head)}…${hex.slice(-tail)}`;
 }
+
+const UNIT_WORDS: Record<string, string> = {
+  B: "bytes",
+  KiB: "kibibytes",
+  MiB: "mebibytes",
+  GiB: "gibibytes",
+  TiB: "tebibytes",
+  PiB: "pebibytes",
+};
+
+/**
+ * The same number a sighted user sees, with the unit spelled out for screen
+ * readers (DESIGN §7: "14.3 mebibytes", not "14.3 MiB"). Abbreviations get
+ * spelled letter by letter by most screen readers, which is unusable in a row
+ * summary read aloud dozens of times.
+ */
+export function formatBytesSpoken(bytes: number): string {
+  const rendered = formatBytes(bytes);
+  const cut = rendered.lastIndexOf(" ");
+  if (cut === -1) {
+    return rendered;
+  }
+  const unit = rendered.slice(cut + 1);
+  return `${rendered.slice(0, cut)} ${UNIT_WORDS[unit] ?? unit}`;
+}
+
+const MODE_BITS = ["r", "w", "x"] as const;
+
+/**
+ * `rwxr-xr-x` from the 12-bit permission word.
+ *
+ * Directories the server marks `implicit` never reach here: their mode is a
+ * value squashing invented, not one the image carries, so the UI renders "—"
+ * instead (ARCHITECTURE §6.5).
+ */
+export function formatMode(mode: number): string {
+  let out = "";
+  for (let group = 2; group >= 0; group -= 1) {
+    for (let bit = 0; bit < 3; bit += 1) {
+      const mask = 1 << (group * 3 + (2 - bit));
+      out += (mode & mask) === 0 ? "-" : MODE_BITS[bit];
+    }
+  }
+  return out;
+}

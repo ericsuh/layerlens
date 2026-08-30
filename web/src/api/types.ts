@@ -84,3 +84,77 @@ export interface Meta {
   cacheMaxBytes: number;
   allowedRegistries: string[];
 }
+
+/**
+ * §6.5 — one side's metadata for a tree row.
+ *
+ * `implicit` marks a directory no layer header ever named: it exists only
+ * because a child needed a parent, so its `mode` is a value the server's
+ * squashing invented. The UI renders "—" for those rather than a permission
+ * string that is ours and not the image's. Absent means false.
+ */
+export interface TreeSideMeta {
+  kind: "file" | "dir" | "symlink" | "hardlink" | "device" | "fifo";
+  mode: number;
+  sizeBytes: number;
+  implicit?: boolean;
+  linkTarget?: string;
+}
+
+/**
+ * §6.5 — the subtree aggregate for a row.
+ *
+ * The four side totals are always present. The seven change breakdowns are
+ * **omitted when zero**, so every reader must treat an absent field as 0 —
+ * use `changeOf()` rather than reaching for the optional fields directly.
+ * Deltas are derivable (`rightBytes - leftBytes`) and are not on the wire.
+ */
+export interface TreeAgg {
+  leftBytes: number;
+  rightBytes: number;
+  leftFiles: number;
+  rightFiles: number;
+  addedBytes?: number;
+  removedBytes?: number;
+  modifiedBytesLeft?: number;
+  modifiedBytesRight?: number;
+  addedFiles?: number;
+  removedFiles?: number;
+  modifiedFiles?: number;
+}
+
+export type TreeStatus = "added" | "removed" | "modified" | "unchanged";
+
+export interface TreeRow {
+  name: string;
+  path: string;
+  status: TreeStatus;
+  /** Absent ⇒ the entry is added (it exists only in image B). */
+  left?: TreeSideMeta;
+  /** Absent ⇒ the entry is removed (it exists only in image A). */
+  right?: TreeSideMeta;
+  agg: TreeAgg;
+  hasChildren: boolean;
+  /** Post-filter direct children — the honest `aria-setsize`. */
+  childCount: number;
+  /** Only on depth=2 responses: at most 50 per row, 2000 per response. */
+  children?: TreeRow[];
+  /**
+   * True whenever children were cut — including cut to *none*, in which case
+   * `children` is absent entirely. The remedy is the same either way: page
+   * that directory with a request rooted at this row's path.
+   */
+  childrenTruncated?: boolean;
+}
+
+export interface TreePage {
+  path: string;
+  rows: TreeRow[];
+  /** Absent ⇒ last page for this path+filter. */
+  nextCursor?: string;
+  totalRows: number;
+  /** Denominator for the relative-size bars; stable across pages by contract. */
+  maxSiblingBytes: number;
+  pathStatus: TreeStatus;
+  pathAgg: TreeAgg;
+}

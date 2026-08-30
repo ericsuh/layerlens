@@ -2,7 +2,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { GOLDEN_GRAPH } from "../fixtures";
+import { GOLDEN_GRAPH, GOLDEN_TREE_APP, GOLDEN_TREE_ROOT } from "../fixtures";
 import { renderApp } from "../testing";
 import { ComparePage } from "./ComparePage";
 
@@ -12,16 +12,25 @@ const PAIR = `?left=${LEFT}&right=${RIGHT}`;
 
 describe("ComparePage", () => {
   beforeEach(() => {
+    // The compare page now mounts the diff tree as well, so the stub has to
+    // answer both endpoints; returning the graph for everything would feed a
+    // LayerGraph to the tree adapter.
     vi.stubGlobal(
       "fetch",
-      vi.fn(() =>
-        Promise.resolve(
-          new Response(JSON.stringify(GOLDEN_GRAPH), {
+      vi.fn((input: string | URL) => {
+        const url = new URL(input, "http://localhost");
+        const body = url.pathname.endsWith("/diff/layers")
+          ? GOLDEN_GRAPH
+          : (url.searchParams.get("path") ?? "/") === "/"
+            ? GOLDEN_TREE_ROOT
+            : GOLDEN_TREE_APP;
+        return Promise.resolve(
+          new Response(JSON.stringify(body), {
             status: 200,
             headers: { "content-type": "application/json" },
           }),
-        ),
-      ),
+        );
+      }),
     );
   });
 
@@ -105,8 +114,7 @@ describe("ComparePage", () => {
   it("keeps the filesystem panel's comparison line in step with the selection", async () => {
     renderApp(<ComparePage />, { path: `/compare${PAIR}&l=4&r=7` });
     await screen.findByTestId("selection-chip-a");
-    const panel = screen.getByTestId("fs-skeleton").parentElement;
-    expect(panel).toHaveTextContent("A @ layer 4");
-    expect(panel).toHaveTextContent("B @ layer 7");
+    expect(screen.getByTestId("fs-compare-a")).toHaveTextContent("A @ layer 4");
+    expect(screen.getByTestId("fs-compare-b")).toHaveTextContent("B @ layer 7");
   });
 });

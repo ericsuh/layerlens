@@ -868,6 +868,128 @@ optional field, no rename, removal or reinterpretation of an existing one.
   would be a guess.
 
 
+### Phase 007 (frontend: filesystem diff tree + golden-workflow e2e), 2026-08-30
+
+- **The filter menu's five values all live in the URL; only two reach the API.**
+  ARCHITECTURE §8.3 lists `filter` as a URL parameter and §6.5 defines the
+  server's `all|changed`. DESIGN §5.3's menu has five entries. Shipped:
+  `TreeFilter` is `all | changed | added | removed | modified`, and
+  `serverFilter()` maps the last three onto `changed` — so all four non-`all`
+  filters share one query key and one set of cached pages, and the whole menu
+  is still shareable by link. The refinements are applied client-side to rows
+  the server already returned, which is exactly as far as they can go without
+  the search endpoint §6 does not define (below).
+- **Disclosure resets on a pair change, not on a selection change.**
+  ARCHITECTURE §8.3 said "reset when pair/selection changes". Shipped: only the
+  pair resets it. A layer selection changes what the rows *say*, not which
+  paths exist, and collapsing the user's expansion on every nudge of a
+  comparison point defeats state #24's whole point — the dim-and-keep
+  treatment is only visible if there is something left to dim. §8.3 updated.
+- **Playwright lives under `web/`, not at the repository root.** The phase file
+  put `playwright.config.ts` and `e2e/` at the root; the repo has exactly one
+  npm project, so `@playwright/test` is unresolvable from there. Shipped:
+  `web/playwright.config.ts` + `web/e2e/`, with `webServer.cwd = ".."` so the
+  binary and `fixtures/` still resolve from the root. `mise run e2e` depends on
+  `build` and runs `playwright test` in `web/`. Adding a second `package.json`
+  purely to host a config would have been the worse trade.
+- **`depth=2` is a first-page-only prefetch, and it seeds sibling query keys.**
+  §8.4 step 4 asks for the root to be prefetched at depth 2. Shipped: *every*
+  directory's first page is requested at depth 2 and subsequent (cursor) pages
+  at depth 1 — paging a 2 500-child directory must not re-pay for grandchildren
+  — and each returned row whose children are complete is written into that
+  child's own `['tree', …]` key, so the first expand is a render rather than a
+  round trip (asserted in `e2e/golden.spec.ts`). Two rules make that safe:
+  a row with `childrenTruncated` is **never** seeded (a prefix under
+  `staleTime: Infinity` would strand the directory with no cursor to continue
+  from), and nothing is seeded while `isPlaceholderData` is true.
+- **The placeholder-seeding bug this found.** `placeholderData: keepPreviousData`
+  means `query.data` can be the *previous* key's answer while the new one
+  loads. That is right for rendering and wrong for anything that writes to the
+  cache: the first implementation filed the `filter=changed` children under the
+  `filter=all` key, where `staleTime: Infinity` kept them forever, so switching
+  the filter left every expanded directory showing the old filter's rows. Any
+  future cache write from a query with `keepPreviousData` needs the same guard.
+- **First paint opens the single-child spine.** Neither document specifies an
+  initial expansion; the approved prototype hardcodes `/app` open. Shipped: on
+  the first loaded page of a comparison, the tree walks open any chain of
+  directories that has exactly one child worth opening, stopping at the first
+  branch and at depth 3. Under the default "changed only" filter that is
+  reliably the one directory the diff hangs off. It runs once per
+  (pair, selection, root, filter) and never re-opens what a user collapsed.
+- **The name filter searches the query cache, not just the mounted tree.**
+  The phase file's risk note stands — DESIGN §5.3/§10.5 want server-assisted
+  search and ARCHITECTURE §6 defines no endpoint for it, so this remains a
+  **client-side substring filter over fetched rows** and a real search endpoint
+  is still an open API addition. What shipped goes one useful step further than
+  "loaded rows": it reads `queryClient.getQueryData` for any path, so the
+  depth=2 prefetch lets a search for `util` find `/app/src/util.js` while
+  `src/` is still collapsed, and auto-expands the ancestor chain to show it.
+  The empty state says plainly that the filter searches what has been fetched.
+- **"Show N more…" and the watermark both ship.** DESIGN §5.3 wants a
+  button-styled trailing row; ARCHITECTURE §8.4 wants a virtualizer watermark
+  that calls `fetchNextPage`. Shipped: both. The trailing row is a real button
+  that reads `Show N more…` at rest and `Loading more…` while a page is in
+  flight, and the watermark starts the next page ~12 rows before the row
+  enters the viewport. In practice the button is transient during smooth
+  scrolling and becomes the manual control whenever the watermark has not
+  fired — which is also why it is the surface state #27's `Retry` replaces.
+- **A failed *page* never blanks a loaded directory.** The whole-panel error
+  state only applies when the directory has no rows at all; a cursor page that
+  fails puts an inline error row with `Retry` where the "more" row was, and the
+  rows already loaded stay. Asserted in `e2e/pagination.spec.ts`.
+- **State #25 is a claim about the comparison, so it is only made at `/`.**
+  An all-unchanged *nested* directory renders state #26 ("no changes in this
+  directory"), not "the filesystems are identical at these layers" — the latter
+  would be false wherever the user had drilled to a quiet corner of a
+  comparison that does differ.
+- **#26's hidden count is fetched, not guessed.** The number of unchanged
+  entries is not derivable from a `changed` response, so the empty state mounts
+  one `filter=all` query for the same path — which also warms the exact cache
+  entry its "Show all entries" button switches to. When rows *are* showing, the
+  panel's footer note carries no number at all rather than a fabricated one.
+- **"showing N of M entries" counts the current directory.** DESIGN §5.3's
+  example ("214 of 48,112") implies a whole-tree total that a windowed API
+  cannot produce. Shipped: N is the loaded, post-filter direct children of the
+  current root and M is the server's `totalRows` for it — which is the number
+  that actually answers "is this directory fully loaded?" while paging.
+- **`aria-setsize` comes from the server, and is dropped when it cannot.** Rows
+  carry the parent's post-filter `childCount`, not the number of rows paged in,
+  so a screen reader in a 2 500-child directory hears "3 of 2,500". Under a
+  client-side refinement or a name filter that number is no longer the honest
+  set size, so the attribute falls back to headless-tree's own count of what is
+  visible.
+- **Two layout bugs the tree exposed, both pre-existing.** `#root` had no
+  height, so the `h-full` chain from `<html>` stopped at the mount point and
+  every "fill the viewport, scroll inside" panel silently became "grow with the
+  content, scroll the page"; and the compare grid had no explicit row track, so
+  the row grew to the tallest column. Either alone makes the virtualizer
+  measure a viewport the size of the whole list — it rendered 61 rows where it
+  should render ~29. Fixed with `#root { height: 100% }` and
+  `grid-rows-[minmax(0,1fr)]`.
+- **jsdom needs two shims for the virtualizer, and they are deliberately
+  narrow.** TanStack Virtual reads `offsetWidth`/`offsetHeight`, which jsdom
+  reports as 0, and needs a `ResizeObserver`, which jsdom lacks — so without
+  help the tree renders zero rows and every assertion about it passes
+  vacuously. `vitest.setup.ts` supplies a no-op observer and a viewport-sized
+  box **for the tree's scroll container only**; everything else keeps jsdom's
+  zeros. Real geometry (column alignment, wrapping, virtualization bounds) is
+  asserted in `web/e2e/columns.spec.ts` against Chromium, which is the only
+  place those questions have an answer.
+- **`renderApp` gained a `gcTime` knob.** The suite default of 0 keeps tests
+  isolated, but it also collects the depth=2 seed before anything observes it —
+  so the one test that is *about* the prefetch asks for a real `gcTime`.
+- **New npm dependencies:** `@headless-tree/core` + `@headless-tree/react`
+  1.7.0 and `@tanstack/react-virtual` 3.14.10 (both named in §C3), plus
+  `@playwright/test` 1.62.1 (§D). `eslint` reports one standing warning,
+  `react-hooks/incompatible-library`, on `useVirtualizer`: it is a note that the
+  React Compiler declines to memoize that component, and the compiler is not
+  part of this build.
+- **`components/ui/popover.tsx` gained optional controlled props.** The
+  breadcrumb overflow menu has to close on its own selection, which an
+  uncontrolled Radix popover cannot do. `open`/`onOpenChange` are optional, so
+  the existing uncontrolled call sites are untouched.
+
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.

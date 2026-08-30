@@ -13,15 +13,23 @@ export function Popover({
   label,
   side = "right",
   align = "start",
+  open,
+  onOpenChange,
 }: {
   trigger: ReactNode;
   children: ReactNode;
   label: string;
   side?: PopoverPrimitive.PopoverContentProps["side"];
   align?: PopoverPrimitive.PopoverContentProps["align"];
+  /** Optional controlled state, for menus that close on their own selection. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
   return (
-    <PopoverPrimitive.Root>
+    <PopoverPrimitive.Root
+      {...(open === undefined ? {} : { open })}
+      {...(onOpenChange === undefined ? {} : { onOpenChange })}
+    >
       <PopoverPrimitive.Trigger asChild>{trigger}</PopoverPrimitive.Trigger>
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content

@@ -6,6 +6,7 @@ import {
   isImageId,
   parseCompareSearch,
   resolveLayerCounts,
+  serverFilter,
 } from "./urlstate";
 import type { CompareUrlState } from "./urlstate";
 
@@ -86,6 +87,14 @@ describe("parseCompareSearch / buildCompareSearch", () => {
     it("falls back to the default filter for an unknown value", () => {
       expect(parseCompareSearch("?filter=weird").filter).toBe("changed");
     });
+
+    it("round-trips the three client-side refinements", () => {
+      for (const filter of ["added", "removed", "modified"] as const) {
+        const state = parseCompareSearch(`?filter=${filter}`);
+        expect(state.filter).toBe(filter);
+        expect(buildCompareSearch(state)).toContain(`filter=${filter}`);
+      }
+    });
   });
 
   it("carries phase-007's tree params through untouched", () => {
@@ -121,5 +130,18 @@ describe("resolveLayerCounts", () => {
 
   it("clamps an out-of-range selection from a stale link instead of rendering nothing", () => {
     expect(resolveLayerCounts({ l: 99, r: -4 }, bounds)).toEqual({ l: 8, r: 0 });
+  });
+});
+
+describe("serverFilter", () => {
+  it("sends the three polarity refinements as the server's `changed`", () => {
+    // The API understands `all|changed` only (§6.5); the refinements narrow
+    // the same response client-side, which is what lets all four share a
+    // single query key and a single set of cached pages.
+    expect(serverFilter("all")).toBe("all");
+    expect(serverFilter("changed")).toBe("changed");
+    expect(serverFilter("added")).toBe("changed");
+    expect(serverFilter("removed")).toBe("changed");
+    expect(serverFilter("modified")).toBe("changed");
   });
 });
