@@ -250,22 +250,63 @@ default so that a bare run fails instead of guessing at a target.
 | `LAYERLENS_DEPLOY_HOST` | **required** | Target hostname or IP |
 | `LAYERLENS_DEPLOY_USER` | `root` | SSH user; anything else uses `sudo -n` for the privileged steps |
 | `LAYERLENS_DEPLOY_DIR` | `/opt/layerlens` | Remote install directory (binary + fixtures) |
-| `LAYERLENS_DEPLOY_PORT` | `22` | SSH port |
+| `LAYERLENS_DEPLOY_PORT` | `22` | SSH port — **not** the port the service listens on |
 | `LAYERLENS_DEPLOY_SERVICE` | `layerlens` | systemd unit name |
 | `LAYERLENS_DEPLOY_BINARY` | `bin/layerlens-linux-amd64` | Local binary to ship |
 | `LAYERLENS_DEPLOY_FIXTURES` | `fixtures` | Local fixtures directory to ship |
 | `LAYERLENS_DEPLOY_UNIT` | `deploy/layerlens.service` | Local unit file to install |
-| `LAYERLENS_DEPLOY_HEALTH_URL` | `http://127.0.0.1:8080/healthz` | Probed *on the remote host* after the restart |
+| `LAYERLENS_DEPLOY_SERVICE_PORT` | `8000` | Port the deployed service listens on, stamped into the unit's `LAYERLENS_PORT` |
+| `LAYERLENS_DEPLOY_HEALTH_URL` | derived from the service port | Probed *on the remote host* after the restart |
 | `LAYERLENS_DEPLOY_HEALTH_RETRIES` | `30` | Health poll attempts, 2s apart |
 | `LAYERLENS_DEPLOY_ACTIVE_RETRIES` | `60` | Attempts to observe `ActiveState=active`, 1s apart |
 | `LAYERLENS_DEPLOY_SUDO` | `sudo -n` unless user is root | Privilege prefix for the root-only steps |
 | `LAYERLENS_DEPLOY_SSH_OPTS` | — | Extra `ssh`/`scp` options |
 | `LAYERLENS_DEPLOY_DRY_RUN` | — | `1` prints the plan and executes nothing |
 
-Runtime configuration belongs to the unit, not the deploy: it ships defaults
-for `--listen`, `--data-dir`, `--fixtures-dir`, `--cache-max-bytes`,
+Runtime configuration belongs to the unit, not the deploy: it ships defaults for
+the listen address, `--data-dir`, `--fixtures-dir`, `--cache-max-bytes`,
 `--docker-host`, and the resource guards below, and reads overrides from
 `/etc/layerlens/layerlens.env`, which the deploy never touches.
+
+### The service port
+
+The deployed service listens on **8000** by default. Change it for one deploy
+with `LAYERLENS_DEPLOY_SERVICE_PORT`:
+
+```bash
+LAYERLENS_DEPLOY_HOST=layerlens.exe.dev LAYERLENS_DEPLOY_SERVICE_PORT=9443 mise run deploy
+```
+
+That value is stamped into the unit's `Environment=LAYERLENS_PORT` line at
+install time and drives everything downstream: the unit derives both the listen
+address (`--listen ${LAYERLENS_LISTEN_HOST}:${LAYERLENS_PORT}`) and its
+`ExecStartPost` readiness probe from it, and the deploy polls the same port
+afterwards. There is deliberately no second place to state the port and no way
+for the probe to check one the service is not on — the previous unit carried a
+listen address and a probe URL as separate settings with a comment warning that
+they had to agree.
+
+To change the port on a host **without** redeploying, or to keep a setting a
+deploy will not overwrite, put it in `/etc/layerlens/layerlens.env`:
+
+```
+LAYERLENS_PORT=9443
+LAYERLENS_LISTEN_HOST=127.0.0.1
+```
+
+systemd reads `EnvironmentFile` after the unit's own `Environment=` lines, so an
+operator override there wins over whatever the last deploy stamped in.
+`LAYERLENS_LISTEN_HOST` is empty by default, meaning all interfaces; set it to
+`127.0.0.1` when a reverse proxy fronts the service.
+
+Ports below 1024 are rejected in practice: the unit drops every capability
+(`CapabilityBoundingSet=`), so the service cannot bind one. The deploy warns
+rather than failing, since an operator may have granted
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` in their own override.
+
+The local dev server still defaults to `:8080` (`mise run dev`, and the binary's
+own `--listen` default), which keeps a development instance and a deployed one
+from colliding on a machine running both.
 
 ### Resource guards
 

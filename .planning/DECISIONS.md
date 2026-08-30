@@ -1513,3 +1513,41 @@ Checked and ruled out locally: the server starts cleanly against a data
 directory seeded with those foreign `.tar` files, serving `/healthz` as normal —
 so stale state in `/var/lib/layerlens/images` is not the cause.
 
+### Deployment service port (2026-08-30)
+
+The deployed service now listens on **8000** by default, set with
+`LAYERLENS_DEPLOY_SERVICE_PORT` and stamped into the unit's
+`Environment=LAYERLENS_PORT` line at install time.
+
+Made it a single source of truth rather than adding one more setting. The unit
+previously carried `LAYERLENS_LISTEN=:8080` *and*
+`LAYERLENS_HEALTH_URL=http://127.0.0.1:8080/healthz` with a comment reading
+"Must agree with LAYERLENS_LISTEN" — a probe that can name a port the service is
+not on, which would report a healthy deploy of an unreachable service. Both are
+now derived from `LAYERLENS_PORT`: `--listen
+${LAYERLENS_LISTEN_HOST}:${LAYERLENS_PORT}` in `ExecStart`, and the probe URL
+inlined into `ExecStartPost`. `LAYERLENS_LISTEN_HOST` (empty = all interfaces)
+preserves the ability to bind loopback only.
+
+Three things worth recording:
+
+- **The probe URL is inlined into `ExecStartPost` rather than kept as an
+  `Environment=` value containing `${LAYERLENS_PORT}`.** systemd expands
+  environment variables in `Exec*=` lines but *not* recursively inside other
+  `Environment=` values, so the nested form would have been installed literally
+  and the readiness gate would have polled a nonsense URL.
+- **The deploy rewrites the unit's default rather than writing an
+  `EnvironmentFile`.** The unit is deploy-owned and replaced on every deploy,
+  while `/etc/layerlens/layerlens.env` is operator-owned and deliberately never
+  touched. Because systemd reads `EnvironmentFile` *after* `Environment=`, an
+  operator override still wins over whatever the last deploy stamped in — so the
+  layering is: deploy sets the default, operator overrides it, and neither
+  clobbers the other.
+- **Ports below 1024 warn rather than fail.** The unit drops every capability, so
+  the service cannot bind one — but an operator may have granted
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE` in their own override, and the
+  deploy has no way to know.
+
+The binary's own `--listen` default stays `:8080`, so a dev instance and a
+deployed one do not collide on a machine running both.
+

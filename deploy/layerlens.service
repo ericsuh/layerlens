@@ -41,7 +41,17 @@ Group=layerlens
 # (optional — the leading `-` means "skip it if absent"), so an operator never
 # has to edit a file that the next deploy overwrites.
 # ---------------------------------------------------------------------------
-Environment=LAYERLENS_LISTEN=:8080
+# The port the service listens on, and the interface it binds. These are the
+# single source of truth: the listen address and the readiness probe below are
+# both derived from LAYERLENS_PORT, so they cannot drift apart the way a
+# separately-specified address and probe URL could. `mise run deploy` stamps
+# this line with LAYERLENS_DEPLOY_SERVICE_PORT; because EnvironmentFile is read
+# *after* these assignments, an operator override in
+# /etc/layerlens/layerlens.env still wins over whatever a deploy wrote here.
+Environment=LAYERLENS_PORT=8000
+# Empty binds every interface. Set to 127.0.0.1 to bind loopback only — worth
+# doing when a reverse proxy fronts the service.
+Environment=LAYERLENS_LISTEN_HOST=
 Environment=LAYERLENS_DATA_DIR=/var/lib/layerlens/images
 Environment=LAYERLENS_FIXTURES_DIR=/opt/layerlens/fixtures
 Environment=LAYERLENS_CACHE_MAX_BYTES=53687091200
@@ -56,12 +66,9 @@ Environment=LAYERLENS_DOCKER_HOST=off
 Environment=LAYERLENS_MAX_CONCURRENT_PULLS=4
 Environment=LAYERLENS_MAX_LAYER_ENTRIES=2000000
 Environment=LAYERLENS_PULL_TIMEOUT=6h
-# Must agree with LAYERLENS_LISTEN; used only by the ExecStartPost readiness
-# probe, which is deliberately a loopback URL and never the public address.
-Environment=LAYERLENS_HEALTH_URL=http://127.0.0.1:8080/healthz
 EnvironmentFile=-/etc/layerlens/layerlens.env
 
-ExecStart=/opt/layerlens/layerlens --listen ${LAYERLENS_LISTEN} --data-dir ${LAYERLENS_DATA_DIR} --fixtures-dir ${LAYERLENS_FIXTURES_DIR} --cache-max-bytes ${LAYERLENS_CACHE_MAX_BYTES} --docker-host ${LAYERLENS_DOCKER_HOST} --max-concurrent-pulls ${LAYERLENS_MAX_CONCURRENT_PULLS} --max-layer-entries ${LAYERLENS_MAX_LAYER_ENTRIES} --pull-timeout ${LAYERLENS_PULL_TIMEOUT}
+ExecStart=/opt/layerlens/layerlens --listen ${LAYERLENS_LISTEN_HOST}:${LAYERLENS_PORT} --data-dir ${LAYERLENS_DATA_DIR} --fixtures-dir ${LAYERLENS_FIXTURES_DIR} --cache-max-bytes ${LAYERLENS_CACHE_MAX_BYTES} --docker-host ${LAYERLENS_DOCKER_HOST} --max-concurrent-pulls ${LAYERLENS_MAX_CONCURRENT_PULLS} --max-layer-entries ${LAYERLENS_MAX_LAYER_ENTRIES} --pull-timeout ${LAYERLENS_PULL_TIMEOUT}
 
 # Readiness gate: /healthz answers 503 "loading" until the vendored fixtures are
 # analyzed, and curl treats 503 as a retryable transient error, so this returns
@@ -80,7 +87,7 @@ ExecStart=/opt/layerlens/layerlens --listen ${LAYERLENS_LISTEN} --data-dir ${LAY
 #   reporting failure while `systemctl status` shows the service active shortly
 #   after. 60s of retries plus one 10s attempt stays comfortably inside the
 #   120s start budget.
-ExecStartPost=-/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-max-time 60 --retry-connrefused --max-time 10 --output /dev/null ${LAYERLENS_HEALTH_URL}
+ExecStartPost=-/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-max-time 60 --retry-connrefused --max-time 10 --output /dev/null http://127.0.0.1:${LAYERLENS_PORT}/healthz
 
 # Graceful restart: SIGTERM makes the server stop accepting and drain in-flight
 # requests (15s internal budget), so TimeoutStopSec must exceed that or systemd

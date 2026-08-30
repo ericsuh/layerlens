@@ -78,6 +78,9 @@ func TestDeployDryRunPrintsFullPlan(t *testing.T) {
 		"mv -f /opt/layerlens/.layerlens.",
 		"/opt/layerlens/layerlens",
 		"mv /opt/layerlens/.fixtures.",
+		// The port is stamped into the staged unit before it is installed, so
+		// what lands in /etc already names the port the health poll will use.
+		"s|^Environment=LAYERLENS_PORT=.*|Environment=LAYERLENS_PORT=8000|",
 		"install -o root -g root -m 0644",
 		"/etc/systemd/system/layerlens.service",
 		"systemctl daemon-reload",
@@ -89,7 +92,7 @@ func TestDeployDryRunPrintsFullPlan(t *testing.T) {
 		// Restart=on-failure revives it, so one sample can fail a deploy whose
 		// service is healthy seconds later.
 		"systemctl show -p ActiveState layerlens",
-		"curl --fail --silent --max-time 5 http://127.0.0.1:8080/healthz",
+		"curl --fail --silent --max-time 5 http://127.0.0.1:8000/healthz",
 		"journalctl --unit layerlens",
 	}
 	rest := out
@@ -120,6 +123,7 @@ func TestDeployDryRunHonorsEnvironmentOverrides(t *testing.T) {
 		"LAYERLENS_DEPLOY_DIR=/srv/layerlens",
 		"LAYERLENS_DEPLOY_PORT=2222",
 		"LAYERLENS_DEPLOY_SERVICE=layerlens-staging",
+		"LAYERLENS_DEPLOY_SERVICE_PORT=9443",
 		"LAYERLENS_DEPLOY_HEALTH_URL=http://127.0.0.1:9090/healthz",
 		"LAYERLENS_DEPLOY_DRY_RUN=1",
 	})
@@ -130,11 +134,61 @@ func TestDeployDryRunHonorsEnvironmentOverrides(t *testing.T) {
 	assert.Contains(t, out, "deployer@box.internal")
 	assert.Contains(t, out, "/srv/layerlens/layerlens")
 	assert.Contains(t, out, "/etc/systemd/system/layerlens-staging.service")
+	// An explicit health URL still wins over the one derived from the port.
 	assert.Contains(t, out, "http://127.0.0.1:9090/healthz")
+	assert.Contains(t, out, "Environment=LAYERLENS_PORT=9443")
 	// A non-root SSH user must acquire privilege for the root-only steps, and
 	// non-interactively so a password prompt fails instead of hanging.
 	assert.Contains(t, out, "sudo -n systemctl restart layerlens-staging")
 	assert.NotContains(t, out, "root@box.internal")
+}
+
+// The service port is the one knob an operator is most likely to change, and
+// getting it half-applied — stamped into the unit but not probed, or probed but
+// not stamped — would report a healthy deploy of a service on the wrong port.
+func TestDeployServicePortDrivesBothTheUnitAndTheProbe(t *testing.T) {
+	out, code := runDeploy(t, []string{
+		"LAYERLENS_DEPLOY_HOST=box.internal",
+		"LAYERLENS_DEPLOY_SERVICE_PORT=9443",
+		"LAYERLENS_DEPLOY_DRY_RUN=1",
+	})
+	require.Equal(t, 0, code, "dry run must succeed:\n%s", out)
+
+	assert.Contains(t, out, "Environment=LAYERLENS_PORT=9443")
+	assert.Contains(t, out, "http://127.0.0.1:9443/healthz")
+	assert.NotContains(t, out, "8000", "no trace of the default should remain")
+}
+
+// The default is 8000, and it reaches both places.
+func TestDeployServicePortDefaultsTo8000(t *testing.T) {
+	out, code := runDeploy(t, []string{
+		"LAYERLENS_DEPLOY_HOST=box.internal",
+		"LAYERLENS_DEPLOY_DRY_RUN=1",
+	})
+	require.Equal(t, 0, code, "dry run must succeed:\n%s", out)
+
+	assert.Contains(t, out, "Environment=LAYERLENS_PORT=8000")
+	assert.Contains(t, out, "http://127.0.0.1:8000/healthz")
+}
+
+// A port that systemd would accept but the service could never bind, or that is
+// not a port at all, must stop the deploy rather than land a unit that will not
+// start.
+func TestDeployRejectsAnInvalidServicePort(t *testing.T) {
+	for _, port := range []string{"abc", "0", "70000", "-1", ""} {
+		out, code := runDeploy(t, []string{
+			"LAYERLENS_DEPLOY_HOST=box.internal",
+			"LAYERLENS_DEPLOY_SERVICE_PORT=" + port,
+			"LAYERLENS_DEPLOY_DRY_RUN=1",
+		})
+		if port == "" {
+			// Unset-equivalent: an empty value falls back to the default.
+			assert.Equal(t, 0, code, "an empty port should fall back to the default")
+			continue
+		}
+		assert.Equalf(t, 2, code, "port %q must be rejected, got:\n%s", port, out)
+		assert.Containsf(t, out, "LAYERLENS_DEPLOY_SERVICE_PORT", "port %q", port)
+	}
 }
 
 // The --dry-run flag and LAYERLENS_DEPLOY_DRY_RUN=1 must be interchangeable.

@@ -42,7 +42,10 @@ Optional (shown with their defaults):
   LAYERLENS_DEPLOY_FIXTURES=fixtures  Local fixtures directory to ship.
   LAYERLENS_DEPLOY_UNIT=deploy/layerlens.service
                                       Local unit file to install.
-  LAYERLENS_DEPLOY_HEALTH_URL=http://127.0.0.1:8080/healthz
+  LAYERLENS_DEPLOY_SERVICE_PORT=8000  Port the deployed service listens on.
+                                      Stamped into the unit's LAYERLENS_PORT
+                                      default. NOT the SSH port above.
+  LAYERLENS_DEPLOY_HEALTH_URL=http://127.0.0.1:$LAYERLENS_DEPLOY_SERVICE_PORT/healthz
                                       Probed ON THE REMOTE HOST after restart.
   LAYERLENS_DEPLOY_HEALTH_RETRIES=30  Health poll attempts, 2s apart.
   LAYERLENS_DEPLOY_ACTIVE_RETRIES=60  Attempts to see ActiveState=active, 1s apart.
@@ -83,7 +86,12 @@ SERVICE="${LAYERLENS_DEPLOY_SERVICE:-layerlens}"
 BINARY="${LAYERLENS_DEPLOY_BINARY:-bin/layerlens-linux-amd64}"
 FIXTURES="${LAYERLENS_DEPLOY_FIXTURES:-fixtures}"
 UNIT="${LAYERLENS_DEPLOY_UNIT:-deploy/layerlens.service}"
-HEALTH_URL="${LAYERLENS_DEPLOY_HEALTH_URL:-http://127.0.0.1:8080/healthz}"
+# The port the deployed service listens on. Stamped into the unit's
+# LAYERLENS_PORT default at install time, and used to derive the health probe
+# below so the deploy cannot poll a port it did not configure. Distinct from
+# LAYERLENS_DEPLOY_PORT above, which is the *SSH* port.
+SERVICE_PORT="${LAYERLENS_DEPLOY_SERVICE_PORT:-8000}"
+HEALTH_URL="${LAYERLENS_DEPLOY_HEALTH_URL:-http://127.0.0.1:${SERVICE_PORT}/healthz}"
 HEALTH_RETRIES="${LAYERLENS_DEPLOY_HEALTH_RETRIES:-30}"
 ACTIVE_RETRIES="${LAYERLENS_DEPLOY_ACTIVE_RETRIES:-60}"
 SERVICE_USER="${LAYERLENS_DEPLOY_SERVICE_USER:-layerlens}"
@@ -100,6 +108,26 @@ root) and LAYERLENS_DEPLOY_DIR (default /opt/layerlens) are optional.
 EOF
 	usage >&2
 	exit 2
+fi
+
+# Validated here rather than left to systemd: an out-of-range or non-numeric
+# port would otherwise be stamped into the unit and only surface as a service
+# that will not start, well after the deploy reported success.
+case "$SERVICE_PORT" in
+*[!0-9]* | '')
+	printf 'deploy: LAYERLENS_DEPLOY_SERVICE_PORT must be a number, got %s\n' "$SERVICE_PORT" >&2
+	exit 2
+	;;
+esac
+if [ "$SERVICE_PORT" -lt 1 ] || [ "$SERVICE_PORT" -gt 65535 ]; then
+	printf 'deploy: LAYERLENS_DEPLOY_SERVICE_PORT must be 1-65535, got %s\n' "$SERVICE_PORT" >&2
+	exit 2
+fi
+if [ "$SERVICE_PORT" -lt 1024 ]; then
+	# printf rather than warn(): this validation runs before the helpers are
+	# defined, so that it can reject bad config before anything else happens.
+	printf 'deploy: WARNING: port %s is privileged; the unit drops all capabilities (CapabilityBoundingSet=) so the service will fail to bind it\n' \
+		"$SERVICE_PORT" >&2
 fi
 
 # Privilege prefix: nothing when connecting as root, `sudo -n` otherwise. -n so
@@ -255,6 +283,7 @@ else
 	note "unit     $UNIT -> /etc/systemd/system/${SERVICE}.service"
 fi
 note "target   ${USER_NAME}@${HOST}:${PORT} ${DIR}"
+note "service  listens on port ${SERVICE_PORT}; probing ${HEALTH_URL}"
 note "sudo     ${SUDO:-(none, connecting as root)}"
 if [ "$DRY_RUN" = 1 ]; then
 	printf '\n\033[1mDRY RUN\033[0m — the commands below are printed, not executed. No network is touched.\n'
@@ -302,8 +331,16 @@ if [ -e $(quote "${DIR}/fixtures") ]; then ${SUDO_P}mv $(quote "${DIR}/fixtures"
 ${SUDO_P}mv $(quote "$STAGE_FIXTURES") $(quote "${DIR}/fixtures")
 ${SUDO_P}chmod -R a+rX $(quote "${DIR}/fixtures")"
 
-step "Install the unit file and reload systemd"
+step "Stamp the service port into the unit, install it, and reload systemd"
+# The staged unit belongs to the deploy user in its own install directory, so
+# the rewrite needs no privilege; only the install into /etc does. Rewriting the
+# *default* rather than writing an EnvironmentFile is deliberate: the unit is
+# deploy-owned and replaced every time, while /etc/layerlens/layerlens.env is
+# operator-owned and never touched — and because systemd reads EnvironmentFile
+# after Environment=, an operator's override still wins over this value.
 remote "set -eu
+sed -i -e $(quote "s|^Environment=LAYERLENS_PORT=.*|Environment=LAYERLENS_PORT=${SERVICE_PORT}|") $(quote "$STAGE_UNIT")
+grep -q $(quote "^Environment=LAYERLENS_PORT=${SERVICE_PORT}\$") $(quote "$STAGE_UNIT")
 ${SUDO_P}install -o root -g root -m 0644 $(quote "$STAGE_UNIT") $(quote "/etc/systemd/system/${SERVICE}.service")
 ${SUDO_P}rm -f $(quote "$STAGE_UNIT")
 ${SUDO_P}systemctl daemon-reload
