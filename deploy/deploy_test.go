@@ -83,7 +83,12 @@ func TestDeployDryRunPrintsFullPlan(t *testing.T) {
 		"systemctl daemon-reload",
 		"systemctl enable layerlens",
 		"systemctl restart layerlens",
-		"systemctl --no-pager --quiet is-active layerlens",
+		// The readiness gate polls ActiveState rather than sampling is-active
+		// once: a unit is `activating` while ExecStartPost runs, and a start
+		// that trips TimeoutStartSec is briefly `failed` before
+		// Restart=on-failure revives it, so one sample can fail a deploy whose
+		// service is healthy seconds later.
+		"systemctl show -p ActiveState layerlens",
 		"curl --fail --silent --max-time 5 http://127.0.0.1:8080/healthz",
 		"journalctl --unit layerlens",
 	}
@@ -220,6 +225,66 @@ func TestCrossCompiledArtifact(t *testing.T) {
 // TestUnitFileHardening mechanizes the review checklist the phase plan asked
 // for: every directive ARCHITECTURE §1.3 and RESEARCH Q6 call for is asserted
 // present with its intended value, so the unit cannot silently lose one.
+// The unit's readiness probe must not be able to outlast the start timeout.
+// If it can, systemd aborts the start, marks the unit failed, and
+// Restart=on-failure revives it moments later — which surfaces as a deploy that
+// reports failure while `systemctl status` shows the service active.
+func TestReadinessProbeFitsInsideTheStartTimeout(t *testing.T) {
+	t.Parallel()
+
+	unit, err := os.ReadFile("layerlens.service")
+	require.NoError(t, err)
+	text := string(unit)
+
+	probe := ""
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(line, "ExecStartPost=") {
+			probe = line
+		}
+	}
+	require.NotEmpty(t, probe, "unit has no ExecStartPost readiness probe")
+
+	// Bounded as a whole, not just per attempt: --retry N with a per-attempt
+	// --max-time multiplies out to minutes without this.
+	retryMaxTime := durationFlag(t, probe, "--retry-max-time")
+	perAttempt := durationFlag(t, probe, "--max-time")
+
+	startBudget := 0
+	for line := range strings.SplitSeq(text, "\n") {
+		if after, ok := strings.CutPrefix(line, "TimeoutStartSec="); ok {
+			startBudget = secondsValue(t, strings.TrimSpace(after))
+		}
+	}
+	require.Positive(t, startBudget, "unit does not set TimeoutStartSec")
+
+	worst := retryMaxTime + perAttempt
+	assert.Less(t, worst, startBudget,
+		"readiness probe can run %ds (retry-max-time %d + one %ds attempt) against a %ds start budget",
+		worst, retryMaxTime, perAttempt, startBudget)
+}
+
+func durationFlag(t *testing.T, line, flag string) int {
+	t.Helper()
+	fields := strings.Fields(line)
+	for i, field := range fields {
+		if field == flag {
+			require.Less(t, i+1, len(fields), "%s has no value", flag)
+			value, err := strconv.Atoi(fields[i+1])
+			require.NoError(t, err, "%s value is not a number", flag)
+			return value
+		}
+	}
+	t.Fatalf("readiness probe does not set %s: %s", flag, line)
+	return 0
+}
+
+func secondsValue(t *testing.T, raw string) int {
+	t.Helper()
+	value, err := strconv.Atoi(strings.TrimSuffix(raw, "s"))
+	require.NoError(t, err, "not a seconds value: %q", raw)
+	return value
+}
+
 func TestUnitFileHardening(t *testing.T) {
 	raw, err := os.ReadFile("layerlens.service")
 	require.NoError(t, err)

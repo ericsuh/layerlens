@@ -257,6 +257,7 @@ default so that a bare run fails instead of guessing at a target.
 | `LAYERLENS_DEPLOY_UNIT` | `deploy/layerlens.service` | Local unit file to install |
 | `LAYERLENS_DEPLOY_HEALTH_URL` | `http://127.0.0.1:8080/healthz` | Probed *on the remote host* after the restart |
 | `LAYERLENS_DEPLOY_HEALTH_RETRIES` | `30` | Health poll attempts, 2s apart |
+| `LAYERLENS_DEPLOY_ACTIVE_RETRIES` | `60` | Attempts to observe `ActiveState=active`, 1s apart |
 | `LAYERLENS_DEPLOY_SUDO` | `sudo -n` unless user is root | Privilege prefix for the root-only steps |
 | `LAYERLENS_DEPLOY_SSH_OPTS` | — | Extra `ssh`/`scp` options |
 | `LAYERLENS_DEPLOY_DRY_RUN` | — | `1` prints the plan and executes nothing |

@@ -45,6 +45,7 @@ Optional (shown with their defaults):
   LAYERLENS_DEPLOY_HEALTH_URL=http://127.0.0.1:8080/healthz
                                       Probed ON THE REMOTE HOST after restart.
   LAYERLENS_DEPLOY_HEALTH_RETRIES=30  Health poll attempts, 2s apart.
+  LAYERLENS_DEPLOY_ACTIVE_RETRIES=60  Attempts to see ActiveState=active, 1s apart.
   LAYERLENS_DEPLOY_SUDO               Privilege prefix for root-only commands.
                                       Default: empty for root, "sudo -n" otherwise.
   LAYERLENS_DEPLOY_SSH_OPTS           Extra ssh/scp options, split on whitespace.
@@ -84,6 +85,7 @@ FIXTURES="${LAYERLENS_DEPLOY_FIXTURES:-fixtures}"
 UNIT="${LAYERLENS_DEPLOY_UNIT:-deploy/layerlens.service}"
 HEALTH_URL="${LAYERLENS_DEPLOY_HEALTH_URL:-http://127.0.0.1:8080/healthz}"
 HEALTH_RETRIES="${LAYERLENS_DEPLOY_HEALTH_RETRIES:-30}"
+ACTIVE_RETRIES="${LAYERLENS_DEPLOY_ACTIVE_RETRIES:-60}"
 SERVICE_USER="${LAYERLENS_DEPLOY_SERVICE_USER:-layerlens}"
 
 if [ -z "$HOST" ]; then
@@ -310,11 +312,32 @@ ${SUDO_P}systemctl enable $(quote "$SERVICE")"
 step "Restart the service gracefully"
 # `restart`, not stop+start: systemd sends one SIGTERM and the server drains
 # in-flight requests before exiting (TimeoutStopSec=30s in the unit covers its
-# 15s drain budget). ExecStartPost in the unit already waits for /healthz, so
-# this returns only once the new process is serving.
+# 15s drain budget).
+#
+# The readiness check polls rather than sampling `is-active` once. A unit stays
+# `activating` for as long as its ExecStartPost probe runs, and a start that
+# trips TimeoutStartSec lands in `failed` and is then picked straight back up by
+# Restart=on-failure — so a single sample taken the instant `restart` returns
+# can report a failure for a service that is healthy seconds later. Settle on
+# `active`, give up early on `failed`, and print the status and journal on the
+# way out so a failed deploy says *why*.
+#
+# `systemctl show -p ... | cut` rather than `show --value`: --value needs
+# systemd >= 230, and this script already has one lesson about depending on a
+# host tool being newer than the one actually installed.
 remote "set -eu
 ${SUDO_P}systemctl restart $(quote "$SERVICE")
-${SUDO_P}systemctl --no-pager --quiet is-active $(quote "$SERVICE")"
+state=unknown
+for attempt in \$(seq 1 $(quote "$ACTIVE_RETRIES")); do
+  state=\$(${SUDO_P}systemctl show -p ActiveState $(quote "$SERVICE") 2>/dev/null | cut -d= -f2)
+  if [ \"\$state\" = active ]; then echo \"active (attempt \$attempt)\"; exit 0; fi
+  if [ \"\$state\" = failed ]; then break; fi
+  sleep 1
+done
+echo \"${SERVICE} did not become active (last state: \$state)\" >&2
+${SUDO_P}systemctl --no-pager --full status $(quote "$SERVICE") || true
+${SUDO_P}journalctl --unit $(quote "$SERVICE") --no-pager --lines 50 || true
+exit 1"
 
 step "Verify: poll the health endpoint on the remote host"
 # Independent of the unit's own ExecStartPost probe, and phrased as a loop so a

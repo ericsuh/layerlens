@@ -1447,3 +1447,37 @@ test asserted once against whatever instant the first scroll happened to leave
 behind; it now re-anchors to the tail on every polling attempt. Five consecutive
 green runs after the change.
 
+### Deploy readiness check: poll, don't sample (2026-08-30)
+
+Reported from a real deploy: step 8's `systemctl --quiet is-active` failed, yet
+`systemctl status layerlens.service` showed the service active when checked by
+hand moments later. Two changes, because there are two things wrong.
+
+**The check was a single sample of a value that is legitimately transient.** A
+unit reports `activating` for as long as its `ExecStartPost` probe runs, and a
+start that trips `TimeoutStartSec` lands in `failed` and is then picked straight
+back up by `Restart=on-failure` — so one sample taken the instant `restart`
+returns can fail a deploy whose service is healthy seconds later. It now polls
+`ActiveState` (default 60 attempts, 1s apart, `LAYERLENS_DEPLOY_ACTIVE_RETRIES`),
+settling on `active`, giving up immediately on `failed`, and printing
+`systemctl status` plus 50 journal lines on the way out so a failed deploy says
+why. Verified by executing the generated remote script against a stubbed
+`systemctl`: active-immediately exits 0, activating-then-active exits 0 on the
+fourth attempt (the reported case, previously an immediate exit 1), and failed
+exits 1 without burning the full timeout.
+
+`systemctl show -p ActiveState | cut` rather than `show --value`, because
+`--value` needs systemd >= 230 and this script already has one lesson about
+assuming a host tool is newer than the one installed.
+
+**The unit could also cause the state it was being blamed for.** The readiness
+probe was `curl --retry 30 --retry-delay 1 --max-time 10` with no bound on the
+retry loop as a whole, so it could hold the unit in `activating (start-post)`
+for minutes — past `TimeoutStartSec=120s`, at which point systemd aborts the
+start, marks the unit `failed`, and `Restart=on-failure` revives it. That is
+precisely "deploy said it failed, status says active". Adding
+`--retry-max-time 60` bounds the worst case to ~70s inside the 120s budget.
+`TestReadinessProbeFitsInsideTheStartTimeout` parses both values out of the unit
+and fails if the probe can outlast the start budget; it fails against the
+original unit.
+

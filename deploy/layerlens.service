@@ -71,7 +71,16 @@ ExecStart=/opt/layerlens/layerlens --listen ${LAYERLENS_LISTEN} --data-dir ${LAY
 #   fail the unit — the server is up either way. `systemctl status` still shows
 #   the probe's exit status, and deploy.sh polls /healthz itself before
 #   declaring the deploy good.
-ExecStartPost=-/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused --max-time 10 --output /dev/null ${LAYERLENS_HEALTH_URL}
+#
+#   --retry-max-time bounds the probe as a whole. Without it, `--retry 30` with
+#   a 10s per-attempt cap could keep the unit in `activating (start-post)` for
+#   several minutes — past TimeoutStartSec below, which makes systemd abort the
+#   start, mark the unit `failed`, and let Restart=on-failure bring it back a
+#   moment later. That produces exactly the confusing outcome of a deploy
+#   reporting failure while `systemctl status` shows the service active shortly
+#   after. 60s of retries plus one 10s attempt stays comfortably inside the
+#   120s start budget.
+ExecStartPost=-/usr/bin/curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-max-time 60 --retry-connrefused --max-time 10 --output /dev/null ${LAYERLENS_HEALTH_URL}
 
 # Graceful restart: SIGTERM makes the server stop accepting and drain in-flight
 # requests (15s internal budget), so TimeoutStopSec must exceed that or systemd
