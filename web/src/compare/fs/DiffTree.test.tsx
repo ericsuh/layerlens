@@ -147,7 +147,9 @@ describe("DiffTree", () => {
     const { history } = renderApp(<ComparePage />, { path: `/compare${PAIR}&l=7&r=8` });
     const app = await screen.findByTestId("tree-row-/app");
 
-    await user.click(within(app).getByRole("button", { name: "Open /app as root" }));
+    // Clicking the directory's *name* re-roots the view; the chevron beside it
+    // expands in place instead.
+    await user.click(within(app).getByTitle(/^Open \/app —/));
     await waitFor(() => {
       expect(history.at(-1)).toBe(`/compare${PAIR}&l=7&r=8&path=/app`);
     });

@@ -671,9 +671,12 @@ export function DiffTree({
                         level={entry.level}
                         focusedItem={focusedItem}
                         firstItemId={items[0]?.getId() ?? null}
-                        maxSiblingBytes={
-                          snapshots.get(parentPath(entry.id))?.data.maxSiblingBytes ?? 0
-                        }
+                        // One denominator for every bar in the view: the
+                        // largest entry at the tree's own root. Scaling per
+                        // directory (the parent's maxSiblingBytes) re-stretched
+                        // each level to full width, so a child could out-draw
+                        // the folder containing it.
+                        scaleBytes={rootSnapshot.data.maxSiblingBytes}
                         ariaSetSize={serverSetSize(entry.id)}
                         expanded={expandedSet.has(entry.id)}
                         onToggle={toggle}
@@ -702,7 +705,7 @@ function ItemRow({
   level,
   focusedItem,
   firstItemId,
-  maxSiblingBytes,
+  scaleBytes,
   ariaSetSize,
   expanded,
   onToggle,
@@ -712,7 +715,7 @@ function ItemRow({
   level: number;
   focusedItem: string | null;
   firstItemId: string | null;
-  maxSiblingBytes: number;
+  scaleBytes: number;
   ariaSetSize: number | undefined;
   expanded: boolean;
   onToggle: (path: string) => void;
@@ -745,7 +748,7 @@ function ItemRow({
       level={level}
       expanded={expanded}
       selected={item.isSelected()}
-      maxSiblingBytes={maxSiblingBytes}
+      scaleBytes={scaleBytes}
       onToggle={() => {
         item.setFocused();
         onToggle(id);

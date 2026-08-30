@@ -425,8 +425,9 @@ Fixed 32px row height (virtualized). One shared column grid — used by the
 header row *and* every tree row — so the two can never drift:
 
 ```
-[ Name (fluid) ][ ± 42px ][ Δ size 84px ][ Δ files 64px ][ Size 76px ][ Files 56px ][ Rel. size 108px ]
-   [indent][▸][name……]       −1023.9 MiB     +999,999       1023.9 MiB    999,999      ▕██▓▓░░▏
+[ Name (fluid) ][ ± 30px ][   Size 116px   ][ Δ size 84px ][ Files 56px ][ Δ files 64px ]
+   [indent][▸][name……]    ±     1023.9 MiB      −1023.9 MiB     999,999       +999,999
+                                ▕██▓▓░░▏
 ```
 
 - **Header row**: persistent and **sticky** (`position: sticky; top: 0`) at
@@ -438,24 +439,27 @@ header row *and* every tree row — so the two can never drift:
   fluid Name cell; every numeric column is a fixed grid track. The header
   therefore stays aligned with the rows at every depth by construction —
   there is nothing depth-dependent outside the Name cell.
-- **Column set** — `Name | ± | Δ size | Δ files | Size | Files | Rel. size`:
-  the Δ pair sits directly after the status glyph because "what changed" is
-  the tool's primary question; the absolute pair follows as the "after"
-  context; the bar stays outermost as a purely visual summary. Absolute
+- **Column set** — `Name | ± | Size | Δ size | Files | Δ files`: each
+  absolute is immediately followed by its own delta, so the pair reads as one
+  unit ("13.3 MiB, of which +4.8 MiB is new") instead of asking the eye to
+  jump two columns to pair them up. There is **no separate relative-size
+  column**: the bar lives inside the Size cell, which is the number it
+  visualizes — two columns for one quantity was width spent twice. Absolute
   columns are the **B-side** totals (the after state) — keeping the existing
   decision that A-side totals live in the row tooltip. Two labeled absolute
   columns replace the old `142 MiB · 393 f` composite cell: the unit-suffix
   jargon (`f`) is gone, and delta vs absolute is disambiguated by the
   headers, not by inline suffixes.
 - **Header labels + tooltips** (label short, meaning in `title`):
-  - `±` — "Change status: + added, − removed, ± modified, · unchanged; on a
-    directory, ± N counts changed descendants."
+  - `±` — "Change status: + added, − removed, ± modified or contains changes,
+    · unchanged." **Glyph only, no count**: a directory row reading `± 66` was
+    read as a size or a file count as often as a descendant tally. The number
+    survives as the cell's tooltip and in the row's SR sentence.
+  - `Size` — "Total size in image B, with a bar scaled against the largest
+    top-level entry — hover a row for the A-side totals."
   - `Δ size` — "Change in total size, B relative to A."
-  - `Δ files` — "Change in file count, B relative to A."
-  - `Size` — "Total size in image B — hover a row for the A-side totals."
   - `Files` — "Total file count in image B — hover a row for the A-side totals."
-  - `Rel. size` — "Size relative to the largest sibling; hatched segments
-    are the added / removed / modified portions."
+  - `Δ files` — "Change in file count, B relative to A."
 - **Fixed widths** are sized from the worst plausible content, not the
   fixture (§3): nothing in a numeric column may ever wrap or overflow.
   Numeric cells are right-aligned, mono, tabular-nums, `white-space: nowrap`.
@@ -463,12 +467,12 @@ header row *and* every tree row — so the two can never drift:
 #### Tree rows
 
 - **Disclosure triangle**: 16px hit area 24px, rotates 90° in 120ms when
-  open; only on directories; `cursor:pointer`. Chevron area toggles;
-  clicking the *name* of a directory also toggles (single-click), while the
-  small `↳` "open as root" icon-button at row end (visible on hover/focus)
-  performs drill-down — two distinct affordances so disclosure vs drill-down
-  never surprises. Files: no triangle, name click selects the row (shows a
-  detail line: full path, mode, per-side sizes).
+  open; only on directories; `cursor:pointer`. **The chevron expands the
+  subtree in place; clicking the directory's *name* re-roots the view onto
+  it.** Two affordances, each obvious from its shape — a triangle discloses, a
+  name navigates — which retires the `↳` "open as root" button that had to be
+  explained. Files: no triangle, name click selects the row (shows a detail
+  line: full path, mode, per-side sizes).
 - **Name**: mono for files, sans for directories (dirs get trailing `/`);
   truncate-end.
 - **Status glyph + color** (never color alone): `+` added, `−` removed,
@@ -485,9 +489,15 @@ header row *and* every tree row — so the two can never drift:
   rationale: one side of truth plus deltas beats four columns of numbers.
   File rows show their own size and leave `Files` empty. Removed entries
   show their A-side values in both columns, struck through.
-- **Size bar**: 6px, right-aligned fixed 96px track; width = subtree size /
-  largest sibling subtree at this level (per-sibling-group normalization —
-  the spec's "relative sizes of each entry"). Segmented fill: unchanged
+- **Size bar**: 5px, right-aligned fixed 104px track, positioned inside the
+  Size cell beneath its number (absolutely, so it cannot push that number off
+  the baseline the other numeric columns share). Width = subtree size /
+  **the largest entry at the top level of the visible tree** — one denominator
+  for the whole tree, not one per directory. That is what makes a child's bar
+  never exceed its parent's: a subtree's bytes are a subset of its parent's,
+  so a shared scale orders them by construction. Per-sibling normalization
+  re-stretched every level to full width, so a 3 KiB file inside a 4 MiB
+  folder drew the same bar as the folder. Segmented fill: unchanged
   portion solid neutral 35% alpha, added portion green 45° hatch, removed
   red 135° hatch (rendered from the A-side share), modified amber
   vertical-tick hatch. Bars <2px clamp to 2px.
@@ -682,7 +692,7 @@ below that we do not optimize (no mobile).
   to each selected point, then diffed), so layer selection genuinely changes
   the tree — including the all-unchanged trunk-point case.
 - Tree supports disclosure, drill-down with breadcrumbs, changed-only filter,
-  per-sibling-normalized hatched size bars, and the sticky column header
+  tree-normalized hatched size bars inside the Size column, and the sticky header
   (§5.3); the fixture includes the deep path
   `/app/node_modules/@babel/plugin-transform-runtime/lib/get-runtime-path/`
   to prove header/row column alignment holds at depth.

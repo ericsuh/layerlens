@@ -69,9 +69,14 @@ test("fix 2 — numeric columns reserve their worst case and never wrap", async 
   const ids = await imageIds(request);
   const deepest = await openDeepTree(page, ids);
 
-  const numeric = ["cell-delta-size", "cell-delta-files", "cell-size", "cell-files"] as const;
-  for (const id of numeric) {
-    const cell = deepest.getByTestId(id);
+  // cell-size is a two-row flex cell (number over bar), so its own box is not
+  // the thing that must not wrap — the number inside it is.
+  const numeric = ["cell-delta-size", "cell-delta-files", "cell-files"] as const;
+  for (const id of [...numeric, "cell-size"] as const) {
+    const cell =
+      id === "cell-size"
+        ? deepest.getByTestId(id).locator(".ll-tnum")
+        : deepest.getByTestId(id);
     await expect(cell).toHaveCSS("white-space", "nowrap");
     await expect(cell).toHaveCSS("text-align", "right");
     await expect(cell).toHaveCSS("font-variant-numeric", "tabular-nums");
@@ -80,16 +85,19 @@ test("fix 2 — numeric columns reserve their worst case and never wrap", async 
   // Worst-case content, injected: the fixtures are far too small to produce
   // `−1023.9 MiB` or `+999,999`, and the columns were sized for the worst
   // plausible image, not for this one.
+  // Keyed by the selector that actually holds the number: cell-size wraps its
+  // value in .ll-tnum so the bar can sit beneath it, and measuring the flex
+  // container instead would measure the bar's track rather than the text.
   const worstCase: Record<string, string> = {
-    "cell-delta-size": "−1023.9 MiB",
-    "cell-delta-files": "+999,999",
-    "cell-size": "1023.9 MiB",
-    "cell-files": "999,999",
+    '[data-testid="cell-delta-size"]': "−1023.9 MiB",
+    '[data-testid="cell-delta-files"]': "+999,999",
+    '[data-testid="cell-size"] .ll-tnum': "1023.9 MiB",
+    '[data-testid="cell-files"]': "999,999",
   };
   const overflow = await deepest.evaluate((rowElement, values) => {
     const results: { id: string; overflowed: boolean; lines: number }[] = [];
     for (const [id, text] of Object.entries(values)) {
-      const cell = rowElement.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+      const cell = rowElement.querySelector<HTMLElement>(id);
       if (cell === null) {
         continue;
       }
@@ -108,7 +116,7 @@ test("fix 2 — numeric columns reserve their worst case and never wrap", async 
     return results;
   }, worstCase);
 
-  expect(overflow.length).toBe(numeric.length);
+  expect(overflow.length).toBe(Object.keys(worstCase).length);
   for (const result of overflow) {
     expect(result, `${result.id} must fit its reserved width`).toMatchObject({
       overflowed: false,
@@ -127,15 +135,14 @@ test("fix 3 — columns are labelled, and no cell carries unit-suffix jargon", a
   const labels = await page
     .locator('[data-testid="tree-header"] > div')
     .evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() ?? ""));
-  expect(labels).toEqual(["Name", "±", "Δ size", "Δ files", "Size", "Files", "Rel. size"]);
+  expect(labels).toEqual(["Name", "±", "Size", "Δ size", "Files", "Δ files"]);
 
   for (const [id, title] of [
     ["col-status", /Change status/],
     ["col-deltaSize", /Change in total size, B relative to A/],
     ["col-deltaFiles", /Change in file count, B relative to A/],
-    ["col-size", /Total size in image B/],
+    ["col-size", /Total size in image B, with a bar scaled against the largest top-level entry/],
     ["col-files", /Total file count in image B/],
-    ["col-bar", /relative to the largest sibling/],
   ] as const) {
     await expect(page.getByTestId(id)).toHaveAttribute("title", title);
   }
@@ -166,9 +173,9 @@ test("below 1280px both file-count columns leave the header and the rows togethe
   await expect(deepest.getByTestId("cell-delta-files")).toBeHidden();
   await expect(deepest.getByTestId("cell-files")).toBeHidden();
 
-  // Five columns left, and still aligned.
+  // Four columns left, and still aligned.
   const headerCells = await headerEdges(page);
-  expect(headerCells.length).toBe(5);
+  expect(headerCells.length).toBe(4);
   expect((await cellEdges(deepest)).slice(1)).toEqual(headerCells.slice(1));
 
   // The data did not disappear — it is in the row's screen-reader sentence.

@@ -5,7 +5,6 @@ import {
   formatByteDelta,
   formatBytes,
   formatBytesSpoken,
-  formatCompactCount,
   formatCount,
 } from "../../lib/format";
 import { SizeBar } from "./SizeBar";
@@ -66,7 +65,8 @@ export interface TreeRowViewProps {
   level: number;
   expanded: boolean;
   selected: boolean;
-  maxSiblingBytes: number;
+  /** Denominator for every bar in the view — see SizeBar. */
+  scaleBytes: number;
   onToggle: () => void;
   onDrill: () => void;
   onSelect: () => void;
@@ -77,18 +77,20 @@ export interface TreeRowViewProps {
 /**
  * One tree row (DESIGN §5.3 "Tree rows").
  *
- * Three distinct affordances, deliberately not one: the chevron toggles, the
- * *name* toggles (directories) or selects (files), and the `↳` button at the
- * end of the name re-roots the view. The rest of the row is a dead zone with
- * no pointer cursor, so "clickable" never blurs into "the row happens to be
- * under my mouse".
+ * Two distinct affordances, deliberately not one: the chevron expands the
+ * subtree in place, and the *name* re-roots the view onto that directory (or
+ * selects, for a file). Splitting them this way makes each obvious from its
+ * shape — a triangle discloses, a name navigates — and retires the `↳` button,
+ * which had to be explained. The rest of the row is a dead zone with no pointer
+ * cursor, so "clickable" never blurs into "the row happens to be under my
+ * mouse".
  */
 export function TreeRowView({
   row,
   level,
   expanded,
   selected,
-  maxSiblingBytes,
+  scaleBytes,
   onToggle,
   onDrill,
   onSelect,
@@ -155,9 +157,13 @@ export function TreeRowView({
           type="button"
           tabIndex={-1}
           className={`ll-tname${dir ? "" : " ll-tname-file"}`}
-          title={`${row.path} — ${describeRow(row, WRITTEN)}`}
+          title={
+            dir
+              ? `Open ${row.path} — ${describeRow(row, WRITTEN)}`
+              : `${row.path} — ${describeRow(row, WRITTEN)}`
+          }
           onClick={(event) => {
-            stop(event, expandable ? onToggle : onSelect);
+            stop(event, dir ? onDrill : onSelect);
           }}
         >
           {row.name}
@@ -173,34 +179,39 @@ export function TreeRowView({
             type changed
           </span>
         ) : null}
-        {dir ? (
-          <button
-            type="button"
-            tabIndex={-1}
-            className="ll-drill"
-            title={`Open ${row.path} as root`}
-            aria-label={`Open ${row.path} as root`}
-            onClick={(event) => {
-              stop(event, onDrill);
-            }}
-          >
-            ↳
-          </button>
-        ) : null}
       </div>
 
-      <div className="ll-tcell-status" aria-hidden="true">
-        {kind === "contains" ? (
-          <span className="ll-contains" title={`${formatCount(changed)} changed descendants`}>
-            ± {formatCompactCount(changed)}
-          </span>
-        ) : (
-          GLYPH[kind]
-        )}
+      <div
+        className="ll-tcell-status"
+        aria-hidden="true"
+        title={
+          kind === "contains" ? `${formatCount(changed)} changed descendants` : undefined
+        }
+      >
+        {/* Glyph only. The count that used to sit here ("± 66") read as a size
+            or a file count as often as a descendant tally; it survives as this
+            cell's tooltip and in the row's screen-reader sentence. */}
+        {kind === "contains" ? "±" : GLYPH[kind]}
+      </div>
+
+      <div className="ll-tcell-size" title={totals} data-testid="cell-size">
+        <span className={`ll-tnum${gone ? " ll-tnum-gone" : ""}`} aria-hidden="true">
+          {formatBytes(gone ? row.agg.leftBytes : row.agg.rightBytes)}
+        </span>
+        <SizeBar agg={row.agg} scaleBytes={scaleBytes} />
       </div>
 
       <div className={`ll-tnum ${deltaClass}`} aria-hidden="true" data-testid="cell-delta-size">
         {formatByteDelta(deltaBytes)}
+      </div>
+
+      <div
+        className={`ll-tnum ll-tcol-optional${gone ? " ll-tnum-gone" : ""}`}
+        title={totals}
+        aria-hidden="true"
+        data-testid="cell-files"
+      >
+        {dir ? formatCount(gone ? row.agg.leftFiles : row.agg.rightFiles) : ""}
       </div>
 
       <div
@@ -213,28 +224,6 @@ export function TreeRowView({
         {/* A file is not a subtree: its own add/remove is already the status
             glyph, so a "+1" here would double-count it. */}
         {dir ? (deltaFiles === 0 ? "—" : `${deltaFiles > 0 ? "+" : "−"}${formatCount(Math.abs(deltaFiles))}`) : ""}
-      </div>
-
-      <div
-        className={`ll-tnum${gone ? " ll-tnum-gone" : ""}`}
-        title={totals}
-        aria-hidden="true"
-        data-testid="cell-size"
-      >
-        {formatBytes(gone ? row.agg.leftBytes : row.agg.rightBytes)}
-      </div>
-
-      <div
-        className={`ll-tnum ll-tcol-optional${gone ? " ll-tnum-gone" : ""}`}
-        title={totals}
-        aria-hidden="true"
-        data-testid="cell-files"
-      >
-        {dir ? formatCount(gone ? row.agg.leftFiles : row.agg.rightFiles) : ""}
-      </div>
-
-      <div className="ll-tcell-bar">
-        <SizeBar agg={row.agg} maxSiblingBytes={maxSiblingBytes} />
       </div>
     </div>
   );

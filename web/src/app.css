@@ -1001,21 +1001,15 @@
     border-radius: 4px;
   }
 
+  /* A read-out, not a control: no pointer cursor and no hover response, because
+     DESIGN §1 makes those the signals that something is clickable and these
+     chips no longer are. */
   .ll-sel-chip {
     border-radius: var(--radius-badge);
     padding: 1px 8px;
     font-weight: 600;
     font-family: var(--font-mono);
     font-size: 11px;
-    cursor: pointer;
-    transition:
-      box-shadow 0.12s ease,
-      filter 0.12s ease;
-  }
-
-  .ll-sel-chip:hover {
-    box-shadow: var(--shadow-panel);
-    filter: brightness(0.96);
   }
 
   .ll-sel-chip-a {
@@ -1150,11 +1144,11 @@
      (guides + chevron) lives inside the fluid Name cell, which is what keeps
      the header aligned with rows at every depth by construction.
      Widths reserve the worst plausible rendering, not the current data:
-     status "± 9.9M" 42 · Δ size "−1023.9 MiB" 84 · Δ files "+999,999" 64 ·
-     Size "1023.9 MiB" 76 · Files "999,999" 56 · bar track 96 in 108. */
+     status "±" 30 · Size "1023.9 MiB" over a 104px track 116 ·
+     Δ size "−1023.9 MiB" 84 · Files "999,999" 56 · Δ files "+999,999" 64. */
   .ll-tgrid {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 42px 84px 64px 76px 56px 108px;
+    grid-template-columns: minmax(0, 1fr) 30px 116px 84px 56px 64px;
     align-items: center;
     column-gap: 8px;
     padding: 0 14px 0 8px;
@@ -1166,7 +1160,7 @@
      reachable in the row tooltip and the SR text. */
   @media (max-width: 1279px) {
     .ll-tgrid {
-      grid-template-columns: minmax(0, 1fr) 42px 84px 76px 108px;
+      grid-template-columns: minmax(0, 1fr) 30px 116px 84px;
     }
 
     .ll-tcol-optional {
@@ -1440,14 +1434,34 @@
     opacity: 0.7;
   }
 
-  .ll-tcell-bar {
+  /* The Size cell stacks its number over the bar that visualizes it. Both are
+     right-aligned to the same edge so the numbers still read as a column and
+     the bars still read as a chart. */
+  /* The Size cell carries its own bar. The bar is positioned rather than
+     stacked so it cannot push the number off the baseline the other numeric
+     columns sit on — a stacked layout lifted "13.3 MiB" ~7px above "+4.8 MiB"
+     beside it, and numbers that no longer line up stop reading as a column. */
+  .ll-tcell-size {
+    position: relative;
     display: flex;
+    align-items: center;
     justify-content: flex-end;
+    align-self: stretch;
+    min-width: 0;
+  }
+
+  /* The number is NOT nudged: it stays centered like every other numeric cell,
+     which is the whole point. The bar tucks into the space below the text's
+     descender instead. */
+  .ll-tcell-size .ll-sbar {
+    position: absolute;
+    right: 0;
+    bottom: 3px;
   }
 
   .ll-sbar {
-    width: 96px;
-    height: 6px;
+    width: 104px;
+    height: 5px;
     border-radius: 3px;
     background: var(--color-surface-2);
     overflow: hidden;

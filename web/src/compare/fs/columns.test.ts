@@ -41,18 +41,19 @@ describe("tree column definition", () => {
     const optional = TREE_COLUMNS.filter((column) => column.hideBelow1280 === true).map(
       (column) => column.key,
     );
-    expect(optional).toEqual(["deltaFiles", "files"]);
+    expect(optional).toEqual(["files", "deltaFiles"]);
   });
 
   it("labels every column and explains it in a title", () => {
+    // Each absolute is immediately followed by its own delta, and there is no
+    // separate relative-size column — the bar lives in the Size cell.
     expect(TREE_COLUMNS.map((column) => column.label)).toEqual([
       "Name",
       "±",
-      "Δ size",
-      "Δ files",
       "Size",
+      "Δ size",
       "Files",
-      "Rel. size",
+      "Δ files",
     ]);
     for (const column of TREE_COLUMNS) {
       expect(column.title.length).toBeGreaterThan(10);
@@ -62,13 +63,14 @@ describe("tree column definition", () => {
   it("reserves the worst case DESIGN §3 names, not the fixture's data", () => {
     const widths = Object.fromEntries(TREE_COLUMNS.map((c) => [c.key, c.widthPx]));
     expect(widths).toMatchObject({
-      status: 42,
+      status: 30,
+      size: 116,
       deltaSize: 84,
-      deltaFiles: 64,
-      size: 76,
       files: 56,
-      bar: 108,
+      deltaFiles: 64,
     });
+    // The bar is not its own column any more, and must not creep back into one.
+    expect(TREE_COLUMNS.some((column) => column.key === ("bar" as string))).toBe(false);
     for (const key of NUMERIC_COLUMN_KEYS) {
       expect(TREE_COLUMNS.find((column) => column.key === key)?.worstCase).toBeTruthy();
     }

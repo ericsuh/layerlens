@@ -116,8 +116,9 @@ test("golden workflow: pick two images, read the layer graph, diff the filesyste
     await page.getByTestId("filter-select").selectOption("changed");
     await expandRow(page, "/app");
     const src = await revealRow(page, "/app/src");
-    await src.hover();
-    await src.getByRole("button", { name: "Open /app/src as root" }).click();
+    // The chevron expanded /app in place above; clicking the directory's own
+    // *name* re-roots onto it.
+    await src.getByTitle(/^Open \/app\/src —/).click();
     await expect(page).toHaveURL(/path=\/app\/src/);
     await expect(page.getByTestId("crumb-current")).toHaveText("src");
     // Re-rooted: the row is now a top-level entry, not a nested one.

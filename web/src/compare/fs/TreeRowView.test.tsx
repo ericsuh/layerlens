@@ -18,7 +18,7 @@ function renderRow(row: TreeRow, overrides: Partial<Parameters<typeof TreeRowVie
       level={0}
       expanded={false}
       selected={false}
-      maxSiblingBytes={1000}
+      scaleBytes={1000}
       itemProps={{ role: "treeitem" }}
       {...handlers}
       {...overrides}
@@ -64,12 +64,16 @@ describe("TreeRowView", () => {
     // The B side is gone, so the absolute columns quote A — struck through, so
     // "1.2 MiB" cannot be misread as "still there".
     expect(cell(element, "cell-size")).toHaveTextContent("1.2 MiB");
-    expect(cell(element, "cell-size").className).toContain("ll-tnum-gone");
+    // The strike-through is on the number inside the Size cell, which now also
+    // holds the bar.
+    expect(cell(element, "cell-size").querySelector(".ll-tnum")?.className).toContain(
+      "ll-tnum-gone",
+    );
     expect(cell(element, "cell-files")).toHaveTextContent("3");
     expect(cell(element, "cell-delta-size")).toHaveTextContent("−1.2 MiB");
   });
 
-  it("gives a merely-containing directory a ± N summary and no tint", () => {
+  it("marks a merely-containing directory with a bare ± and no tint", () => {
     const { element } = renderRow({
       name: "app",
       path: "/app",
@@ -92,7 +96,11 @@ describe("TreeRowView", () => {
     // No full-row tint: this directory did not change, its contents did.
     expect(element.className).not.toContain("ll-trow-added");
     expect(element.className).not.toContain("ll-trow-removed");
-    expect(within(element).getByTitle("66 changed descendants")).toHaveTextContent("± 66");
+    // The glyph alone, with the tally moved to the tooltip: "± 66" in the cell
+    // was read as a size or a file count as often as a descendant count.
+    const status = within(element).getByTitle("66 changed descendants");
+    expect(status).toHaveTextContent("±");
+    expect(status.textContent).not.toMatch(/66/);
     expect(cell(element, "cell-delta-files")).toHaveTextContent("+58");
     expect(cell(element, "cell-size")).toHaveAttribute(
       "title",
@@ -116,7 +124,7 @@ describe("TreeRowView", () => {
     expect(cell(element, "cell-delta-size").className).toContain("ll-tnum-zero");
   });
 
-  it("keeps chevron, name and drill-down as three separate affordances", async () => {
+  it("splits the chevron (expand) from the name (open) as two affordances", async () => {
     const user = userEvent.setup();
     const { element, onToggle, onDrill, onSelect } = renderRow({
       name: "src",
@@ -129,14 +137,18 @@ describe("TreeRowView", () => {
       childCount: 3,
     });
 
+    // The chevron discloses the subtree in place...
     await user.click(within(element).getByTitle("Expand"));
     expect(onToggle).toHaveBeenCalledTimes(1);
-    // On a directory the name toggles too; drill-down is its own button.
-    await user.click(within(element).getByTitle(/^\/app\/src —/));
-    expect(onToggle).toHaveBeenCalledTimes(2);
-    await user.click(within(element).getByRole("button", { name: "Open /app/src as root" }));
+    expect(onDrill).not.toHaveBeenCalled();
+
+    // ...and the name re-roots the view onto that directory. The old `↳`
+    // button is gone: the two jobs now match the two shapes.
+    await user.click(within(element).getByTitle(/^Open \/app\/src —/));
     expect(onDrill).toHaveBeenCalledTimes(1);
+    expect(onToggle).toHaveBeenCalledTimes(1);
     expect(onSelect).not.toHaveBeenCalled();
+    expect(within(element).queryByText("↳")).toBeNull();
   });
 
   it("selects rather than toggles when the row is a file", async () => {
@@ -174,9 +186,14 @@ describe("TreeRowView", () => {
     // aligned with rows at every depth (RESEARCH Q12 fix 1).
     const nameCell = element.querySelector(".ll-tcell-name");
     expect(nameCell?.querySelectorAll(".ll-tguide")).toHaveLength(6);
-    expect(element.querySelectorAll(":scope > div")).toHaveLength(7);
-    for (const id of ["cell-delta-size", "cell-delta-files", "cell-size", "cell-files"]) {
+    // Six grid children: Name, ±, Size, Δ size, Files, Δ files. The bar is not
+    // one of them — it lives inside the Size cell.
+    expect(element.querySelectorAll(":scope > div")).toHaveLength(6);
+    for (const id of ["cell-delta-size", "cell-delta-files", "cell-files"]) {
       expect(cell(element, id).className).toContain("ll-tnum");
     }
+    // Size wraps its number so the bar can sit under it; the number still
+    // carries the class that keeps it on one line.
+    expect(cell(element, "cell-size").querySelector(".ll-tnum")).not.toBeNull();
   });
 });

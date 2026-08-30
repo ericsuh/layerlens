@@ -9,21 +9,28 @@ const SEGMENT_CLASS = {
 } as const;
 
 /**
- * The per-sibling-normalized relative-size bar (DESIGN §5.3).
+ * The relative-size bar, rendered inside the Size cell it visualizes.
+ *
+ * `scaleBytes` is one denominator for the whole visible tree — the largest
+ * entry at its top level — not a per-directory maximum. That is what makes a
+ * child's bar never exceed its parent's: with a single denominator, a subtree
+ * whose bytes are a subset of its parent's is a shorter bar by construction,
+ * whereas per-sibling scaling re-stretched every directory to full width and
+ * made a 3 KiB file inside a 4 MiB folder look the same size as the folder.
  *
  * `aria-hidden`: every number it encodes is already in the row's SR sentence,
  * and a bar read aloud as a list of percentages helps nobody.
  */
 export function SizeBar({
   agg,
-  maxSiblingBytes,
+  scaleBytes,
   trackPx = BAR_TRACK_PX,
 }: {
   agg: TreeAgg;
-  maxSiblingBytes: number;
+  scaleBytes: number;
   trackPx?: number;
 }) {
-  const model = sizeBarModel(agg, maxSiblingBytes, trackPx);
+  const model = sizeBarModel(agg, scaleBytes, trackPx);
   if (model.widthPx === 0) {
     return null;
   }

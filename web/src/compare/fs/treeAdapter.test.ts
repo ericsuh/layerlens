@@ -330,6 +330,26 @@ describe("interleaveTrailers", () => {
 });
 
 describe("sizeBarModel", () => {
+  // The reason the denominator is now the tree's top-level maximum rather than
+  // each directory's own: with one scale, "child never out-draws its parent"
+  // is arithmetic rather than a thing to remember. Per-sibling scaling
+  // re-stretched every level to full width, so a 3 KiB file inside a 4 MiB
+  // folder drew the same bar as the folder.
+  it("never draws a child wider than the parent containing it", () => {
+    const scale = 8_741_966; // the largest top-level entry
+    const parent = { leftBytes: 4_000_000, rightBytes: 4_000_000, leftFiles: 9, rightFiles: 9 };
+    const children = [
+      { leftBytes: 4_000_000, rightBytes: 4_000_000, leftFiles: 9, rightFiles: 9 }, // all of it
+      { leftBytes: 1_500_000, rightBytes: 1_500_000, leftFiles: 4, rightFiles: 4 },
+      { leftBytes: 1, rightBytes: 2, leftFiles: 1, rightFiles: 1 }, // a rounding-error sliver
+    ];
+    const parentWidth = sizeBarModel(parent, scale).widthPx;
+    for (const child of children) {
+      expect(sizeBarModel(child, scale).widthPx).toBeLessThanOrEqual(parentWidth);
+    }
+  });
+
+
   it("scales against the largest sibling and splits into change segments", () => {
     const model = sizeBarModel(
       agg({ leftBytes: 40, rightBytes: 60, addedBytes: 25, removedBytes: 5, modifiedBytesLeft: 10, modifiedBytesRight: 10 }),

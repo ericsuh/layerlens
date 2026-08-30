@@ -410,17 +410,6 @@ export function LayerGraphPanel({ graph, selection, onSelect }: LayerGraphPanelP
   const ruleA = boxForPosition(positionA);
   const ruleB = boxForPosition(positionB);
 
-  const scrollToSelection = (side: "a" | "b") => {
-    const position = side === "a" ? positionA : positionB;
-    if (position === null) {
-      return;
-    }
-    cardRefs.current.get(`${position.column}:${position.index}`)?.scrollIntoView({
-      block: "center",
-      behavior: "smooth",
-    });
-  };
-
   const leftRef = primaryRef(graph.left);
   const rightRef = primaryRef(graph.right);
 
@@ -431,29 +420,18 @@ export function LayerGraphPanel({ graph, selection, onSelect }: LayerGraphPanelP
           Layer comparison
         </h2>
         <span className="text-text-muted text-[12px]">base → latest</span>
+        {/* Read-outs, not controls. These were buttons that scrolled the
+            diagram to the selected card — an affordance nothing about them
+            advertised, on a diagram short enough that scrolling to a card is
+            rarely what anyone wanted. They keep the job they were actually
+            doing: saying which layer each side is pinned to. */}
         <div className="ml-auto flex gap-1.5">
-          <button
-            type="button"
-            className="ll-sel-chip ll-sel-chip-a"
-            data-testid="selection-chip-a"
-            onClick={() => {
-              scrollToSelection("a");
-            }}
-            title="Scroll to image A's selected layer"
-          >
+          <span className="ll-sel-chip ll-sel-chip-a" data-testid="selection-chip-a">
             {selectionLabel("a", selection.l)}
-          </button>
-          <button
-            type="button"
-            className="ll-sel-chip ll-sel-chip-b"
-            data-testid="selection-chip-b"
-            onClick={() => {
-              scrollToSelection("b");
-            }}
-            title="Scroll to image B's selected layer"
-          >
+          </span>
+          <span className="ll-sel-chip ll-sel-chip-b" data-testid="selection-chip-b">
             {selectionLabel("b", selection.r)}
-          </button>
+          </span>
         </div>
       </header>
 

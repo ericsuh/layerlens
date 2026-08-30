@@ -11,7 +11,7 @@
  */
 
 export interface TreeColumn {
-  key: "name" | "status" | "deltaSize" | "deltaFiles" | "size" | "files" | "bar";
+  key: "name" | "status" | "size" | "deltaSize" | "files" | "deltaFiles";
   label: string;
   /** The `title` tooltip that carries the meaning the short label cannot. */
   title: string;
@@ -24,10 +24,15 @@ export interface TreeColumn {
 }
 
 /**
- * Order matters: `Name | ± | Δ size | Δ files | Size | Files | Rel. size`.
- * The Δ pair sits directly after the status glyph because "what changed" is
- * the tool's primary question; the absolute pair is the "after" context; the
- * bar stays outermost as a purely visual summary.
+ * Order matters: `Name | ± | Size | Δ size | Files | Δ files`.
+ *
+ * Each absolute is followed by its own delta, so the pair reads as one unit
+ * ("14.3 MiB, of which +695 B is new") instead of asking the eye to jump two
+ * columns to pair them up.
+ *
+ * There is no separate relative-size column: the bar lives inside the Size
+ * cell, which is the number it visualizes. Two columns for one quantity was
+ * width spent twice.
  */
 export const TREE_COLUMNS: readonly TreeColumn[] = [
   {
@@ -40,10 +45,20 @@ export const TREE_COLUMNS: readonly TreeColumn[] = [
   {
     key: "status",
     label: "±",
+    // No count: a directory row used to read "± 66", which was read as a size
+    // or a file count as often as a descendant tally. The glyph alone says
+    // "something below here changed", and the Δ columns say how much.
+    title: "Change status: + added, − removed, ± modified or contains changes, · unchanged",
+    widthPx: 30,
+    worstCase: "±",
+  },
+  {
+    key: "size",
+    label: "Size",
     title:
-      "Change status: + added, − removed, ± modified, · unchanged. On a directory, ± N counts changed descendants.",
-    widthPx: 42,
-    worstCase: "± 9.9M",
+      "Total size in image B, with a bar scaled against the largest top-level entry — hover a row for the A-side totals",
+    widthPx: 116,
+    worstCase: "1023.9 MiB over a 104px track",
   },
   {
     key: "deltaSize",
@@ -51,21 +66,6 @@ export const TREE_COLUMNS: readonly TreeColumn[] = [
     title: "Change in total size, B relative to A",
     widthPx: 84,
     worstCase: "−1023.9 MiB",
-  },
-  {
-    key: "deltaFiles",
-    label: "Δ files",
-    title: "Change in file count, B relative to A",
-    widthPx: 64,
-    worstCase: "+999,999",
-    hideBelow1280: true,
-  },
-  {
-    key: "size",
-    label: "Size",
-    title: "Total size in image B — hover a row for the A-side totals",
-    widthPx: 76,
-    worstCase: "1023.9 MiB",
   },
   {
     key: "files",
@@ -76,12 +76,12 @@ export const TREE_COLUMNS: readonly TreeColumn[] = [
     hideBelow1280: true,
   },
   {
-    key: "bar",
-    label: "Rel. size",
-    title:
-      "Size relative to the largest sibling; hatched segments are the added / removed / modified portions",
-    widthPx: 108,
-    worstCase: "96px track",
+    key: "deltaFiles",
+    label: "Δ files",
+    title: "Change in file count, B relative to A",
+    widthPx: 64,
+    worstCase: "+999,999",
+    hideBelow1280: true,
   },
 ];
 
@@ -89,7 +89,7 @@ export const TREE_COLUMNS: readonly TreeColumn[] = [
  * The grid template, kept here as the single source of truth and asserted
  * against `.ll-tgrid` by a unit test so the CSS and this table cannot drift.
  */
-export const TREE_GRID_TEMPLATE = "minmax(0,1fr) 42px 84px 64px 76px 56px 108px";
+export const TREE_GRID_TEMPLATE = "minmax(0,1fr) 30px 116px 84px 56px 64px";
 
 /** The px classes each column's cell carries, for the tests that assert them. */
-export const NUMERIC_COLUMN_KEYS = ["deltaSize", "deltaFiles", "size", "files"] as const;
+export const NUMERIC_COLUMN_KEYS = ["size", "deltaSize", "files", "deltaFiles"] as const;

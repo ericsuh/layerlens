@@ -22,9 +22,7 @@ export function TreeHeader() {
               ? "ll-th-name"
               : column.key === "status"
                 ? "ll-th-status"
-                : column.key === "bar"
-                  ? "ll-th-bar"
-                  : "ll-th-num") + (column.hideBelow1280 === true ? " ll-tcol-optional" : "")
+                : "ll-th-num") + (column.hideBelow1280 === true ? " ll-tcol-optional" : "")
           }
         >
           {column.label}

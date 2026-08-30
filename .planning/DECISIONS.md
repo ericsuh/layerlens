@@ -1551,3 +1551,45 @@ Three things worth recording:
 The binary's own `--listen` default stays `:8080`, so a dev instance and a
 deployed one do not collide on a machine running both.
 
+### Filesystem tree and layer-panel UI revisions (2026-08-30)
+
+Four changes requested after using the shipped UI.
+
+1. **Size bars are scaled against the largest top-level entry, and the bar
+   moved into the Size column.** They were normalized per sibling group, which
+   re-stretched every directory to full width — a 3 KiB file inside a 4 MiB
+   folder drew the same bar as the folder. One denominator for the whole
+   visible tree makes "a child never out-draws its parent" arithmetic rather
+   than something to remember, since a subtree's bytes are always a subset of
+   its parent's. The denominator is the root page's `maxSiblingBytes`, which is
+   already exactly "the largest entry at this tree's top level", so no new API
+   surface was needed; the prop was renamed `maxSiblingBytes` → `scaleBytes`
+   because the old name had become a lie. A unit test pins the ordering
+   property. Merging the bar into the Size cell followed from the same
+   observation: two columns were spending width on one quantity. The bar is
+   absolutely positioned beneath the number rather than stacked with it — a
+   stacked layout lifted "13.3 MiB" about 7px above "+4.8 MiB" beside it, and
+   numbers that do not line up stop reading as a column.
+
+2. **Columns reordered to `Name | ± | Size | Δ size | Files | Δ files`**, so
+   each absolute is immediately followed by its own delta instead of the eye
+   having to pair them across two columns.
+
+3. **The count left the status column.** A directory read `± 66`, which was
+   taken for a size or a file count as often as a descendant tally. The glyph
+   alone still says "something below here changed", the Δ columns say how much,
+   and the tally survives in the cell's tooltip and the row's SR sentence.
+
+4. **The layer panel's selection chips are read-outs, not buttons.** They
+   scrolled the diagram to the selected card — an affordance nothing about them
+   advertised, on a diagram short enough that it was rarely wanted. They keep
+   the job they were actually doing: naming which layer each side is pinned to.
+   Their `cursor: pointer` and hover response went with the behavior, since
+   DESIGN §1 makes those the signals that something is clickable.
+
+5. **The chevron and the name are now two different verbs.** The chevron
+   expands in place; clicking a directory's name re-roots the view onto it.
+   Previously the name duplicated the chevron and a separate `↳` button did the
+   re-rooting — an affordance that had to be explained. Each shape now does the
+   thing its shape suggests: a triangle discloses, a name navigates.
+

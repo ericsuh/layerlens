@@ -14,7 +14,7 @@ import type { TreeFilter } from "../../lib/urlstate";
 export const ROW_HEIGHT = 32;
 
 /** The relative-size bar's track, in px (DESIGN §5.3). */
-export const BAR_TRACK_PX = 96;
+export const BAR_TRACK_PX = 104;
 
 /** Bars below this clamp up, so "small but non-zero" never renders as nothing. */
 export const BAR_MIN_PX = 2;
@@ -402,24 +402,27 @@ export interface BarModel {
 }
 
 /**
- * Width relative to the largest sibling, split into hatched change segments
- * (DESIGN §5.3, ARCHITECTURE §8.4 step 5).
+ * Width relative to `scaleBytes` — the largest entry at the top level of the
+ * visible tree — split into hatched change segments (DESIGN §5.3,
+ * ARCHITECTURE §8.4 step 5).
  *
- * The numerator matches the server's denominator exactly — `leftBytes +
- * rightBytes`, both sides — so a row can never exceed the track. A zero
- * denominator (a directory of empty files) yields no bar rather than a
- * division by zero.
+ * One denominator for the whole tree, not one per directory: a child's bytes
+ * are always a subset of its parent's, so a shared denominator guarantees a
+ * child's bar is never longer than its parent's. The numerator matches the
+ * server's own — `leftBytes + rightBytes`, both sides — so a top-level row can
+ * never exceed the track. A zero denominator (a tree of empty files) yields no
+ * bar rather than a division by zero.
  */
 export function sizeBarModel(
   agg: TreeAgg,
-  maxSiblingBytes: number,
+  scaleBytes: number,
   trackPx: number = BAR_TRACK_PX,
 ): BarModel {
   const total = agg.leftBytes + agg.rightBytes;
-  if (total <= 0 || maxSiblingBytes <= 0) {
+  if (total <= 0 || scaleBytes <= 0) {
     return { widthPx: 0, segments: [] };
   }
-  const raw = (total / maxSiblingBytes) * trackPx;
+  const raw = (total / scaleBytes) * trackPx;
   const widthPx = Math.min(trackPx, Math.max(BAR_MIN_PX, Math.round(raw)));
 
   const c = changeOf(agg);
