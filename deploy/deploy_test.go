@@ -229,6 +229,41 @@ func TestCrossCompiledArtifact(t *testing.T) {
 // If it can, systemd aborts the start, marks the unit failed, and
 // Restart=on-failure revives it moments later — which surfaces as a deploy that
 // reports failure while `systemctl status` shows the service active.
+// A deploy that fails must say why. `systemctl restart` failing used to kill the
+// remote script under `set -eu` before any diagnostic ran, so the operator got
+// one line from systemd and nothing else. Both failure paths — restart refused,
+// and never reaching `active` — must dump the effective unit, the status, and
+// the journal. `systemctl cat` earns its place by printing drop-ins: a leftover
+// <service>.service.d/ from an earlier or unrelated deployment survives
+// replacing the unit file and can inject directives this repo never wrote.
+func TestRestartStepDiagnosesBothFailurePaths(t *testing.T) {
+	t.Parallel()
+
+	out, code := runDeploy(t, []string{
+		"LAYERLENS_DEPLOY_HOST=example.invalid",
+		"LAYERLENS_DEPLOY_DRY_RUN=1",
+	})
+	require.Equal(t, 0, code, "dry run must succeed:\n%s", out)
+
+	_, after, found := strings.Cut(out, "[8/10]")
+	require.True(t, found, "plan has no restart step:\n%s", out)
+	step, _, found := strings.Cut(after, "[9/10]")
+	require.True(t, found, "restart step is not delimited:\n%s", out)
+
+	for _, want := range []string{
+		"systemctl cat layerlens",
+		"systemctl --no-pager --full status layerlens",
+		"journalctl --unit layerlens",
+	} {
+		assert.Containsf(t, step, want,
+			"the restart step must run %q so a failed deploy explains itself\nstep:\n%s", want, step)
+	}
+
+	// Once for the refused-restart branch, once for the never-active branch.
+	assert.Equal(t, 2, strings.Count(step, "systemctl cat layerlens"),
+		"both failure paths need the effective unit, not just one of them")
+}
+
 func TestReadinessProbeFitsInsideTheStartTimeout(t *testing.T) {
 	t.Parallel()
 

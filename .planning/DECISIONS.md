@@ -1481,3 +1481,35 @@ precisely "deploy said it failed, status says active". Adding
 and fails if the probe can outlast the start budget; it fails against the
 original unit.
 
+### A failed restart must diagnose itself (2026-08-30)
+
+A real deploy failed at step 8 with only systemd's one-line "Job for
+layerlens.service failed because the control process exited with error code."
+Under `set -eu` the remote script died on the `systemctl restart` line, so the
+status and journal dumps below it never ran — the operator got a bare failure
+for the one case that most needs evidence. Both failure paths (restart refused,
+and never reaching `active`) now print `systemctl cat`, `systemctl status`, and
+80 journal lines, asserted by `TestRestartStepDiagnosesBothFailurePaths` and
+exercised against a stubbed `systemctl`.
+
+`systemctl cat` is first deliberately: it prints the *effective* unit including
+drop-ins. A leftover `/etc/systemd/system/<service>.service.d/` from an earlier
+or unrelated deployment survives replacing the unit file and can inject
+directives this repo never wrote — which is the leading explanation for a
+"control process" failure against a unit whose only control process is the
+`-`-prefixed `ExecStartPost`, whose failure systemd is required to ignore.
+
+Context worth recording: the journal from that host showed a *different*
+layerlens — `2026/08/28 ... INFO layerlens: source=demo listening on
+http://[::]:8000`, stdlib `log` formatting rather than our `slog`, port 8000
+rather than 8080, and whole `.tar` files written into
+`/var/lib/layerlens/images`, which this implementation never does (it stores
+zstd-compressed JSONL indexes). So the deploy is landing on a host that already
+runs an unrelated service of the same name, sharing the unit name, the state
+directory, and the data directory. `LAYERLENS_DEPLOY_SERVICE` already exists to
+deploy under a different unit name.
+
+Checked and ruled out locally: the server starts cleanly against a data
+directory seeded with those foreign `.tar` files, serving `/healthz` as normal —
+so stale state in `/var/lib/layerlens/images` is not the cause.
+

@@ -326,7 +326,24 @@ step "Restart the service gracefully"
 # systemd >= 230, and this script already has one lesson about depending on a
 # host tool being newer than the one actually installed.
 remote "set -eu
-${SUDO_P}systemctl restart $(quote "$SERVICE")
+# \`restart\` failing is the one path that used to produce no diagnosis at all:
+# under \`set -eu\` the script died on this line and everything below it —
+# status, journal — never ran, so the deploy reported a bare failure. Catch it
+# and dump the same evidence the timeout path does.
+#
+# \`systemctl cat\` is first on purpose: it prints the *effective* unit,
+# drop-ins included. A leftover /etc/systemd/system/${SERVICE}.service.d/ from an
+# earlier or unrelated deployment survives replacing the unit file and can add
+# directives this repo never wrote — including control processes, which is what
+# \"the control process exited with error code\" points at when the unit here
+# has only one, and that one is \`-\`-prefixed and therefore ignorable.
+if ! ${SUDO_P}systemctl restart $(quote "$SERVICE"); then
+  echo \"restart failed; effective unit, status and recent log follow\" >&2
+  ${SUDO_P}systemctl cat $(quote "$SERVICE") || true
+  ${SUDO_P}systemctl --no-pager --full status $(quote "$SERVICE") || true
+  ${SUDO_P}journalctl --unit $(quote "$SERVICE") --no-pager --lines 80 || true
+  exit 1
+fi
 state=unknown
 for attempt in \$(seq 1 $(quote "$ACTIVE_RETRIES")); do
   state=\$(${SUDO_P}systemctl show -p ActiveState $(quote "$SERVICE") 2>/dev/null | cut -d= -f2)
@@ -335,6 +352,7 @@ for attempt in \$(seq 1 $(quote "$ACTIVE_RETRIES")); do
   sleep 1
 done
 echo \"${SERVICE} did not become active (last state: \$state)\" >&2
+${SUDO_P}systemctl cat $(quote "$SERVICE") || true
 ${SUDO_P}systemctl --no-pager --full status $(quote "$SERVICE") || true
 ${SUDO_P}journalctl --unit $(quote "$SERVICE") --no-pager --lines 50 || true
 exit 1"
