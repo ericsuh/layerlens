@@ -66,11 +66,20 @@ export function EdgeOverlay({
         <path className="ll-edge-b" d={forkPath(trunkLast, rightFirst)} data-testid="fork-b" />
       ) : null}
 
-      {branchSpinePaths(left).map((d) => (
-        <path className="ll-edge-spine-a" d={d} key={`spine-a-${d}`} />
+      {/*
+        Keyed by position, not by the path data. Spine segments are purely
+        positional geometry — one per gap between consecutive branch cards, in a
+        list that never reorders — while the `d` strings collide whenever two
+        segments are degenerate, which is every segment before the cards have
+        been measured (and permanently under jsdom, where every rect is zero).
+        That collision made React warn about duplicate keys and is licence for
+        it to drop or duplicate a node.
+      */}
+      {branchSpinePaths(left).map((d, i) => (
+        <path className="ll-edge-spine-a" d={d} key={`spine-a-${i}`} />
       ))}
-      {branchSpinePaths(right).map((d) => (
-        <path className="ll-edge-spine-b" d={d} key={`spine-b-${d}`} />
+      {branchSpinePaths(right).map((d, i) => (
+        <path className="ll-edge-spine-b" d={d} key={`spine-b-${i}`} />
       ))}
 
       {couldBeShared.map((edge) => (

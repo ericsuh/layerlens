@@ -221,11 +221,33 @@ type stringWriter struct{ b []byte }
 func (w *stringWriter) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
 func (w *stringWriter) String() string              { return string(w.b) }
 
+// shortSocketDir returns a directory whose path is short enough to hold a bound
+// unix socket. A socket address lives in sockaddr_un.sun_path, which is 104
+// bytes on macOS and 108 on Linux — and macOS hands out per-test temp dirs like
+// /var/folders/f7/w21qlq914rq45z5lxcfq7gkw0000gn/T/TestName1234567890/001,
+// which overruns that on its own and fails the bind with EINVAL. t.TempDir() is
+// still preferred where it fits, so this only changes behavior where it must.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	// 100 rather than the true limit: leave room for the filename and the NUL
+	// terminator without encoding a per-platform constant.
+	if len(dir)+len("/docker.sock") < 100 {
+		return dir
+	}
+
+	short, err := os.MkdirTemp("/tmp", "layerlens")
+	require.NoError(t, err, "no short path available for a unix socket")
+	t.Cleanup(func() { _ = os.RemoveAll(short) })
+	return short
+}
+
 // TestParseFlagsAutodetectsLocalSocket covers the ARCHITECTURE §1.3 fallback.
 func TestParseFlagsAutodetectsLocalSocket(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "")
 
-	sock := filepath.Join(t.TempDir(), "docker.sock")
+	sock := filepath.Join(shortSocketDir(t), "docker.sock")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ln.Close()) }()

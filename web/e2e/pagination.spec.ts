@@ -27,22 +27,34 @@ test.describe("wide directory", () => {
     await expect(showing).toHaveText("showing 200 of 2,500 entries");
 
     const scroller = page.getByTestId("tree-scroll");
+    const toTail = () =>
+      scroller.evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+      });
+
     // Scrolling to the tail brings state #28's trailing row into the list. It
     // is a button, and it is also what the watermark drives, so at any given
     // instant it reads either its resting label or its in-flight one.
-    await scroller.evaluate((element) => {
-      element.scrollTop = element.scrollHeight;
-    });
-    await expect(page.getByTestId("show-more")).toHaveText(/Show [\d,]+ more…|Loading more…/);
+    //
+    // Re-anchor to the tail on every attempt rather than asserting once against
+    // whatever the first scroll left behind: the trailer is virtualized, so it
+    // is mounted only while the tail is in view, and each page that lands grows
+    // the list *below* the current scrollTop and pushes it back out again.
+    // Asserting on a single instant made this test fail roughly one run in
+    // three with "element(s) not found".
+    await expect
+      .poll(async () => {
+        await toTail();
+        return page.getByTestId("show-more").textContent({ timeout: 1000 }).catch(() => "");
+      })
+      .toMatch(/Show [\d,]+ more…|Loading more…/);
 
     for (let step = 0; step < 120; step += 1) {
       const text = await showing.textContent();
       if (text === "showing 2,500 of 2,500 entries") {
         break;
       }
-      await scroller.evaluate((element) => {
-        element.scrollTop = element.scrollHeight;
-      });
+      await toTail();
       await page.waitForTimeout(120);
     }
     await expect(showing).toHaveText("showing 2,500 of 2,500 entries");

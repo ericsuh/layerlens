@@ -497,6 +497,15 @@ export function DiffTree({
   const entriesRef = useRef<VisibleEntry[]>(entries);
   entriesRef.current = entries;
 
+  // react-hooks/incompatible-library: the React Compiler cannot prove
+  // useVirtualizer's returned functions are safe to memoize, so it skips
+  // memoizing this component and says so. That is the accepted cost of the
+  // virtualizer chosen in DECISIONS §C3, and it is inert here: nothing from the
+  // virtualizer is handed to a memoized child — the rows below read it during
+  // render only — and the compiler is not enabled in this build regardless.
+  // Silenced deliberately so the warning does not become permanent noise that
+  // hides a real one later.
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: entries.length,
     getScrollElement: () => scrollRef.current,

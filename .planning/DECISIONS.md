@@ -1400,3 +1400,50 @@ Two things worth recording:
    it is asserted at the guard where it is deterministic, and both tests were
    confirmed to fail against the old condition before being kept.
 
+### macOS portability fixes (2026-08-30)
+
+Three failures reported from a real `mise run clean` + rebuild on macOS that a
+Linux run cannot produce. All were genuine; none were flakes. The lesson is that
+"green" here had only ever meant "green on linux/arm64", while `PROJECT.md` puts
+the e2e target on a Mac.
+
+1. **`TestParseFlagsAutodetectsLocalSocket` — `bind: invalid argument`.** A unix
+   socket address lives in `sockaddr_un.sun_path`, which is **104 bytes on macOS**
+   against 108 on Linux, and macOS hands out per-test temp directories like
+   `/var/folders/f7/w21qlq914rq45z5lxcfq7gkw0000gn/T/TestName1234567890/001` that
+   overrun it unaided. `t.TempDir()` is still preferred where it fits; a
+   `shortSocketDir` helper falls back to a short base only when it would not.
+   Reproduced on Linux by running the old test under a 209-character `TMPDIR`,
+   which yields the identical error, and confirmed fixed the same way.
+
+2. **`deploy.sh` — `EXTRA_OPTS[@]: unbound variable`, failing four deploy tests.**
+   Under `set -u`, **bash 3.2 treats an empty array's `[@]` expansion as
+   unbound** (relaxed in 4.4), and macOS still ships bash 3.2 as `/bin/bash`.
+   `LAYERLENS_DEPLOY_SSH_OPTS` is empty in the common case, so every deploy on a
+   Mac aborted before printing a plan. Fixed by *not creating the empty
+   expansion at all* — the options array is appended to only when the variable is
+   non-empty — rather than by the `${ARR[@]+"${ARR[@]}"}` guard. Deliberate: bash
+   5.3 does not reproduce the failure and `BASH_COMPAT=3.2` does not restore it,
+   so a workaround whose correctness depends on a version difference could not be
+   verified here, while the restructured form behaves identically on every bash
+   from 3.1 up.
+
+3. **Duplicate React keys `spine-a-M0 0 V0`.** `EdgeOverlay` keyed branch spine
+   paths by their `d` string, which collides whenever two segments are
+   degenerate — every segment before the cards are measured, and permanently
+   under jsdom where every rect is zero. Keyed by position instead: these are
+   positional geometry in a list that never reorders.
+
+Also silenced the standing `react-hooks/incompatible-library` warning on
+`useVirtualizer` with the rationale inline, so it stops being permanent noise
+that would hide a real warning later.
+
+Also de-raced `pagination.spec.ts`'s trailing-row assertion, which failed about
+one run in three with "element(s) not found" — pre-existing, and unrelated to the
+macOS fixes, but found while re-verifying them. The `show-more` trailer is
+virtualized, so it is mounted only while the tail is in view, and each page that
+lands grows the list *below* the current `scrollTop` and pushes it back out. The
+test asserted once against whatever instant the first scroll happened to leave
+behind; it now re-anchors to the tail on every polling attempt. Five consecutive
+green runs after the change.
+

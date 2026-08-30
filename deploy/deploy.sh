@@ -115,11 +115,22 @@ fi
 SUDO_P=""
 [ -n "$SUDO" ] && SUDO_P="$SUDO "
 
-# Word-split on purpose: these are option lists, not single arguments.
-# shellcheck disable=SC2206
-EXTRA_OPTS=(${LAYERLENS_DEPLOY_SSH_OPTS:-})
-SSH=(ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=10 "${EXTRA_OPTS[@]}" "${USER_NAME}@${HOST}")
-SCP=(scp -P "$PORT" -o BatchMode=yes -o ConnectTimeout=10 "${EXTRA_OPTS[@]}")
+# Under `set -u`, bash 3.2 aborts on an *empty* array's [@] expansion — and
+# macOS still ships bash 3.2 as /bin/bash, where LAYERLENS_DEPLOY_SSH_OPTS is
+# empty in the common case. So the empty expansion is avoided outright rather
+# than worked around with ${ARR[@]+"${ARR[@]}"}: appending only when there is
+# something to append behaves identically on every bash from 3.1 up, and does
+# not depend on a version difference a Linux CI run cannot exercise.
+SSH=(ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=10)
+SCP=(scp -P "$PORT" -o BatchMode=yes -o ConnectTimeout=10)
+if [ -n "${LAYERLENS_DEPLOY_SSH_OPTS:-}" ]; then
+	# Word-split on purpose: this is an option list, not a single argument.
+	# shellcheck disable=SC2206
+	SSH+=(${LAYERLENS_DEPLOY_SSH_OPTS})
+	# shellcheck disable=SC2206
+	SCP+=(${LAYERLENS_DEPLOY_SSH_OPTS})
+fi
+SSH+=("${USER_NAME}@${HOST}")
 
 # One stamp for the whole run, so the staging paths of a single deploy are
 # recognizable as a set in `ls` on the remote host and cannot collide with a
