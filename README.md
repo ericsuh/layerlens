@@ -55,7 +55,11 @@ code, and the reserved `/api` namespace never falls through to the SPA shell.
 | `GET /api/v1/images/{id}` | One image plus its layers (DiffID, ChainID, instruction, size) |
 | `GET /api/v1/diff/layers?left=&right=` | The layer graph: shared trunk, both branches, could-be-shared edges |
 | `GET /api/v1/diff/tree?left=&right=&leftLayers=&rightLayers=&path=` | One directory of the unified diff tree, server-aggregated and paginated |
-| `GET /api/v1/meta` | Version and cache usage against `--cache-max-bytes` |
+| `GET /api/v1/meta` | Version, the registry allowlist, and cache usage against `--cache-max-bytes` |
+| `GET /api/v1/docker/images` | Local daemon images; `available:false` with a reason when there is no socket — never an error |
+| `POST /api/v1/pulls` | Start (or join) an analysis of a registry or daemon image: `{"source":"registry"\|"docker","reference":"…"}` |
+| `GET /api/v1/pulls` · `GET /api/v1/pulls/{id}` | Pull status with byte-accurate progress |
+| `DELETE /api/v1/pulls/{id}` | Cancel a pull; committed layer indexes are kept, so a retry resumes |
 
 `id` is always the image's config digest (`sha256:…`), which is what `left`,
 `right` and the `/images/{id}` path all take. `leftLayers`/`rightLayers` are
@@ -93,6 +97,66 @@ curl -s "localhost:8080/api/v1/diff/tree?left=$L&right=$R&leftLayers=6&rightLaye
 ```
 
 `cmd/layerlens/e2e_test.go` runs exactly this sequence against a real listener.
+
+## Remote sources and the trust boundary
+
+layerlens analyzes images from three places: the vendored fixtures, the local
+Docker daemon, and a public registry. The registry path is where user input
+reaches the network, so it has two independent controls.
+
+**The allowlist** decides which registry a user may *name*. It is matched on
+whole dot-separated labels, so `*.gcr.io` accepts `us.gcr.io` and rejects
+`evilgcr.io`; `*.azurecr.io` rejects `x.azurecr.io.evil.com`. Explicit ports
+and anything that would be fetched over plain http are refused. The check runs
+synchronously in `POST /api/v1/pulls`, before a socket is opened, and the list
+is served at `/api/v1/meta` so the UI never carries a second, drifting copy:
+
+    docker.io · index.docker.io · registry-1.docker.io · ghcr.io
+    gcr.io · *.gcr.io · *.pkg.dev · public.ecr.aws
+    *.dkr.ecr.*.amazonaws.com · *.azurecr.io
+
+**The guarded dialer** decides which address the process may *connect to*, on
+every socket it opens. An allowlist cannot cover this on its own: a blob GET
+legitimately redirects to a CDN whose hostname nobody can enumerate. So every
+connection — the token endpoint, the manifest, each blob, and each redirect hop
+— resolves once, refuses the host outright if *any* answer is loopback,
+private, link-local, multicast, unspecified, unique-local, IPv4-mapped or a
+v4-embedding v6 form, and then dials the vetted literal address, so there is no
+window for DNS rebinding between the check and the connection. Plaintext cannot
+be dialed at all, which is what makes an https→http downgrade impossible even
+through somebody else's redirect handling. Manifests, indexes, configs and
+token responses are size-capped, and the layer count is capped, so a
+compromised-but-allowlisted upstream cannot exhaust memory.
+
+**Pulls are anonymous, always.** No `~/.docker/config.json`, no credential
+helpers, no cloud SDK auth chain — nothing on this machine can be used to reach
+an image the public cannot. A private repository therefore answers with one
+deliberately indistinguishable outcome for 401, 403 and 404 ("not found, or it
+requires authentication"), because an anonymous puller that distinguished them
+would be a probe for the existence of private repositories.
+
+**Known limitation (RESEARCH Q4):** Docker Hub and GHCR are verified end to end
+against the live services. GCR, Artifact Registry, ACR and ECR Public are on
+the allowlist and go through the identical code path, but are **not**
+live-verified — treat them as expected-to-work, not guaranteed. (ECR *private*
+has no anonymous access at all and cannot work by design.) The opt-in suites
+that hit the real world are off by default so `mise run test` stays hermetic:
+
+    LAYERLENS_NETWORK_TESTS=1 go test ./internal/ingest/ -run TestLive
+    LAYERLENS_DOCKER_TESTS=1  go test ./internal/ingest/ -run TestLiveDocker
+    E2E_NETWORK=1 mise run e2e     # the Playwright network smoke test
+    E2E_DOCKER=1  mise run e2e     # the Playwright docker smoke test
+
+**The Docker daemon path** reads one `docker save` stream, once, for the
+explicit `linux/amd64` platform, and indexes it as it arrives — no spool file,
+and nothing held in memory but the stream's metadata members (the manifests and
+the config, bounded at 64 MiB), which is what makes a 25 GiB local image viable
+on a server whose disk budget is the analysis cache. When the local image carries a
+digest for an allowlisted registry, the registry path is preferred instead: the
+bytes are identical, and that route can skip layers already indexed rather than
+draining them out of a sequential stream. A server with no socket reports the
+daemon source as unavailable; nothing errors. `--docker-host off` turns the
+source off explicitly on a host that does have one.
 
 ## Analysis cache
 

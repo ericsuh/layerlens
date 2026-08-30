@@ -604,6 +604,151 @@
     }
   }
 
+  /* A row that is data plus one explicit action, not a click target: no
+     hover response and no pointer cursor, so it cannot be mistaken for the
+     selectable rows above it (DESIGN §1.2). */
+  .ll-src-row-static {
+    cursor: default;
+  }
+
+  .ll-src-row-static:hover {
+    background: transparent;
+  }
+
+  /* ---------- pull progress (DESIGN §4.4) ---------- */
+  .ll-pull {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-panel);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-panel);
+    padding: 12px 14px;
+  }
+
+  .ll-pull[data-state="error"] {
+    border-color: var(--color-removed);
+  }
+
+  .ll-pull[data-state="done"] {
+    border-color: var(--color-added);
+  }
+
+  .ll-pull-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .ll-pull-numbers {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 0;
+    font-size: 12px;
+    color: var(--color-text-muted);
+  }
+
+  /* The three phases as a step list: the current one is the only one at full
+     weight, so "where am I" is answerable at a glance. */
+  .ll-steps {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 12.5px;
+    color: var(--color-text-muted);
+  }
+
+  .ll-step {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .ll-step[data-state="active"] {
+    color: var(--color-text);
+    font-weight: 600;
+  }
+
+  .ll-step-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: var(--radius-badge);
+    border: 1px solid var(--color-border-strong);
+    flex: none;
+  }
+
+  .ll-step[data-state="done"] .ll-step-dot {
+    background: var(--color-added);
+    border-color: var(--color-added);
+  }
+
+  .ll-step[data-state="active"] .ll-step-dot {
+    background: var(--color-focus-ring);
+    border-color: var(--color-focus-ring);
+    animation: ll-step-pulse 1.6s ease infinite;
+  }
+
+  @keyframes ll-step-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.45;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ll-step[data-state="active"] .ll-step-dot {
+      animation: none;
+    }
+  }
+
+  /* The determinate bar. Distinct from .ll-progress, which is the 2px
+     indeterminate strip pinned to the top of a panel. */
+  .ll-pbar {
+    height: 8px;
+    border-radius: var(--radius-control);
+    background: var(--color-surface-2);
+    overflow: hidden;
+  }
+
+  .ll-pbar > i {
+    display: block;
+    height: 100%;
+    background: var(--color-focus-ring);
+    transition: width 0.3s ease;
+  }
+
+  /* No total yet: a filled bar would claim a completeness nothing knows. */
+  .ll-pbar > i.ll-pbar-unknown {
+    opacity: 0.25;
+  }
+
+  .ll-pbar-indeterminate > i {
+    width: 35%;
+    animation: ll-indeterminate 1.1s ease-in-out infinite;
+    transition: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ll-pbar > i {
+      transition: none;
+    }
+    .ll-pbar-indeterminate > i {
+      animation: none;
+      width: 100%;
+      opacity: 0.5;
+    }
+  }
+
   /* ---------- layer cards (DESIGN §5.2) ---------- */
   .ll-lcard {
     position: relative;

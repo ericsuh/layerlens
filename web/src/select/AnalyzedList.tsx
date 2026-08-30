@@ -128,9 +128,16 @@ export function AnalyzedRow({
   );
 }
 
-export function AnalyzedListSkeleton() {
+/** Four skeleton rows (DESIGN §9 #2), shared by every source list that loads. */
+export function AnalyzedListSkeleton({
+  label = "Loading analyzed images",
+  testId = "analyzed-skeleton",
+}: {
+  label?: string;
+  testId?: string;
+} = {}) {
   return (
-    <div data-testid="analyzed-skeleton" aria-busy="true" aria-label="Loading analyzed images">
+    <div data-testid={testId} aria-busy="true" aria-label={label}>
       {[0, 1, 2, 3].map((i) => (
         <div key={i} className="border-border flex items-center gap-3 border-b px-4 py-3.5">
           <div className="ll-skeleton h-3.5 w-2/5" />

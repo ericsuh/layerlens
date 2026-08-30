@@ -5,6 +5,8 @@ import {
   formatBytes,
   formatCompactCount,
   formatRelativeTime,
+  formatSoftEta,
+  formatThroughput,
   shortDigest,
   shortHex,
 } from "./format";
@@ -147,5 +149,33 @@ describe("formatRelativeTime", () => {
 
   it("does not invent a time for an unparseable stamp", () => {
     expect(formatRelativeTime("not-a-date", now)).toBe("unknown");
+  });
+});
+
+describe("formatThroughput", () => {
+  it("renders a rate in the same binary units as every other size", () => {
+    expect(formatThroughput(40_054_784)).toBe("38.2 MiB/s");
+    expect(formatThroughput(0)).toBe("0 B/s");
+  });
+
+  it("refuses to render a nonsense rate", () => {
+    expect(formatThroughput(Number.NaN)).toBe("—");
+    expect(formatThroughput(-1)).toBe("—");
+  });
+});
+
+describe("formatSoftEta", () => {
+  it.each([
+    [12, "less than a minute left"],
+    [59, "less than a minute left"],
+    [245, "about 4 min left"],
+    [3600, "about 1 hr left"],
+    [9000, "about 3 hr left"],
+  ])("phrases %d seconds softly", (seconds, expected) => {
+    expect(formatSoftEta(seconds)).toBe(expected);
+  });
+
+  it("says nothing rather than guessing from a nonsense number", () => {
+    expect(formatSoftEta(Number.POSITIVE_INFINITY)).toBe("");
   });
 });

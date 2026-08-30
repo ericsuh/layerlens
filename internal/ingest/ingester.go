@@ -15,6 +15,8 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,6 +44,14 @@ const PlatformString = PlatformOS + "/" + PlatformArch
 // the DiffID at position i would not describe the blob at position i.
 var ErrLayerCountMismatch = errors.New("ingest: manifest layers and config diff_ids disagree")
 
+// MaxLayers caps how many layers one image may have (ARCHITECTURE §7.2). Real
+// images run to a few dozen; the cap exists so a hostile-but-allowlisted
+// registry cannot turn one manifest into unbounded work.
+const MaxLayers = 512
+
+// ErrTooManyLayers reports an image past MaxLayers.
+var ErrTooManyLayers = errors.New("ingest: image has too many layers")
+
 // Meta is the provenance an image cannot tell us about itself.
 type Meta struct {
 	// RefNames are the display references, e.g. ["example:v1"].
@@ -52,6 +62,17 @@ type Meta struct {
 	Pinned bool
 	// ManifestDigest is the platform manifest digest, when known.
 	ManifestDigest domain.Digest
+	// Progress, when non-nil, receives byte-accurate progress for this
+	// ingest. It is the pull manager's window into a 25 GiB stream.
+	Progress Reporter
+}
+
+// reporter returns the meta's reporter, or a discarding one.
+func (m Meta) reporter() Reporter {
+	if m.Progress == nil {
+		return &NopReporter{}
+	}
+	return m.Progress
 }
 
 // Ingester runs the analysis pipeline against a cache store.
@@ -99,6 +120,8 @@ type Result struct {
 // layer granularity (§4.1). The image record is written last, which is what
 // makes a visible record imply all of its layers are present (§5).
 func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result, error) {
+	progress := meta.reporter()
+	progress.Phase(PhaseResolving)
 	cfgName, err := img.ConfigName()
 	if err != nil {
 		return nil, fmt.Errorf("ingest: read config digest: %w", err)
@@ -126,6 +149,13 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 		if err != nil {
 			return nil, fmt.Errorf("ingest: upgrade provenance of %s: %w", id, err)
 		}
+		// Reported as a complete pull rather than as no pull at all: the
+		// UI is showing a progress card, and "every layer was already
+		// analyzed" is the honest reading of what just happened.
+		progress.Totals(0, len(upgraded.Layers), false)
+		for n := range upgraded.Layers {
+			progress.LayerFinished(n, true, 0)
+		}
 		return &Result{Record: upgraded, AlreadyPresent: true, LayersSkipped: len(upgraded.Layers)}, nil
 	} else if !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
@@ -147,6 +177,19 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 		return nil, fmt.Errorf("%w: %d diff_ids, %d manifest layers, %d blobs",
 			ErrLayerCountMismatch, len(cfg.RootFS.DiffIDs), len(manifest.Layers), len(blobs))
 	}
+	if len(blobs) > MaxLayers {
+		return nil, fmt.Errorf("%w: %d layers", ErrTooManyLayers, len(blobs))
+	}
+
+	// The denominator comes from the manifest, which is why registry
+	// progress is exact rather than a guess (§6.3): every layer's
+	// compressed size is declared before a single byte is fetched.
+	var bytesTotal int64
+	for _, l := range manifest.Layers {
+		bytesTotal += l.Size
+	}
+	progress.Totals(bytesTotal, len(blobs), false)
+	progress.Phase(PhaseDownloading)
 
 	txn, err := i.store.Begin()
 	if err != nil {
@@ -163,7 +206,6 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 
 	res := &Result{}
 	layers := make([]domain.Layer, 0, len(blobs))
-	diffIDs := make([]domain.Digest, 0, len(blobs))
 	var totalBytes int64
 
 	for n, blob := range blobs {
@@ -174,7 +216,8 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 		if err != nil {
 			return nil, fmt.Errorf("ingest: layer %d diff_id: %w", n, err)
 		}
-		summary, skipped, err := i.indexOne(ctx, txn, blob, diffID, n)
+		progress.LayerStarted(n, diffID, manifest.Layers[n].Size)
+		summary, skipped, err := i.indexOne(ctx, txn, blob, diffID, n, progress)
 		if err != nil {
 			return nil, err
 		}
@@ -183,6 +226,7 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 		} else {
 			res.LayersIndexed++
 		}
+		progress.LayerFinished(n, skipped, manifest.Layers[n].Size)
 
 		compressedDigest, _ := domain.ParseDigest(manifest.Layers[n].Digest.String())
 		layers = append(layers, domain.Layer{
@@ -194,10 +238,90 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 			EntryCount:       summary.EntryCount,
 			ChangesetDigest:  summary.ChangesetDigest,
 		})
-		diffIDs = append(diffIDs, diffID)
 		totalBytes += summary.ContentBytes
 	}
 
+	progress.Phase(PhaseFinalizing)
+	rec, err := i.buildRecord(id, cfg, layers, totalBytes, meta)
+	if err != nil {
+		return nil, err
+	}
+	if err := txn.Commit(rec); err != nil {
+		return nil, err
+	}
+	committed = true
+
+	stored, err := i.store.Image(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	res.Record = stored
+	return res, nil
+}
+
+// indexOne stores the changeset for one layer, streaming the blob only if the
+// DiffID is not already indexed.
+//
+// The skip is the reason two images that share a base cost one pass, not two:
+// layer indexes are content-addressed by DiffID and shared across every image
+// that uses them.
+func (i *Ingester) indexOne(ctx context.Context, txn *cachestore.Txn, blob v1.Layer,
+	diffID domain.Digest, n int, progress Reporter,
+) (cachestore.LayerSummary, bool, error) {
+	if summary, ok := txn.UseLayer(diffID); ok {
+		return summary, true, nil
+	}
+
+	mediaType, err := blob.MediaType()
+	if err != nil {
+		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: layer %d media type: %w", n, err)
+	}
+	rc, err := blob.Compressed()
+	if err != nil {
+		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: open layer %d: %w", n, err)
+	}
+	idx, indexErr := analyze.IndexLayer(ctx, analyze.LayerSource{
+		Reader:    rc,
+		MediaType: string(mediaType),
+		// Passing the declared DiffID is what makes a tampered or
+		// truncated blob fail the ingest instead of being cached as if
+		// it were the layer it claims to be.
+		DiffID: diffID,
+		// The same counter for every layer, so it reads as bytes-done
+		// for the whole pull rather than for this layer alone.
+		Progress: progress.Bytes(),
+	})
+	closeErr := rc.Close()
+	if indexErr != nil {
+		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: index layer %d (%s): %w", n, diffID, indexErr)
+	}
+	if closeErr != nil {
+		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: close layer %d: %w", n, closeErr)
+	}
+	if err := txn.PutLayer(idx); err != nil {
+		return cachestore.LayerSummary{}, false, err
+	}
+	summary, ok := txn.UseLayer(diffID)
+	if !ok {
+		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: layer %s vanished after commit", diffID)
+	}
+	return summary, false, nil
+}
+
+// buildRecord assembles the image record: the derived chain IDs, the history
+// mapping, and the provenance the image cannot tell us about itself.
+//
+// Shared by every source. The registry and layout paths walk a v1.Image's
+// layers in order; the docker-save path reconstructs the same list from a
+// stream that arrived out of order. Both end here, so an image record means
+// exactly the same thing whichever door it came through.
+func (i *Ingester) buildRecord(id domain.Digest, cfg *v1.ConfigFile, layers []domain.Layer,
+	totalBytes int64, meta Meta,
+) (*domain.ImageRecord, error) {
+	diffIDs := make([]domain.Digest, len(layers))
+	for n := range layers {
+		diffIDs[n] = layers[n].DiffID
+	}
 	chains, err := analyze.ChainIDs(diffIDs)
 	if err != nil {
 		return nil, fmt.Errorf("ingest: chain ids: %w", err)
@@ -223,64 +347,15 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 	} else {
 		rec.CreatedAt = cfg.Created.UTC()
 	}
-
-	if err := txn.Commit(rec); err != nil {
-		return nil, err
-	}
-	committed = true
-
-	stored, err := i.store.Image(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	res.Record = stored
-	return res, nil
+	return rec, nil
 }
 
-// indexOne stores the changeset for one layer, streaming the blob only if the
-// DiffID is not already indexed.
-//
-// The skip is the reason two images that share a base cost one pass, not two:
-// layer indexes are content-addressed by DiffID and shared across every image
-// that uses them.
-func (i *Ingester) indexOne(ctx context.Context, txn *cachestore.Txn, blob v1.Layer,
-	diffID domain.Digest, n int,
-) (cachestore.LayerSummary, bool, error) {
-	if summary, ok := txn.UseLayer(diffID); ok {
-		return summary, true, nil
-	}
-
-	mediaType, err := blob.MediaType()
-	if err != nil {
-		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: layer %d media type: %w", n, err)
-	}
-	rc, err := blob.Compressed()
-	if err != nil {
-		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: open layer %d: %w", n, err)
-	}
-	idx, indexErr := analyze.IndexLayer(ctx, analyze.LayerSource{
-		Reader:    rc,
-		MediaType: string(mediaType),
-		// Passing the declared DiffID is what makes a tampered or
-		// truncated blob fail the ingest instead of being cached as if
-		// it were the layer it claims to be.
-		DiffID: diffID,
-	})
-	closeErr := rc.Close()
-	if indexErr != nil {
-		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: index layer %d (%s): %w", n, diffID, indexErr)
-	}
-	if closeErr != nil {
-		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: close layer %d: %w", n, closeErr)
-	}
-	if err := txn.PutLayer(idx); err != nil {
-		return cachestore.LayerSummary{}, false, err
-	}
-	summary, ok := txn.UseLayer(diffID)
-	if !ok {
-		return cachestore.LayerSummary{}, false, fmt.Errorf("ingest: layer %s vanished after commit", diffID)
-	}
-	return summary, false, nil
+// configDigest is the image ID: the digest of the config blob exactly as it
+// was serialized. It is computed over the raw bytes rather than over a
+// re-encoding, because a re-encoding is a different image ID.
+func configDigest(raw []byte) (domain.Digest, error) {
+	sum := sha256.Sum256(raw)
+	return domain.ParseDigest("sha256:" + hex.EncodeToString(sum[:]))
 }
 
 // historyOf projects an OCI config's history onto the domain mirror that

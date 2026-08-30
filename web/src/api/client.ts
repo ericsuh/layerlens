@@ -1,4 +1,14 @@
-import type { ApiErrorBody, ImagesResponse, LayerGraph, Meta, TreePage } from "./types";
+import type {
+  ApiErrorBody,
+  DockerListing,
+  ImagesResponse,
+  LayerGraph,
+  Meta,
+  PullList,
+  PullStatus,
+  StartPullRequest,
+  TreePage,
+} from "./types";
 
 /**
  * A non-2xx response, parsed out of the §6.1 envelope.
@@ -38,11 +48,26 @@ function isErrorBody(value: unknown): value is ApiErrorBody {
 /** Base URL of the API. Same origin always — the SPA is served by the server. */
 const BASE = "/api/v1";
 
-async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
+/**
+ * The one request path. `body` is the only reason a method other than GET
+ * exists here: `POST /pulls` and `DELETE /pulls/{id}` answer with the same
+ * §6.1 envelope as every read, so they share the error handling rather than
+ * growing a second, subtly different one.
+ */
+async function request<T>(
+  path: string,
+  options: { signal?: AbortSignal; method?: "GET" | "POST" | "DELETE"; body?: unknown } = {},
+): Promise<T> {
+  const { signal, method = "GET", body } = options;
   let response: Response;
   try {
     response = await fetch(`${BASE}${path}`, {
-      headers: { accept: "application/json" },
+      method,
+      headers: {
+        accept: "application/json",
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       ...(signal ? { signal } : {}),
     });
   } catch (cause) {
@@ -79,7 +104,38 @@ async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 export function fetchImages(signal?: AbortSignal): Promise<ImagesResponse> {
-  return request<ImagesResponse>("/images", signal);
+  return request<ImagesResponse>("/images", { ...(signal ? { signal } : {}) });
+}
+
+export function fetchDockerImages(signal?: AbortSignal): Promise<DockerListing> {
+  return request<DockerListing>("/docker/images", { ...(signal ? { signal } : {}) });
+}
+
+/**
+ * §6.3 — idempotent by contract: an identical request that is already in
+ * flight, or an image the cache already holds, answers 200 with the existing
+ * status (possibly already `done`) instead of starting a second pull. The
+ * caller therefore never needs to guard against a double submit.
+ */
+export function startPull(body: StartPullRequest, signal?: AbortSignal): Promise<PullStatus> {
+  return request<PullStatus>("/pulls", { method: "POST", body, ...(signal ? { signal } : {}) });
+}
+
+export function fetchPulls(signal?: AbortSignal): Promise<PullList> {
+  return request<PullList>("/pulls", { ...(signal ? { signal } : {}) });
+}
+
+export function fetchPull(id: string, signal?: AbortSignal): Promise<PullStatus> {
+  return request<PullStatus>(`/pulls/${encodeURIComponent(id)}`, {
+    ...(signal ? { signal } : {}),
+  });
+}
+
+export function cancelPull(id: string, signal?: AbortSignal): Promise<PullStatus> {
+  return request<PullStatus>(`/pulls/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    ...(signal ? { signal } : {}),
+  });
 }
 
 export function fetchLayerGraph(
@@ -88,11 +144,11 @@ export function fetchLayerGraph(
   signal?: AbortSignal,
 ): Promise<LayerGraph> {
   const params = new URLSearchParams({ left, right });
-  return request<LayerGraph>(`/diff/layers?${params.toString()}`, signal);
+  return request<LayerGraph>(`/diff/layers?${params.toString()}`, { ...(signal ? { signal } : {}) });
 }
 
 export function fetchMeta(signal?: AbortSignal): Promise<Meta> {
-  return request<Meta>("/meta", signal);
+  return request<Meta>("/meta", { ...(signal ? { signal } : {}) });
 }
 
 /** The `/diff/tree` query (§6.5), one directory's page of children. */
@@ -134,5 +190,5 @@ export function fetchTreePage(query: TreeQuery, signal?: AbortSignal): Promise<T
   if (query.cursor !== undefined && query.cursor !== "") {
     params.set("cursor", query.cursor);
   }
-  return request<TreePage>(`/diff/tree?${params.toString()}`, signal);
+  return request<TreePage>(`/diff/tree?${params.toString()}`, { ...(signal ? { signal } : {}) });
 }

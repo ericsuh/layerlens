@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import type { ReactNode } from "react";
 
 export type SourceTabId = "analyzed" | "docker" | "registry";
@@ -5,40 +6,64 @@ export type SourceTabId = "analyzed" | "docker" | "registry";
 interface TabDef {
   id: SourceTabId;
   label: string;
-  /** Disabled tabs render at full size so adding their panels shifts nothing. */
-  enabled: boolean;
-  note: string;
 }
 
 /**
  * The source segmented control (DESIGN §4.3).
  *
- * All three tabs are laid out now, at their final size, and the two whose
- * sources are not implemented yet are genuinely `disabled` with a "soon" chip
- * — not clickable buttons that lead nowhere. Rendering them now is what keeps
- * the control from resizing when their panels land.
+ * All three sources are live. The strip's geometry is fixed by the three
+ * labels — the chips are the only variable part, and the panel below keeps its
+ * 320px floor — so switching tabs never moves anything.
  */
-const TABS: TabDef[] = [
-  { id: "analyzed", label: "Analyzed", enabled: true, note: "" },
-  { id: "docker", label: "Docker daemon", enabled: false, note: "not available yet" },
-  { id: "registry", label: "Registry", enabled: false, note: "not available yet" },
+const TABS: readonly TabDef[] = [
+  { id: "analyzed", label: "Analyzed" },
+  { id: "docker", label: "Docker daemon" },
+  { id: "registry", label: "Registry" },
 ];
 
 export function SourceTabs({
   active,
   onChange,
   analyzedCount,
+  dockerAvailable,
   children,
 }: {
   active: SourceTabId;
   onChange: (id: SourceTabId) => void;
   analyzedCount: number | null;
+  /** null while the daemon listing is still in flight — neither dot state yet. */
+  dockerAvailable: boolean | null;
   children: ReactNode;
 }) {
+  const strip = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * A tablist is one tab stop: Tab reaches the selected tab and the arrow keys
+   * move between them (WAI-ARIA), which is why every other tab carries
+   * `tabIndex={-1}`. Without this handler those tabs would be unreachable by
+   * keyboard altogether.
+   */
+  const moveFocus = (event: React.KeyboardEvent, index: number) => {
+    const destination: Record<string, number | undefined> = {
+      ArrowRight: (index + 1) % TABS.length,
+      ArrowLeft: (index - 1 + TABS.length) % TABS.length,
+      Home: 0,
+      End: TABS.length - 1,
+    };
+    const next = destination[event.key];
+    const target = next === undefined ? undefined : TABS[next];
+    if (target === undefined) {
+      return;
+    }
+    event.preventDefault();
+    onChange(target.id);
+    strip.current?.querySelector<HTMLButtonElement>(`#source-tab-${target.id}`)?.focus();
+  };
+
   return (
     <div>
-      <div className="ll-tabs mb-4" role="tablist" aria-label="Image sources">
-        {TABS.map((tab) => (
+      <div className="ll-tabs mb-4" role="tablist" aria-label="Image sources" ref={strip}>
+        {TABS.map((tab, index) => (
           <button
             key={tab.id}
             type="button"
@@ -46,21 +71,29 @@ export function SourceTabs({
             id={`source-tab-${tab.id}`}
             aria-selected={active === tab.id}
             aria-controls={`source-panel-${tab.id}`}
-            aria-disabled={tab.enabled ? undefined : true}
-            disabled={!tab.enabled}
             tabIndex={active === tab.id ? 0 : -1}
-            title={tab.enabled ? undefined : `${tab.label} — ${tab.note}`}
             className="ll-tab"
             onClick={() => {
               onChange(tab.id);
             }}
+            onKeyDown={(event) => {
+              moveFocus(event, index);
+            }}
           >
-            {tab.id === "docker" ? <span className="ll-dot" aria-hidden="true" /> : null}
+            {tab.id === "docker" ? (
+              <span
+                className={`ll-dot ${dockerAvailable === true ? "ll-dot-ok" : ""}`.trim()}
+                aria-hidden="true"
+              />
+            ) : null}
             <span>{tab.label}</span>
             {tab.id === "analyzed" && analyzedCount !== null ? (
               <span className="ll-count-chip ll-num">{analyzedCount}</span>
             ) : null}
-            {tab.enabled ? null : <span className="ll-count-chip">soon</span>}
+            {/* Never the dot alone: the status is also a word (DESIGN §7). */}
+            {tab.id === "docker" && dockerAvailable === false ? (
+              <span className="ll-count-chip">unavailable</span>
+            ) : null}
           </button>
         ))}
       </div>

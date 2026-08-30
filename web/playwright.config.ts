@@ -33,7 +33,10 @@ export default defineConfig({
       // The viewport goes *after* the device spread: `Desktop Chrome` carries
       // its own 1280×720, which would silently override the DESIGN §8 target
       // this phase's screenshots were reviewed at.
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } },
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1440, height: 900 },
+      },
     },
   ],
   webServer: {
@@ -44,7 +47,14 @@ export default defineConfig({
     cwd: "..",
     // `.e2e-data` is wiped first so an LRU or a half-written cache entry from a
     // previous run can never make a test flake (or pass).
-    command: `rm -rf .e2e-data && ./bin/layerlens --listen 127.0.0.1:${String(PORT)} --data-dir .e2e-data --fixtures-dir fixtures`,
+    // `--docker-host off` unless the opt-in Docker smoke asked for a daemon:
+    // the default suite must look the same on a laptop that happens to run
+    // Docker as on one that does not, and the daemon tab's state is otherwise
+    // whatever images the developer has lying around.
+    command:
+      `rm -rf .e2e-data && ./bin/layerlens --listen 127.0.0.1:${String(PORT)} ` +
+      `--data-dir .e2e-data --fixtures-dir fixtures ` +
+      `--docker-host ${process.env.E2E_DOCKER === "1" ? '""' : "off"}`,
     url: `http://127.0.0.1:${String(PORT)}/healthz`,
     reuseExistingServer: false,
     stdout: "ignore",

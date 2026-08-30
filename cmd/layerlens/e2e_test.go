@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ericsuh/layerlens/internal/domain"
+	"github.com/ericsuh/layerlens/internal/imgref"
 	"github.com/ericsuh/layerlens/internal/server"
 )
 
@@ -259,6 +262,93 @@ func TestSecondProcessOnTheSameDataDirFails(t *testing.T) {
 	err := run(t.Context(), second, discardLogger(), nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "locked by another layerlens process")
+
+	stop()
+	waitForRun(t, errCh)
+}
+
+// postAPI issues a JSON POST against the running binary.
+func postAPI(t *testing.T, base, path string, payload any) (int, []byte) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	resp, err := http.Post(base+path, "application/json", bytes.NewReader(raw)) //nolint:noctx // short-lived test request
+	require.NoError(t, err)
+	defer func() { require.NoError(t, resp.Body.Close()) }()
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, got
+}
+
+// TestRemoteSourcesAgainstTheRealBinary checks the parts of phase 008 that are
+// only true of the wired-up process: that the allowlist the UI is told about is
+// the one the server enforces, that a refused registry is refused before any
+// socket is opened, and that a server with no Docker reports that as data
+// rather than as a failure.
+//
+// It deliberately makes no network request: every case here is decided before
+// layerlens would open a connection.
+func TestRemoteSourcesAgainstTheRealBinary(t *testing.T) {
+	cfg := fixturesConfig(t, t.TempDir())
+	// Explicitly no daemon, whatever the machine running the tests has.
+	cfg.dockerHost = ""
+	base, stop, errCh := startRun(t, cfg)
+	waitReady(t, base)
+
+	var meta server.MetaResponse
+	getAPI(t, base, server.APIPrefix+"/meta", &meta)
+	assert.Equal(t, imgref.DefaultPatterns, meta.AllowedRegistries,
+		"the UI must be told the same list the server enforces")
+
+	t.Run("a registry that is not allowlisted is refused", func(t *testing.T) {
+		status, raw := postAPI(t, base, server.APIPrefix+"/pulls",
+			map[string]string{"source": "registry", "reference": "evil.example.com/x"})
+		require.Equal(t, http.StatusForbidden, status, string(raw))
+		var envelope server.APIError
+		require.NoError(t, json.Unmarshal(raw, &envelope))
+		assert.Equal(t, server.CodeRegistryNotAllowed, envelope.Error.Code)
+		assert.Contains(t, envelope.Error.Message, "evil.example.com")
+	})
+
+	t.Run("the label-boundary attacks are refused too", func(t *testing.T) {
+		for _, reference := range []string{
+			"evilgcr.io/x", "x.azurecr.io.evil.com/y", "ghcr.io.evil.com/z",
+		} {
+			status, raw := postAPI(t, base, server.APIPrefix+"/pulls",
+				map[string]string{"source": "registry", "reference": reference})
+			assert.Equal(t, http.StatusForbidden, status, "%s: %s", reference, raw)
+		}
+	})
+
+	t.Run("an unparseable reference is a 400", func(t *testing.T) {
+		status, raw := postAPI(t, base, server.APIPrefix+"/pulls",
+			map[string]string{"source": "registry", "reference": "not a ref!"})
+		require.Equal(t, http.StatusBadRequest, status, string(raw))
+		var envelope server.APIError
+		require.NoError(t, json.Unmarshal(raw, &envelope))
+		assert.Equal(t, server.CodeInvalidReference, envelope.Error.Code)
+	})
+
+	t.Run("no docker is data, not an error", func(t *testing.T) {
+		var listing domain.DockerListing
+		getAPI(t, base, server.APIPrefix+"/docker/images", &listing)
+		assert.False(t, listing.Available)
+		assert.NotEmpty(t, listing.Reason)
+		assert.Empty(t, listing.Images)
+
+		status, raw := postAPI(t, base, server.APIPrefix+"/pulls",
+			map[string]string{"source": "docker", "reference": "alpine:3.20"})
+		require.Equal(t, http.StatusServiceUnavailable, status, string(raw))
+		var envelope server.APIError
+		require.NoError(t, json.Unmarshal(raw, &envelope))
+		assert.Equal(t, server.CodeDockerUnavailable, envelope.Error.Code)
+	})
+
+	t.Run("the pull list starts empty and stays JSON", func(t *testing.T) {
+		var list server.PullList
+		getAPI(t, base, server.APIPrefix+"/pulls", &list)
+		assert.Empty(t, list.Pulls)
+	})
 
 	stop()
 	waitForRun(t, errCh)

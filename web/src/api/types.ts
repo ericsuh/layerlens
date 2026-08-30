@@ -33,6 +33,83 @@ export interface ImagesResponse {
   images: ImageSummary[];
 }
 
+/** §6.2 — one image the local Docker daemon offers. */
+export interface DockerImageSummary {
+  /** `repo:tag` — exactly what `POST /pulls` accepts back. */
+  reference: string;
+  dockerId: string;
+  /** The daemon's own uncompressed estimate, not a measured size. */
+  sizeBytes: number;
+  platform?: string;
+  /** True when an analyzed record already exists, so selecting it is free. */
+  alreadyAnalyzed: boolean;
+  /** That record's image id — the id the A/B slots take. */
+  analyzedId?: string;
+}
+
+/**
+ * §6.2 — `GET /api/v1/docker/images`.
+ *
+ * "No Docker" is not an error anywhere in this API: a server with no socket
+ * answers `available: false` with a `reason` written to be shown verbatim
+ * (DESIGN state #4), because a missing daemon is a fact about the deployment
+ * rather than a failed request.
+ */
+export interface DockerListing {
+  available: boolean;
+  reason?: string;
+  images: DockerImageSummary[];
+}
+
+/** §6.3 — the body of `POST /api/v1/pulls`. */
+export interface StartPullRequest {
+  source: "registry" | "docker";
+  reference: string;
+}
+
+export type PullSource = "registry" | "docker";
+
+/** `resolving` and `running` are the two states that keep polling (§8.2). */
+export type PullState = "resolving" | "running" | "done" | "error" | "cancelled";
+
+export interface PullLayerProgress {
+  index: number;
+  digest: string;
+  bytesDone: number;
+  bytesTotal?: number;
+}
+
+/**
+ * §6.3 — the polling payload for one ingest.
+ *
+ * `bytesTotal` is exact on the registry path (the manifest lists every layer's
+ * compressed size up front) and absent on the daemon path, where
+ * `bytesEstimated` is true and the UI must label the numbers as an estimate.
+ */
+export interface PullStatus {
+  id: string;
+  reference: string;
+  source: PullSource;
+  state: PullState;
+  startedAt: string;
+  bytesTotal?: number;
+  bytesDone: number;
+  bytesEstimated: boolean;
+  layersTotal?: number;
+  /** Includes layers skipped because they were already indexed. */
+  layersDone: number;
+  layersSkipped: number;
+  currentLayer?: PullLayerProgress;
+  /** Set when `state === "done"` — the id the A/B slots take. */
+  imageId?: string;
+  /** Set when `state === "error"`; `message` is shown verbatim (§6.1). */
+  error?: { code: string; message: string };
+}
+
+export interface PullList {
+  pulls: PullStatus[];
+}
+
 /** §6.4 — one layer of an image, ordered base → latest. */
 export interface LayerInfo {
   index: number;

@@ -104,7 +104,8 @@ trees, diffs, aggregates — are computed from these indexes.
 - Flags/env: `--listen` (default `:8080`), `--data-dir` (default
   `/var/lib/layerlens/images`), `--cache-max-bytes` (default 50 GiB),
   `--fixtures-dir` (default: embedded-adjacent `fixtures/`), `--docker-host`
-  (default: `DOCKER_HOST` / `/var/run/docker.sock` autodetect), `--ui-dir`
+  (default: `DOCKER_HOST` / `/var/run/docker.sock` autodetect; `off` disables
+  the daemon source outright), `--ui-dir`
   (development only, default empty: serve SPA assets from this directory
   instead of the embedded copy, so `mise run dev`'s esbuild/Tailwind watchers
   are visible without recompiling the binary).
@@ -809,6 +810,7 @@ interface DockerListing {
     reference: string;     // "repo:tag" — what to submit to POST /pulls
     dockerId: string;
     sizeBytes: number;     // daemon-reported (estimate)
+    platform?: string;     // "linux/amd64" as the daemon reports it (DESIGN §4.3)
     alreadyAnalyzed: boolean; // an ImageRecord exists for its config digest
     analyzedId?: string;
   }[];
@@ -1091,6 +1093,15 @@ guardedDial(ctx, network, addr):
   limits to 10 hops and rejects any redirect that downgrades to `http`. Go's
   stdlib already strips `Authorization` on cross-host redirects; every hop's
   connection goes through `guardedDial` regardless of its hostname.
+  `CheckRedirect` is necessary but not sufficient: go-containerregistry builds
+  its *own* `http.Client` for registry traffic, so our redirect policy never
+  runs on that path. The downgrade refusal is therefore enforced at the dialer
+  as well — the transport's `DialContext` (the hook net/http uses for `http://`)
+  always fails, and only `DialTLSContext` can connect — which makes plaintext
+  unreachable no matter whose client follows the redirect.
+- All vetted addresses are tried in turn, not only the first: every one of them
+  passed the same screen, so falling through to the second on a dead first
+  address changes nothing about the policy and everything about reliability.
 - Response-size caps: manifests, indexes, and configs are read through
   `io.LimitReader` (8 MiB each); layer count capped (e.g. 512); these bound
   memory against a hostile-but-allowlisted upstream.

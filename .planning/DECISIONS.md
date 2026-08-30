@@ -990,6 +990,166 @@ optional field, no rename, removal or reinterpretation of an existing one.
   the existing uncontrolled call sites are untouched.
 
 
+### Phase 008 (remote sources: registry pulls, Docker ingest, SSRF), 2026-08-30
+
+- **The plaintext refusal lives in the dialer, not only in `CheckRedirect`.**
+  §7.2 put the no-downgrade rule on `http.Client.CheckRedirect`. That hook
+  never runs on the path that matters: go-containerregistry builds its own
+  `http.Client` (`remote/fetcher.go`) and only takes our *transport*. Shipped:
+  `http.Transport.DialContext` — the hook net/http uses for `http://` — always
+  returns `ErrPlaintextRefused`, and only `DialTLSContext` can connect. A
+  downgrade is then unreachable regardless of whose client follows the
+  redirect. `safehttp.Client()` still carries the 10-hop cap and the scheme
+  check for requests layerlens issues itself. §7.2 updated.
+- **`Proxy` is nil and stays nil.** `http.ProxyFromEnvironment` would route
+  every request through an address the screen never sees, which on most hosts
+  is a loopback one — the exact hole this package exists to close.
+- **All vetted addresses are tried, not just `ips[0]`.** §7.2's pseudocode
+  dials the first. Every candidate passed the identical screen (a single
+  non-public answer already failed the whole host), so trying the second on a
+  dead first is the same policy with better behaviour. §7.2 updated.
+- **The screen covers more than the §7.2 list.** Beyond loopback/private/
+  link-local/multicast/unspecified/ULA/IPv4-mapped it also refuses CGNAT
+  (100.64/10), 0.0.0.0/8, the TEST-NETs, 198.18/15, 240/4, Teredo, and — the
+  one that actually matters — NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`),
+  whose embedded IPv4 is unwrapped and re-screened. `64:ff9b::a9fe:a9fe` is an
+  ordinary-looking IPv6 address that a NAT64 gateway delivers to
+  169.254.169.254.
+- **Size caps are inverted: everything is capped except a blob fetch.** §7.2
+  asks for 8 MiB caps on "manifests, indexes and configs". A config is fetched
+  as a blob, and after the CDN redirect its URL is not even on the registry's
+  host, so no path rule can tell it from a layer. Shipped: the transport caps
+  every response whose path is not a blob fetch (manifests, indexes, tokens,
+  the `/v2/` ping) plus any blob whose digest the caller has declared small —
+  `Transport.ExpectSmallBlob(digest)`, which the registry source holds around
+  the config read. Belt and braces, the manifest's *declared* `config.size` is
+  refused above 8 MiB before the config is fetched at all, and the layer count
+  is capped at 512 before any blob is opened. Residual, documented: if a
+  registry's CDN dropped the digest from the redirect URL, that image's config
+  would be uncapped rather than the pull breaking — failing open on
+  availability, closed on the declared-size check.
+- **`safehttp.Options` carries two test-only seams: `PermitLoopback` and
+  `RootCAs`.** A hardened dialer is untestable without one of them, and the
+  alternative (an `httptest` server the tests reach by disabling verification)
+  would have been worse. `PermitLoopback` relaxes the address screen and the
+  port rule for loopback only; `RootCAs` narrows trust rather than widening it,
+  and `InsecureSkipVerify` appears nowhere in the tree. `cmd/layerlens` sets
+  neither, and a test asserts the default refuses a loopback server.
+- **The docker save stream is parsed in one pass with no spool file.** The
+  phase file said "streamed to a staging spool and parsed with gcr
+  layout/tarball readers". A spool is a second copy of a 25 GiB image *and* is
+  charged against `--cache-max-bytes` (§5), which would make the daemon path
+  fail on exactly the images it exists for. It also buys nothing: an Engine 29
+  save writes `index.json` and `manifest.json` **after** the blobs (verified
+  against the real daemon), so no reader gets to look ahead. Shipped: members
+  small enough to be metadata (≤ 8 MiB) are buffered; anything larger is
+  indexed as it streams, with its DiffID *computed* rather than declared and
+  its compression sniffed from the magic bytes; at EOF the config's
+  `rootfs.diff_ids` reconcile the pass, indexing from the buffers any layer
+  small enough to have been buffered. Memory stays bounded (≤ 64 MiB of
+  metadata plus one layer's index) and no blob is ever written to disk.
+  Consequence: a big member that is not a layer is a logged warning and a
+  discarded index, not a failed ingest.
+- **Cheap draining of known layers applies only when the metadata precedes the
+  blobs.** DECISIONS A2 asks for known layers to be drained rather than
+  re-hashed. In a save stream a blob cannot be identified before it is read
+  unless the manifest *and* config have already been seen, which the real
+  Engine ordering makes uncommon. Shipped: the parser re-resolves its target
+  after every buffered member and drains a layer it can already identify
+  (tested both ways) — and, far more importantly, the manager prefers the
+  registry path outright whenever `docker inspect` reports a `RepoDigests`
+  entry on an allowlisted registry, where skipping is free and exact.
+- **No per-layer checkmark list — DESIGN §4.4 asks for one the API cannot
+  feed.** `PullStatus` (§6.3) carries counts plus the *current* layer, not an
+  array of layers, and widening it would mean streaming a 512-entry array on
+  every 800 ms poll to render a list nobody reads during a pull. Shipped: the
+  current layer with its own byte counts, `n of m layers`, and the
+  already-analyzed count — which is the part of that list that carries
+  information. DESIGN §4.4's "per-layer checkmark list (collapsed behind
+  details beyond 10 layers)" is deliberately not implemented.
+- **No server-side progress throttle.** The phase file suggested throttling
+  status updates to ~100 ms. Shipped: byte progress is an atomic counter that
+  `analyze.IndexLayer` increments and the poller reads, and per-layer
+  transitions take a mutex once per layer. The hot path never takes a lock, so
+  there is nothing for a throttle to protect, and a throttle would only make
+  the reported number stale.
+- **`--docker-host off` disables the daemon source.** §1.3 had no opt-out, so
+  on any host with a socket the Docker tab was whatever that machine happened
+  to hold — which makes the Playwright suite non-deterministic on a developer
+  laptop and gives an operator no way to run a pull-only server. §1.3 updated.
+- **`domain.DockerListing` reshaped to §6.2.** The phase-005 placeholder had
+  `{id, refNames, size}`; the contract is `{reference, dockerId, sizeBytes,
+  alreadyAnalyzed, analyzedId}` plus `platform` (DESIGN §4.3 asks the row to
+  show it) and `reason`. §6.2 updated with `platform`.
+- **"Already analyzed" is matched by two keys, not one.** The daemon's image
+  id is normally the config digest, which is layerlens' own id — but under the
+  containerd image store a multi-platform image is identified by its *index*
+  digest, which matches nothing in the cache (observed against the real Engine
+  29 daemon in this sandbox: `alpine:3.20` lists as `sha256:d9e853e8…` while
+  its analyzed id is `sha256:bf8527eb…`). The listing therefore also matches on
+  the display reference, which every ingest records.
+- **An already-cached image still reports a finished pull.** `Ingest`'s
+  already-present branch used to report no progress at all, leaving the UI with
+  a card stuck at zero. It now announces the layer count and marks every layer
+  skipped, which is the honest reading of what happened.
+- **`Ingester.Start` returns `StartResult{ID, Created}`.** §6.3 distinguishes
+  202 (started) from 200 (already in flight, or already cached), which a bare
+  `PullID` cannot express. Untagged daemon images are omitted from the listing:
+  a row whose reference cannot be submitted back is a dead row.
+- **Two pull failure codes beyond the §6.1 table.** `PullStatus.error` is not
+  an HTTP envelope, and DESIGN states #11 and #12 need to be distinguishable:
+  `pull_rate_limited` and the catch-all `pull_failed`, alongside the table's
+  `pull_upstream_denied`, `cache_full` and `docker_unavailable`. The catch-all
+  message is deliberately generic — an upstream's error text is logged, never
+  rendered.
+- **The allowlist verdict precedes the scheme check in `imgref.Parse`.** So
+  `localhost/x` and `127.0.0.1/x` are reported as "not on the allowlist", which
+  is what a user needs to hear, rather than as an http-scheme technicality. An
+  explicit port is still `invalid_reference` (a port is a different service
+  from the one the operator vetted, not a different registry). Registry hosts
+  are lowercased and stripped of a trailing root dot before any of it, so
+  `GHCR.IO` and `ghcr.io.` cannot be a second spelling.
+- **`/api/v1/meta.allowedRegistries` now comes from `imgref.DefaultPatterns`,
+  not from a copy in `main.go`.** The phase-005 note above put the list in the
+  command as a placeholder. Now that the matching rule exists, the displayed
+  list and the enforced list are the same variable and cannot drift.
+- **The accept/reject table is one JSON file, `testdata/refs.json`, read by
+  both implementations.** `internal/imgref/imgref_test.go` and the SPA's
+  `refcheck` mirror are driven from it, so the inline verdict the user sees
+  while typing cannot drift from the verdict the server will give. The client
+  adds one verdict the server has no use for — `empty`, for an untouched field,
+  which must not render as a red error.
+- **A Docker reference is validated on the raw string, not only by parsing.**
+  A local reference is not allowlisted — the daemon is local trust — but the
+  Engine client builds its URL by concatenating the reference into
+  `/images/<ref>/json`, and go-containerregistry's grammar accepts `.` and `..`
+  as path segments (`./x` even parses as a *registry* called "."). Nothing
+  useful is reachable that way — the path always ends in a literal segment and
+  carries no query parameters — but a reference with a traversal segment is not
+  one anyone means to type, so it is refused, and the save stream is opened
+  against the id `docker inspect` returned rather than against the user's
+  string. Found by the security review pass over this phase.
+- **Pull cards live above the tab strip, not inside a slot card.** DESIGN §4.4
+  puts a compact progress ring on the slot card and mirrors the pull into the
+  source panel. Shipped: an image joins a slot only once it is analyzed and
+  selectable, so a pull has no slot to ring; the cards sit above the tab strip
+  instead, which satisfies the same requirement — "the user may switch tabs
+  while a pull runs and never lose it from view" — structurally rather than by
+  remembering state. A Docker row's `Analyze` button starts the same pull
+  rather than DESIGN §4.3's "selecting it kicks off analysis at Compare time":
+  work that starts when you press a button labelled for it beats work that
+  starts two clicks later somewhere else.
+- **The Docker list carries a footnote when a row's platform is not
+  linux/amd64.** The daemon reports the variant it would *run* — arm64 on an
+  Apple-silicon or arm64 host — while layerlens always analyzes the amd64
+  variant, which the same image usually also holds. Without the note a row
+  reading `linux/arm64` that analyzes successfully looks like a bug.
+- **`friendlyRegistryNames` keeps DESIGN §9 #8's exact sentence** ("Allowed:
+  Docker Hub, GHCR, GCR, ECR, ACR"), which folds `*.pkg.dev` under "GCR". The
+  full pattern list is also printed verbatim under the input, so an Artifact
+  Registry user sees `*.pkg.dev` there and gets a `✓ allowed` verdict on the
+  reference itself.
+
 ## Risks
 
 1. **25 GiB images.** Never hold a layer in memory and never keep extracted filesystems.

@@ -54,6 +54,41 @@ export function formatByteDelta(bytes: number): string {
 }
 
 /**
+ * Throughput on the pull progress card (DESIGN §4.4: "38.2 MiB/s"). Binary
+ * units like every other size in the UI, so a rate and a total can be read
+ * against each other without a mental conversion.
+ */
+export function formatThroughput(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) {
+    return "—";
+  }
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+/**
+ * A deliberately soft ETA (DESIGN §4.4: "about 4 min left").
+ *
+ * Rounded coarsely and worded vaguely on purpose: the estimate comes from a
+ * few seconds of throughput on a link whose behaviour over the next 20 GiB
+ * nobody knows, and a precise-looking "3 min 42 s left" would be claiming an
+ * accuracy this number does not have.
+ */
+export function formatSoftEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "";
+  }
+  if (seconds < 60) {
+    return "less than a minute left";
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    return `about ${minutes} min left`;
+  }
+  const hours = Math.round(seconds / 3600);
+  return `about ${hours} hr left`;
+}
+
+/**
  * Counts that must fit a fixed-width column (DESIGN §3): plain below 1000,
  * then one decimal with a K/M/G suffix, so `± 9.9M` is the widest rendering.
  */

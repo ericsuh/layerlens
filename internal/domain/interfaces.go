@@ -87,18 +87,45 @@ type PullStatus struct {
 	Error        *PullFailure  `json:"error,omitempty"`
 }
 
-// DockerImageSummary is one image offered by the local Docker daemon.
+// DockerImageSummary is one image offered by the local Docker daemon
+// (ARCHITECTURE §6.2).
 type DockerImageSummary struct {
-	ID       Digest   `json:"id"`
-	RefNames []string `json:"refNames"`
-	Size     int64    `json:"size"`
+	// Reference is "repo:tag" — exactly what POST /pulls accepts back.
+	Reference string `json:"reference"`
+	// DockerID is the daemon's content-addressable image id, which is the
+	// config digest and therefore also the analyzed image's id.
+	DockerID string `json:"dockerId"`
+	// SizeBytes is the daemon's own (uncompressed, estimated) size.
+	SizeBytes int64 `json:"sizeBytes"`
+	// Platform is "os/arch" as the daemon reports it.
+	Platform string `json:"platform,omitempty"`
+	// AlreadyAnalyzed is true when an ImageRecord already exists for this
+	// image, in which case selecting it costs nothing.
+	AlreadyAnalyzed bool `json:"alreadyAnalyzed"`
+	// AnalyzedID is that record's id when AlreadyAnalyzed.
+	AnalyzedID Digest `json:"analyzedId,omitempty"`
 }
 
 // DockerListing is the daemon's image list, plus whether the daemon was
 // reachable at all.
+//
+// "No Docker" is not an error anywhere in this API (§6.3): a server with no
+// socket answers Available=false with a Reason, because a missing daemon is a
+// fact about the deployment, not a failed request.
 type DockerListing struct {
-	Available bool                 `json:"available"`
-	Images    []DockerImageSummary `json:"images"`
+	Available bool `json:"available"`
+	// Reason explains an unavailable daemon, for display verbatim.
+	Reason string               `json:"reason,omitempty"`
+	Images []DockerImageSummary `json:"images"`
+}
+
+// StartResult is what Start reports back: which pull covers the request, and
+// whether it had to be created. Created=false is the idempotent case of §6.3 —
+// an identical request already in flight, or an image already cached — and is
+// what makes POST /pulls answer 200 instead of 202.
+type StartResult struct {
+	ID      PullID
+	Created bool
 }
 
 // Ingester is what the HTTP layer sees of pulling and analyzing images
@@ -106,8 +133,10 @@ type DockerListing struct {
 type Ingester interface {
 	// Start validates the request, dedupes against in-flight pulls and
 	// returns the pull's id.
-	Start(ctx context.Context, req IngestRequest) (PullID, error)
+	Start(ctx context.Context, req IngestRequest) (StartResult, error)
 	Status(id PullID) (*PullStatus, error)
+	// Pulls lists every pull this process knows about, newest first.
+	Pulls() []PullStatus
 	Cancel(id PullID) error
 	ListDockerImages(ctx context.Context) (DockerListing, error)
 }

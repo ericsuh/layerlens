@@ -47,6 +47,10 @@ type Options struct {
 	Layers domain.LayerIndexSource
 	// Cache backs /api/v1/meta. Optional.
 	Cache CacheStats
+	// Ingester backs the pulls and docker endpoints. Defaults to one that
+	// reports no Docker and refuses pulls, so a server built without it
+	// (routing tests) still answers the whole surface.
+	Ingester domain.Ingester
 	// Ready gates /healthz. It reports false until the vendored fixtures
 	// have been ingested (ARCHITECTURE §1.3). Nil means "always ready".
 	Ready func() bool
@@ -72,6 +76,7 @@ type Server struct {
 	handler     http.Handler
 	images      domain.ImageStore
 	layers      domain.LayerIndexSource
+	ingester    domain.Ingester
 	cache       CacheStats
 	ready       func() bool
 	version     string
@@ -99,6 +104,10 @@ func New(opts Options) *Server {
 	if layers == nil {
 		layers = emptyStore{}
 	}
+	ingester := opts.Ingester
+	if ingester == nil {
+		ingester = unconfiguredIngester{}
+	}
 	size := opts.ComparisonCacheSize
 	if size <= 0 {
 		size = DefaultComparisonCacheSize
@@ -110,6 +119,7 @@ func New(opts Options) *Server {
 		apiMux:      http.NewServeMux(),
 		images:      images,
 		layers:      layers,
+		ingester:    ingester,
 		cache:       opts.Cache,
 		ready:       opts.Ready,
 		version:     opts.Version,
@@ -141,17 +151,34 @@ func (s *Server) routes() {
 	// JSON 405 envelope with an Allow header instead of ServeMux's own
 	// plain-text 405.
 	for _, route := range []struct {
-		pattern string
-		handler http.HandlerFunc
+		pattern  string
+		handlers map[string]http.HandlerFunc
 	}{
-		{APIPrefix + "/images", s.handleImages},
-		{APIPrefix + "/images/{id}", s.handleImage},
-		{APIPrefix + "/diff/layers", s.handleDiffLayers},
-		{APIPrefix + "/diff/tree", s.handleDiffTree},
-		{APIPrefix + "/meta", s.handleMeta},
+		{APIPrefix + "/images", map[string]http.HandlerFunc{http.MethodGet: s.handleImages}},
+		{APIPrefix + "/images/{id}", map[string]http.HandlerFunc{http.MethodGet: s.handleImage}},
+		{APIPrefix + "/diff/layers", map[string]http.HandlerFunc{http.MethodGet: s.handleDiffLayers}},
+		{APIPrefix + "/diff/tree", map[string]http.HandlerFunc{http.MethodGet: s.handleDiffTree}},
+		{APIPrefix + "/meta", map[string]http.HandlerFunc{http.MethodGet: s.handleMeta}},
+		{APIPrefix + "/docker/images", map[string]http.HandlerFunc{http.MethodGet: s.handleDockerImages}},
+		{APIPrefix + "/pulls", map[string]http.HandlerFunc{
+			http.MethodGet:  s.handleListPulls,
+			http.MethodPost: s.handleCreatePull,
+		}},
+		{APIPrefix + "/pulls/{id}", map[string]http.HandlerFunc{
+			http.MethodGet:    s.handleGetPull,
+			http.MethodDelete: s.handleCancelPull,
+		}},
 	} {
-		s.apiMux.HandleFunc("GET "+route.pattern, route.handler)
-		s.apiMux.HandleFunc(route.pattern, methodNotAllowed(http.MethodGet))
+		allowed := make([]string, 0, len(route.handlers))
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+			handler, ok := route.handlers[method]
+			if !ok {
+				continue
+			}
+			allowed = append(allowed, method)
+			s.apiMux.HandleFunc(method+" "+route.pattern, handler)
+		}
+		s.apiMux.HandleFunc(route.pattern, methodNotAllowed(allowed...))
 	}
 	s.apiMux.HandleFunc("/", s.handleAPINotFound)
 }
@@ -335,6 +362,31 @@ func (emptyStore) Touch(context.Context, domain.Digest) error { return nil }
 
 func (emptyStore) LayerIndex(_ context.Context, diffID domain.Digest) (*domain.LayerIndex, error) {
 	return nil, fmt.Errorf("%w: %s", domain.ErrNotIndexed, diffID)
+}
+
+// unconfiguredIngester stands in when no pull manager was wired: the routes
+// still exist and answer honestly rather than 404ing or panicking.
+type unconfiguredIngester struct{}
+
+func (unconfiguredIngester) Start(context.Context, domain.IngestRequest) (domain.StartResult, error) {
+	return domain.StartResult{}, errors.New("server: no ingest source is configured")
+}
+
+func (unconfiguredIngester) Status(domain.PullID) (*domain.PullStatus, error) {
+	return nil, fmt.Errorf("%w: pulls are not configured", domain.ErrNotFound)
+}
+
+func (unconfiguredIngester) Pulls() []domain.PullStatus { return nil }
+
+func (unconfiguredIngester) Cancel(domain.PullID) error {
+	return fmt.Errorf("%w: pulls are not configured", domain.ErrNotFound)
+}
+
+func (unconfiguredIngester) ListDockerImages(context.Context) (domain.DockerListing, error) {
+	return domain.DockerListing{
+		Reason: "No Docker socket found at /var/run/docker.sock — the daemon source is unavailable on this server.",
+		Images: []domain.DockerImageSummary{},
+	}, nil
 }
 
 // handleHealthzNotFound answers /healthz/<anything>. Plain text, to match the

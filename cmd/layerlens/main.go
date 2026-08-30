@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/ericsuh/layerlens/internal/cachestore"
+	"github.com/ericsuh/layerlens/internal/imgref"
 	"github.com/ericsuh/layerlens/internal/ingest"
+	"github.com/ericsuh/layerlens/internal/safehttp"
 	"github.com/ericsuh/layerlens/internal/server"
 	"github.com/ericsuh/layerlens/internal/webui"
 )
@@ -26,7 +28,7 @@ import (
 // version is reported by GET /api/v1/meta. It is a build-time constant rather
 // than something derived at runtime so that a binary always reports what it
 // actually is.
-const version = "0.5.0"
+const version = "0.8.0"
 
 const (
 	defaultListen        = ":8080"
@@ -42,26 +44,17 @@ const (
 	maxHeaderBytes = 64 << 10
 )
 
-// defaultAllowedRegistries is the ARCHITECTURE §7.1 host allowlist, reported
+// allowedRegistries is the ARCHITECTURE §7.1 host allowlist, reported
 // verbatim by GET /api/v1/meta so the UI can name the registries a pull may
 // target instead of hardcoding a second copy of the list.
 //
-// This is the display half only. Phase 008 owns the matching rule (label-
-// boundary globs, the port and scheme refusals) and the enforcement point; the
-// contract here is just that the field says what the server will actually
-// accept rather than being an empty list the UI has to guess around.
-var defaultAllowedRegistries = []string{
-	"docker.io",
-	"index.docker.io",
-	"registry-1.docker.io",
-	"ghcr.io",
-	"gcr.io",
-	"*.gcr.io",
-	"*.pkg.dev",
-	"public.ecr.aws",
-	"*.dkr.ecr.*.amazonaws.com",
-	"*.azurecr.io",
-}
+// The list is not duplicated here: it comes from the package that enforces it,
+// so "what the UI says is allowed" and "what the server will actually accept"
+// cannot drift apart.
+var allowedRegistries = imgref.DefaultPatterns
+
+// dockerHostOff is the --docker-host value that disables the daemon source.
+const dockerHostOff = "off"
 
 // dockerSocketPath is the local endpoint probed when neither --docker-host nor
 // $DOCKER_HOST is set (ARCHITECTURE §1.3). A variable so tests can point the
@@ -93,7 +86,8 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 	// The default is empty rather than os.Getenv("DOCKER_HOST"): flag defaults
 	// are printed by -h, and DOCKER_HOST can carry a host and credentials.
 	// The environment is consulted after parsing instead.
-	fs.StringVar(&cfg.dockerHost, "docker-host", "", "Docker endpoint to ingest images from (default $DOCKER_HOST, else the local socket if present)")
+	fs.StringVar(&cfg.dockerHost, "docker-host", "",
+		`Docker endpoint to ingest images from (default $DOCKER_HOST, else the local socket if present; "off" disables the daemon source)`)
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -101,8 +95,15 @@ func parseFlags(args []string, stderr io.Writer) (*config, error) {
 	if rest := fs.Args(); len(rest) > 0 {
 		return nil, fmt.Errorf("unexpected arguments: %v", rest)
 	}
-	if cfg.dockerHost == "" {
+	switch cfg.dockerHost {
+	case "":
 		cfg.dockerHost = resolveDockerHost()
+	case dockerHostOff:
+		// An explicit opt-out. Without it there is no way to say "do not
+		// offer the daemon source" on a machine that happens to have a
+		// socket — which the e2e suite needs to stay deterministic, and
+		// an operator may want for a server that should only ever pull.
+		cfg.dockerHost = ""
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -121,6 +122,19 @@ func resolveDockerHost() string {
 		return "unix://" + dockerSocketPath
 	}
 	return ""
+}
+
+// outboundTransport builds the one transport this process ever uses to reach a
+// registry.
+//
+// Everything that leaves here — the token dance, the manifest, every blob, and
+// every CDN redirect hop — goes through its guarded dialer (ARCHITECTURE §7.2).
+// No credential source is consulted anywhere (RESEARCH Q3), and the
+// tests-only PermitLoopback escape hatch is deliberately left false. It is a
+// function so a test can assert on the transport the command actually builds
+// rather than on one a test constructed to look like it.
+func outboundTransport() *safehttp.Transport {
+	return safehttp.New(safehttp.Options{})
 }
 
 func (c *config) validate() error {
@@ -203,13 +217,45 @@ func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr
 	ingester := ingest.New(store, ingest.Options{Logger: log})
 	loaded := startFixtureLoad(ctx, cfg, log, ingester)
 
+	transport := outboundTransport()
+	defer transport.CloseIdleConnections()
+
+	docker := ingest.NewDocker(ingest.DockerOptions{
+		Host:   cfg.dockerHost,
+		Images: store,
+		Logger: log,
+	})
+	defer func() {
+		if err := docker.Close(); err != nil {
+			log.Debug("close docker client", "err", err)
+		}
+	}()
+	if cfg.dockerHost == "" {
+		log.Info("no Docker endpoint configured; the daemon source will report itself unavailable")
+	} else {
+		log.Info("docker endpoint configured", "host", cfg.dockerHost)
+	}
+
+	pulls := ingest.NewManager(ingest.ManagerOptions{
+		Ingester: ingester,
+		Registry: ingest.NewRegistry(ingest.RegistryOptions{
+			Transport: transport,
+			UserAgent: "layerlens/" + version,
+		}),
+		Docker:    docker,
+		Allowlist: imgref.Default(),
+		Images:    store,
+		Logger:    log,
+	})
+
 	opts := server.Options{
 		Logger:            log,
 		Images:            store,
 		Layers:            store,
 		Cache:             store,
+		Ingester:          pulls,
 		Version:           version,
-		AllowedRegistries: defaultAllowedRegistries,
+		AllowedRegistries: allowedRegistries,
 		Ready: func() bool {
 			select {
 			case <-loaded:

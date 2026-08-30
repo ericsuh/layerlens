@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ericsuh/layerlens/internal/safehttp"
 	"github.com/ericsuh/layerlens/internal/webui"
 )
 
@@ -65,6 +66,20 @@ func TestParseFlags(t *testing.T) {
 				fixturesDir:   "./fx",
 				dockerHost:    "unix:///run/docker.sock",
 				uiDir:         "internal/webui/dist",
+			},
+		},
+		{
+			// The opt-out matters on a host that has a socket: it is
+			// the only way to say "do not offer the daemon source",
+			// and it is what keeps the e2e suite deterministic.
+			name: "--docker-host off disables the daemon source",
+			args: []string{"--docker-host", "off"},
+			want: config{
+				listen:        ":8080",
+				dataDir:       "/var/lib/layerlens/images",
+				cacheMaxBytes: 50 << 30,
+				fixturesDir:   "fixtures",
+				dockerHost:    "",
 			},
 		},
 		{
@@ -383,4 +398,31 @@ func requireBuiltBundle(t *testing.T) {
 	if _, err := fs.Stat(webui.FS(), "index.html"); err != nil {
 		t.Skip("SPA bundle is not built; run `mise run build-web`")
 	}
+}
+
+// TestOutboundTransportIsHardened is a wiring assertion, not a unit test of
+// safehttp: it checks that the transport this command actually builds refuses
+// a private destination and refuses plaintext.
+//
+// The controls themselves are tested in internal/safehttp. What can only be
+// checked here is that the process uses them — a server wired with
+// http.DefaultTransport would pass every test in that package and still be an
+// SSRF.
+func TestOutboundTransportIsHardened(t *testing.T) {
+	transport := outboundTransport()
+	t.Cleanup(transport.CloseIdleConnections)
+	client := transport.Client()
+
+	// 169.254.169.254 is the cloud metadata endpoint every SSRF is aimed at.
+	_, err := client.Get("https://169.254.169.254/latest/meta-data/") //nolint:noctx // short-lived test request
+	require.Error(t, err)
+	assert.ErrorIs(t, err, safehttp.ErrForbiddenAddress)
+
+	_, err = client.Get("http://example.com/") //nolint:noctx // short-lived test request
+	require.Error(t, err)
+	assert.ErrorIs(t, err, safehttp.ErrPlaintextRefused)
+
+	_, err = client.Get("https://example.com:8443/") //nolint:noctx // short-lived test request
+	require.Error(t, err)
+	assert.ErrorIs(t, err, safehttp.ErrForbiddenPort)
 }

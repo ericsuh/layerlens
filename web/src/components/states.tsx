@@ -31,10 +31,13 @@ export function ErrorPanel({
   title,
   detail,
   action,
+  retry,
 }: {
   title: string;
   detail: string;
   action?: { label: string; href: string };
+  /** An in-place retry (DESIGN §9 #6/#27), for errors a refetch can clear. */
+  retry?: { label: string; onClick: () => void };
 }) {
   return (
     <div
@@ -43,6 +46,11 @@ export function ErrorPanel({
     >
       <p className="text-section text-removed-strong m-0 mb-1.5">{title}</p>
       <p className="text-text-muted mx-auto m-0 max-w-[420px] [overflow-wrap:anywhere]">{detail}</p>
+      {retry ? (
+        <button type="button" className="ll-btn-ghost mt-4" onClick={retry.onClick}>
+          {retry.label}
+        </button>
+      ) : null}
       {action ? (
         <Link href={action.href} className="ll-btn-ghost mt-4 inline-block">
           {action.label}
