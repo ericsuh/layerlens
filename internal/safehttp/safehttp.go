@@ -611,10 +611,20 @@ func (g *stallGuard) Read(p []byte) (int, error) {
 	if n > 0 {
 		g.read.Add(int64(n))
 	}
-	if err != nil && !errors.Is(err, io.EOF) && g.tripped.Load() {
-		// The read failed because the watchdog pulled the context out
-		// from under it; reporting context.Canceled here would read as
-		// "the user cancelled", which is the one thing it is not.
+	if err != nil && g.tripped.Load() {
+		// The read ended because the watchdog pulled the context out from
+		// under it. Reporting context.Canceled here would read as "the user
+		// cancelled", which is the one thing it is not.
+		//
+		// io.EOF is deliberately included. Cancelling the request makes the
+		// upstream hang up, and a hang-up is delivered to this side as a
+		// clean EOF just as often as it is delivered as an error — which
+		// ordering wins is a race decided by load. Excluding EOF therefore
+		// handed the caller a *silently truncated* body that looked
+		// complete, which is the worst outcome available: for a layer blob
+		// the DiffID check would eventually catch it, but a manifest or
+		// config would simply be short. Once tripped, this body has no
+		// legitimate end, so every terminal outcome is ErrStalled.
 		return n, ErrStalled
 	}
 	return n, err

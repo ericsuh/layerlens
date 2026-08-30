@@ -1358,3 +1358,45 @@ the trust boundary, they are missing bounds on work. Every finding marked
    would treat them as different layers; content-only is more forgiving and arguably more
    useful for the ".dockerignore mistake" demo.) Default: include mode/uid/gid, exclude
    timestamps — confirm.
+
+### Clean tasks, and a truncation bug they surfaced (2026-08-30)
+
+`mise run clean` removes gitignored build output, `web/node_modules`, and local
+runtime state, returning the tree to fresh-checkout equivalence; `clean-deep`
+additionally wipes the shared Go build/test/module caches. They are separate
+tasks because those caches live outside the repo and are shared with every other
+Go project on the machine, so a `clean` that swept them would be surprising and
+expensive. `clean` finishes by listing anything still ignored that it did not
+delete, so the hand-maintained path list cannot drift out of step with
+`.gitignore` unnoticed.
+
+Two things worth recording:
+
+1. **mise appends task arguments to the script's last line** rather than passing
+   them as `$1`. An initial `clean --deep` implementation parsed `"${1:-}"` and
+   silently did nothing — `mise run clean --bogus` appended `--bogus` to a
+   trailing `echo` and exited 0. Hence two tasks rather than one flag. Any
+   future task that needs arguments must use mise's `usage`/`{{arg()}}` support,
+   not positional parameters.
+
+2. **The cold rebuild after `clean-deep` exposed a real bug in the stall
+   guard.** `TestStallDetectorRefusesATricklingBody` failed under the load of a
+   from-scratch build with "An error is expected but got nil". The cause was not
+   flakiness: `stallGuard.Read` excluded `io.EOF` from the tripped check, but
+   cancelling the request makes the upstream hang up, and a tidy hang-up is
+   delivered to this side as a clean EOF as readily as an error — which one wins
+   is a race decided by machine load. On the EOF side the caller received a
+   **silently truncated body reported as complete**. For a layer blob the DiffID
+   check would eventually catch it; a manifest or config would simply be short.
+   Once tripped, the transfer was killed deliberately and has no legitimate end,
+   so every terminal outcome is now `ErrStalled`.
+
+   The regression test for this is in-package (`stallguard_internal_test.go`) and
+   sets `tripped` directly. Two successive attempts to test it over a socket
+   both passed against the buggy code — one because `Content-Length` made the
+   client report `ErrUnexpectedEOF`, which the old condition already caught, and
+   one because request-context cancellation usually surfaces as an error rather
+   than the EOF the bug needed. Only the EOF half of the race is interesting, so
+   it is asserted at the guard where it is deterministic, and both tests were
+   confirmed to fail against the old condition before being kept.
+

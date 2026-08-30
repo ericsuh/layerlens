@@ -33,10 +33,25 @@ mise run build      # bundle the SPA and build ./bin/layerlens with it embedded
 | `mise run test` | `go test` + Vitest |
 | `mise run check` | lint + typecheck + test + build |
 | `mise run fmt` | `gofmt -w` over the Go trees |
+| `mise run clean` | Remove build output, `web/node_modules`, and local runtime state — the tree as a fresh checkout |
+| `mise run clean-deep` | `clean`, plus the shared Go build/test/module caches (forces a full redownload) |
 | `mise run genfixtures` | Regenerate `fixtures/` from `cmd/genfixtures` (deterministic — expect no git diff) |
 | `mise run e2e` | Playwright against the real binary on fixtures (no Docker, no network) |
 | `mise run deploy-dry-run` | Print the deploy command plan; runs nothing, dials nothing |
 | `mise run deploy` | Cross-compile, ship over SSH, restart the service, wait for `/healthz` |
+
+`clean` returns the working tree to what a fresh `git clone` gives you: it
+deletes only gitignored output, leaves tracked files alone (which is why
+`internal/webui/dist` is emptied rather than removed — its `.gitkeep` is tracked
+and `go:embed` needs the directory to exist), and then lists anything still
+ignored that it did not delete, so the task and `.gitignore` cannot quietly
+drift apart. From clean, `mise run check` rebuilds everything in about 17 s.
+
+`clean-deep` additionally wipes the Go build, test, and module caches. Those are
+not part of a checkout — they live outside the repo and are shared with every
+other Go project on the machine — so they are a separate task rather than
+something `clean` does behind your back. Use it to prove the build works from
+genuinely nothing.
 
 The built SPA lives in `internal/webui/dist` and is embedded with `//go:embed`,
 so the binary is self-contained: it serves `/healthz`, the reserved `/api`

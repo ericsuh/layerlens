@@ -66,6 +66,65 @@ description = "Regenerate the vendored OCI image-layout fixtures (deterministic:
 dir = "{{config_root}}"
 run = "go run ./cmd/genfixtures --out fixtures"
 
+[tasks.clean]
+description = "Remove build artifacts, dependencies, and local runtime state (back to a fresh-checkout tree)"
+dir = "{{config_root}}"
+run = """
+set -eu
+
+# Everything here is gitignored output. Tracked files are never touched, which
+# is why internal/webui/dist is emptied rather than removed: its .gitkeep is
+# tracked, and go:embed needs that directory to exist for the package to
+# compile at all.
+rm -rf \
+  bin \
+  .dev-dist \
+  .dev-data \
+  .e2e-data \
+  .e2e-artifacts \
+  test-results \
+  playwright-report \
+  web/node_modules \
+  web/.e2e-artifacts \
+  web/test-results \
+  web/playwright-report \
+  .pnpm-store
+if [ -d internal/webui/dist ]; then
+  find internal/webui/dist -mindepth 1 ! -name .gitkeep -delete
+fi
+
+echo "cleaned: build output, web/node_modules, and local runtime state"
+
+# The list above is hand-maintained, so report anything still ignored rather
+# than letting it drift out of step with .gitignore. Nothing is deleted here: a
+# leftover is either a gap in this task or a file that belongs to the developer
+# (a local settings override, an editor scratch file), and this task should not
+# be the thing that guesses which.
+leftover=$(git status --ignored --porcelain 2>/dev/null | sed -n 's/^!! //p' || true)
+if [ -n "$leftover" ]; then
+  echo
+  echo "still present (ignored by git, left alone by clean):"
+  printf '  %s\n' $leftover
+fi
+
+echo
+echo "next: 'mise run build' to rebuild, or 'mise run check' for everything"
+"""
+
+[tasks.clean-deep]
+description = "clean, plus the shared Go build/test/module caches (forces a full redownload)"
+depends = ["clean"]
+dir = "{{config_root}}"
+run = """
+set -eu
+# Separate from `clean` because these caches are not part of a checkout: they
+# live outside the repo and are shared with every other Go project on the
+# machine, so wiping them costs a full module redownload and a cold rebuild.
+# Use this to prove the build works from genuinely nothing, not day to day.
+go clean -cache -testcache -modcache
+echo "cleaned: Go build, test, and module caches (next build will redownload)"
+"""
+
 [tasks.fmt]
 description = "Format Go sources"
 dir = "{{config_root}}"
