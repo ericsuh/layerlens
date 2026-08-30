@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -128,7 +129,7 @@ func TestImageRecordOnlyAfterAllLayers(t *testing.T) {
 		},
 	})
 	require.Error(t, err, "committing a record naming an uncommitted layer must fail")
-	assert.Contains(t, err.Error(), "uncommitted layer")
+	assert.Contains(t, err.Error(), "never put or used")
 	require.NoError(t, txn.Abort())
 
 	// A corrupt record that nevertheless reached the disk is dropped at the
@@ -290,4 +291,206 @@ func TestConcurrentReadDuringEviction(t *testing.T) {
 	close(stop)
 	wg.Wait()
 	assert.False(t, s.HasLayer(victim.DiffID))
+}
+
+// diskBytes sums exactly what the accounting claims to track: every file under
+// the layer store and the image store. Staging is excluded — a committed cache
+// has none, and the sweep does not count it either.
+func diskBytes(t *testing.T, s *Store) int64 {
+	t.Helper()
+	var total int64
+	for _, root := range []string{s.layersRoot(), s.imagesRoot()} {
+		err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				total += info.Size()
+			}
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	return total
+}
+
+// evictAll drives the LRU until nothing evictable is left, which is the state
+// that makes accounting drift visible: whatever `accounted` still holds after
+// every byte is gone from disk is drift, and it is permanent.
+func evictAll(s *Store) {
+	s.mu.Lock()
+	s.max = 1
+	s.mu.Unlock()
+	if err := s.reserve(nil, 1); err == nil {
+		s.release(nil, 1)
+	}
+}
+
+// TestConcurrentPutLayerOfSameDiffIDAccountsOnce is ARCHITECTURE §5's "a mutex
+// per layer digest", asserted as the property that mutex exists for.
+//
+// PutLayer is check-then-act. Without serialization two transactions that both
+// miss the same DiffID both reserve its bytes and both install a table entry,
+// one overwriting the other — so the cache is charged twice for one directory
+// and refunded once when it is evicted. The drift is monotonic and invisible
+// until a long-running server refuses `cache_full` on an empty disk, which is
+// exactly what this asserts cannot happen: accounting matches the bytes on
+// disk while the layer is live, and returns to zero when it is gone.
+//
+// Unreachable while fixtures ingest sequentially; normal the moment pulls run
+// concurrently.
+func TestConcurrentPutLayerOfSameDiffIDAccountsOnce(t *testing.T) {
+	s := openStore(t, t.TempDir(), 1<<30, newClock())
+
+	const putters = 16
+	var wg sync.WaitGroup
+	errs := make([]error, putters)
+	start := make(chan struct{})
+	for i := range putters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each transaction builds its own copy of the same
+			// layer, exactly as two concurrent pulls of two images
+			// sharing a base would.
+			idx := makeIndex("shared", 400)
+			txn, err := s.Begin()
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			<-start
+			if err := txn.PutLayer(idx); err != nil {
+				errs[i] = err
+				_ = txn.Abort()
+				return
+			}
+			errs[i] = txn.Commit(&domain.ImageRecord{
+				ID:       dig(fmt.Sprintf("image:concurrent-%d", i)),
+				RefNames: []string{fmt.Sprintf("concurrent:%d", i)},
+				Source:   domain.SourceRegistry,
+				Platform: "linux/amd64",
+				Layers: []domain.Layer{
+					{Index: 0, DiffID: idx.DiffID, ChangesetDigest: idx.ChangesetDigest},
+				},
+			})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "putter %d", i)
+	}
+
+	// One layer directory on disk, however many transactions raced for it.
+	layerDirs, err := os.ReadDir(s.layersRoot())
+	require.NoError(t, err)
+	assert.Len(t, layerDirs, 1, "one DiffID is one layer directory")
+
+	assert.Equal(t, diskBytes(t, s), s.UsedBytes(),
+		"the accounting must equal the bytes actually on disk, not the number of transactions that raced")
+
+	evictAll(s)
+	assert.Equal(t, int64(0), diskBytes(t, s), "everything is evictable, so everything is gone")
+	assert.Equal(t, int64(0), s.UsedBytes(),
+		"and the accounting returns to zero: any residue is permanent drift toward a false cache_full")
+}
+
+// TestCommitRejectsLayerThisTransactionNeverDeclared: presence in the cache is
+// not the property that matters. A layer this ingest never put or used is held
+// against eviction by nothing, so the evictor is free to delete it between the
+// check and the record rename — producing the very record-without-its-layers
+// state the startup sweep exists to clean up.
+func TestCommitRejectsLayerThisTransactionNeverDeclared(t *testing.T) {
+	s := openStore(t, t.TempDir(), 1<<30, newClock())
+	other := makeIndex("someone-elses", 20)
+	putImage(t, s, "other:v1", false, other)
+	require.True(t, s.HasLayer(other.DiffID), "the layer really is in the cache")
+
+	mine := makeIndex("mine", 20)
+	txn, err := s.Begin()
+	require.NoError(t, err)
+	require.NoError(t, txn.PutLayer(mine))
+
+	err = txn.Commit(&domain.ImageRecord{
+		ID: dig("image:borrowing"),
+		Layers: []domain.Layer{
+			{Index: 0, DiffID: mine.DiffID},
+			{Index: 1, DiffID: other.DiffID},
+		},
+	})
+	require.Error(t, err, "a present-but-undeclared layer must not be enough to commit")
+	assert.Contains(t, err.Error(), "never put or used")
+	require.NoError(t, txn.Abort())
+
+	// Declaring it — which is what pins it against eviction — makes the
+	// same commit legal.
+	txn, err = s.Begin()
+	require.NoError(t, err)
+	require.NoError(t, txn.PutLayer(mine))
+	_, ok := txn.UseLayer(other.DiffID)
+	require.True(t, ok)
+	require.NoError(t, txn.Commit(&domain.ImageRecord{
+		ID: dig("image:borrowing"),
+		Layers: []domain.Layer{
+			{Index: 0, DiffID: mine.DiffID},
+			{Index: 1, DiffID: other.DiffID},
+		},
+	}))
+}
+
+// TestUpgradeProvenanceMergesWithoutRewritingUnchangedRecords covers the half
+// of m8 that lives in the store: pinning is monotonic, refNames merge, and an
+// ingest that learns nothing new writes nothing at all — the fixture load runs
+// on every startup and must not churn a record file per boot.
+func TestUpgradeProvenanceMergesWithoutRewritingUnchangedRecords(t *testing.T) {
+	root := t.TempDir()
+	s := openStore(t, root, 1<<30, newClock())
+	idx := makeIndex("base", 20)
+
+	txn, err := s.Begin()
+	require.NoError(t, err)
+	require.NoError(t, txn.PutLayer(idx))
+	require.NoError(t, txn.Commit(&domain.ImageRecord{
+		ID:       dig("image:dual"),
+		RefNames: []string{"registry.example/app:v1"},
+		Source:   domain.SourceRegistry,
+		Platform: "linux/amd64",
+		Layers:   []domain.Layer{{Index: 0, DiffID: idx.DiffID}},
+	}))
+
+	ctx := context.Background()
+	got, err := s.UpgradeProvenance(ctx, dig("image:dual"), Provenance{
+		RefNames: []string{"registry.example/app:v1", "example:v1"},
+		Source:   domain.SourceFixture,
+		Pinned:   true,
+	})
+	require.NoError(t, err)
+	assert.True(t, got.Pinned, "a pinned ingest of an image already present must pin it")
+	assert.Equal(t, domain.SourceFixture, got.Source)
+	assert.Equal(t, []string{"registry.example/app:v1", "example:v1"}, got.RefNames,
+		"refNames merge, in order, without duplicates")
+
+	reloaded, err := s.Image(ctx, dig("image:dual"))
+	require.NoError(t, err)
+	assert.True(t, reloaded.Pinned, "and it is durable, not just in memory")
+	assert.Equal(t, diskBytes(t, s), s.UsedBytes(), "the rewrite is reaccounted")
+
+	// Pinning never reverses, and a no-op upgrade does not touch the file.
+	path, err := imagePathFor(root, dig("image:dual"))
+	require.NoError(t, err)
+	before, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+	again, err := s.UpgradeProvenance(ctx, dig("image:dual"), Provenance{
+		RefNames: []string{"example:v1"},
+		Source:   domain.SourceFixture,
+	})
+	require.NoError(t, err)
+	assert.True(t, again.Pinned, "an unpinned ingest must not unpin an image")
+	after, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "an upgrade that changes nothing must not rewrite the record")
+
+	_, err = s.UpgradeProvenance(ctx, dig("image:absent"), Provenance{Pinned: true})
+	assert.ErrorIs(t, err, domain.ErrNotFound)
 }

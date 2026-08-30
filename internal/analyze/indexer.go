@@ -35,6 +35,13 @@ const (
 	whiteoutPrefix = ".wh."
 	// whiteoutOpaqueDir hides every lower-layer child of its directory.
 	whiteoutOpaqueDir = ".wh..wh..opq"
+	// whiteoutMetaPrefix marks aufs bookkeeping members (".wh..wh.plnk",
+	// ".wh..wh.orph", ".wh..wh.aufs", ...). They name no filesystem path
+	// at all, so treating them as whiteouts of ".wh." + the rest would
+	// fabricate deletions of paths that never existed. Docker's
+	// pkg/archive skips this prefix outright and so do we — the opaque
+	// marker, which shares the prefix, is recognized before this check.
+	whiteoutMetaPrefix = ".wh..wh."
 )
 
 // copyBufferSize is the scratch buffer the indexer reuses to drain every file
@@ -250,9 +257,20 @@ func (s *indexState) add(hdr *tar.Header, body io.Reader) error {
 		// the directory it makes opaque.
 		s.putMarker(domain.Entry{Path: dir, Kind: domain.KindOpaque})
 		return nil
+	case strings.HasPrefix(base, whiteoutMetaPrefix):
+		// aufs metadata, not a whiteout of anything. Skipped rather
+		// than recorded: a phantom marker would inflate EntryCount and
+		// change the changeset digest of a layer whose filesystem
+		// content is unaffected.
+		s.warn("skipped aufs metadata entry %q", hdr.Name)
+		return nil
 	case strings.HasPrefix(base, whiteoutPrefix):
 		name := strings.TrimPrefix(base, whiteoutPrefix)
-		if name == "" {
+		// "" (".wh."), "." (".wh..") and ".." (".wh...") name no
+		// sibling. path.Join would normalize the last two away and
+		// hand us a whiteout of the parent directory — deleting a
+		// whole subtree on the strength of a malformed member.
+		if name == "" || name == "." || name == ".." {
 			s.warn("skipped malformed whiteout entry %q", hdr.Name)
 			return nil
 		}

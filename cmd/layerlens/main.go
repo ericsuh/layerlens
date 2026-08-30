@@ -42,6 +42,27 @@ const (
 	maxHeaderBytes = 64 << 10
 )
 
+// defaultAllowedRegistries is the ARCHITECTURE §7.1 host allowlist, reported
+// verbatim by GET /api/v1/meta so the UI can name the registries a pull may
+// target instead of hardcoding a second copy of the list.
+//
+// This is the display half only. Phase 008 owns the matching rule (label-
+// boundary globs, the port and scheme refusals) and the enforcement point; the
+// contract here is just that the field says what the server will actually
+// accept rather than being an empty list the UI has to guess around.
+var defaultAllowedRegistries = []string{
+	"docker.io",
+	"index.docker.io",
+	"registry-1.docker.io",
+	"ghcr.io",
+	"gcr.io",
+	"*.gcr.io",
+	"*.pkg.dev",
+	"public.ecr.aws",
+	"*.dkr.ecr.*.amazonaws.com",
+	"*.azurecr.io",
+}
+
 // dockerSocketPath is the local endpoint probed when neither --docker-host nor
 // $DOCKER_HOST is set (ARCHITECTURE §1.3). A variable so tests can point the
 // autodetect at a path they control.
@@ -183,11 +204,12 @@ func run(ctx context.Context, cfg *config, log *slog.Logger, ready func(net.Addr
 	loaded := startFixtureLoad(ctx, cfg, log, ingester)
 
 	opts := server.Options{
-		Logger:  log,
-		Images:  store,
-		Layers:  store,
-		Cache:   store,
-		Version: version,
+		Logger:            log,
+		Images:            store,
+		Layers:            store,
+		Cache:             store,
+		Version:           version,
+		AllowedRegistries: defaultAllowedRegistries,
 		Ready: func() bool {
 			select {
 			case <-loaded:

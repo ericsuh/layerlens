@@ -59,6 +59,16 @@ func Diff(l, r *domain.Node) *domain.DiffNode {
 		// the other is a leaf here: the vanished subtree is not part of
 		// the comparison, matching §4.3 and the overlay behaviour that
 		// a type change hides everything below it.
+		//
+		// Its bytes are therefore absent from this row's Agg and from
+		// every ancestor's — the documented dir↔file exception in
+		// §6.5. Counting them into LeftBytes/LeftFiles instead would
+		// put bytes into a total that no reachable row accounts for and
+		// break §4.4's `Agg == Σ children.Agg`, which is what lets a
+		// client reconcile a parent against the page it just expanded.
+		// A client detects the case from the wire — status "modified"
+		// with left.kind "dir" and a right.kind that is not — and
+		// labels the row rather than silently under-reporting.
 		if metaDiffers(l, r) {
 			d.Status = domain.StatusModified
 		} else {
@@ -130,6 +140,7 @@ func metaOf(n *domain.Node) *domain.SideMeta {
 		Xattrs:     n.Xattrs,
 		LinkTarget: n.LinkTarget,
 		ContentSHA: n.ContentSHA,
+		Implicit:   n.Implicit,
 	}
 }
 

@@ -110,14 +110,52 @@ func TestIndexLayerWhiteouts(t *testing.T) {
 
 	t.Run("malformed_whiteout_warned", func(t *testing.T) {
 		t.Parallel()
+		// ".wh." names no sibling; ".wh.." and ".wh..." trim to "."
+		// and "..", which path.Join would normalize away — leaving a
+		// whiteout of the PARENT directory. A single malformed member
+		// would then delete a whole subtree from every lower layer.
+		for _, name := range []string{"app/.wh.", "app/.wh..", "app/.wh..."} {
+			raw := tartest.New().
+				Raw(tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644}, "").
+				File("app/keep", "k").
+				Bytes()
+			idx := indexTar(t, raw)
+			assert.Equal(t, []string{"/app/keep"}, paths(idx),
+				"%q must produce no marker at all", name)
+			require.Len(t, idx.Warnings, 1)
+			assert.Contains(t, idx.Warnings[0], "malformed whiteout")
+		}
+	})
+
+	t.Run("aufs_metadata_skipped", func(t *testing.T) {
+		t.Parallel()
+		// ".wh..wh.*" is aufs bookkeeping, not a whiteout of anything
+		// — Docker's pkg/archive skips the prefix outright. Recording
+		// them as whiteouts of "wh.aufs" and friends would fabricate
+		// deletions, inflate EntryCount and move the changeset digest
+		// of a layer whose filesystem content never changed.
 		raw := tartest.New().
-			Raw(tar.Header{Typeflag: tar.TypeReg, Name: "app/.wh.", Mode: 0o644}, "").
+			Dir("app").
+			Raw(tar.Header{Typeflag: tar.TypeReg, Name: ".wh..wh.aufs", Mode: 0o644}, "").
+			Raw(tar.Header{Typeflag: tar.TypeDir, Name: ".wh..wh.plnk/", Mode: 0o755}, "").
+			Raw(tar.Header{Typeflag: tar.TypeDir, Name: ".wh..wh.orph/", Mode: 0o755}, "").
 			File("app/keep", "k").
 			Bytes()
 		idx := indexTar(t, raw)
-		assert.Equal(t, []string{"/app/keep"}, paths(idx))
-		require.Len(t, idx.Warnings, 1)
-		assert.Contains(t, idx.Warnings[0], "malformed whiteout")
+
+		assert.Equal(t, []string{"/app", "/app/keep"}, paths(idx))
+		assert.Equal(t, 2, len(idx.Entries), "phantom markers would inflate entryCount")
+		require.Len(t, idx.Warnings, 3)
+		for _, w := range idx.Warnings {
+			assert.Contains(t, w, "aufs metadata")
+		}
+
+		// The opaque marker shares the prefix and must still be
+		// recognized: it is checked before the metadata rule.
+		opaque := indexTar(t, tartest.New().Dir("var/cache").Opaque("var/cache").Bytes())
+		require.Len(t, opaque.Entries, 2)
+		assert.Equal(t, domain.KindOpaque, opaque.Entries[1].Kind)
+		assert.Empty(t, opaque.Warnings)
 	})
 }
 

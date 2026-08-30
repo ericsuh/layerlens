@@ -2,9 +2,11 @@ package server_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -135,4 +137,108 @@ func TestComparisonCacheReusesAndEvicts(t *testing.T) {
 
 	fetch(disjoint, nil)
 	assert.Equal(t, int32(5), assemblies.Load(), "…and the two most recent are still resident")
+}
+
+// TestSquashPeakScalesWithOneLayerNotLayerCount is ARCHITECTURE §4.6's
+// "per-layer index being loaded — transient per layer", asserted as a fact
+// rather than a table row.
+//
+// The server used to load every layer index into a slice before squashing, so
+// peak memory was Σ over layers: 30 layers × 50k entries measured at 512 MiB
+// for a squashed tree holding only 50k paths, and both sides of a comparison
+// put it near a gigabyte well below the 500k-file target. Applying and
+// dropping each index makes the resident set the tree plus one index, whatever
+// the layer count.
+//
+// The measurement is taken from inside the store, at the moment the LAST layer
+// is requested: that is the point of maximum retention, and it is the only
+// place a test can observe the squasher's working set. Two layer counts over
+// the SAME set of paths isolate the variable — the tree is identical in both
+// runs, so any difference in heap is the indexes.
+func TestSquashPeakScalesWithOneLayerNotLayerCount(t *testing.T) {
+	if raceEnabled {
+		t.Skip("heap measurements are not meaningful under the race detector")
+	}
+	// Deliberately not parallel: the assertion reads a process-wide heap.
+
+	const entriesPerLayer = 50_000
+	const few, many = 5, 30
+
+	fewHeap := heapAtLastLayer(t, few, entriesPerLayer)
+	manyHeap := heapAtLastLayer(t, many, entriesPerLayer)
+
+	// One index's worth of entries, measured the same way so the budget is
+	// in the units the thing under test actually allocates.
+	perIndex := heapOfOneIndex(t, entriesPerLayer)
+
+	t.Logf("%d entries/layer: %d layers → %d MiB resident, %d layers → %d MiB resident, one index ≈ %d MiB",
+		entriesPerLayer, few, fewHeap>>20, many, manyHeap>>20, perIndex>>20)
+
+	// Six times the layers, at most one more index resident. Retaining
+	// them all would cost (many-few) × perIndex ≈ 25 indexes more.
+	assert.Less(t, manyHeap, fewHeap+perIndex,
+		"squashing %d layers held %d bytes against %d for %d layers: peak is scaling with the layer count",
+		many, manyHeap, fewHeap, few)
+	assert.Less(t, manyHeap, uint64(perIndex)*4,
+		"the resident set must be the tree plus about one layer index")
+}
+
+// heapAtLastLayer squashes an image of layerCount layers, each restating the
+// same entriesPerLayer paths, and returns the live heap at the moment the last
+// index is requested.
+func heapAtLastLayer(t *testing.T, layerCount, entriesPerLayer int) uint64 {
+	t.Helper()
+
+	store := newSynthStore()
+	builders := make([]func() []domain.Entry, 0, layerCount)
+	for i := range layerCount {
+		builders = append(builders, flatLayer(entriesPerLayer, fmt.Sprintf("v%d", i)))
+	}
+	left := store.addImage("stack:v1", builders...)
+	// The right side is compared at layer point 0 — the legal empty
+	// filesystem — so exactly one squash is measured.
+	right := store.addImage("stack:empty", flatLayer(1, "empty"))
+
+	var peak uint64
+	store.onLoad = func(nth int) {
+		if nth != layerCount-1 {
+			return
+		}
+		// At this point layerCount-1 indexes have been applied. Under
+		// the old implementation every one of them is still reachable
+		// from the slice; under this one they are garbage, and the GC
+		// is what turns "unreachable" into "not resident".
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		peak = m.HeapAlloc
+	}
+
+	srv := server.New(server.Options{
+		Logger: discardLogger(), UI: emptyUI(), Images: store, Layers: store,
+	})
+	var page server.TreePage
+	getJSON(t, srv, treeURL(left, right, url.Values{
+		"path":        {"/data"},
+		"rightLayers": {"0"},
+		"limit":       {"1"},
+	}), &page)
+	require.Equal(t, entriesPerLayer, page.TotalRows, "the squashed tree really holds every path")
+	require.NotZero(t, peak, "the measurement hook never fired")
+	return peak
+}
+
+// heapOfOneIndex is the live heap cost of a single decoded layer index of the
+// same shape, so the budget above is expressed in the units being measured.
+func heapOfOneIndex(t *testing.T, entriesPerLayer int) uint64 {
+	t.Helper()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	entries := flatLayer(entriesPerLayer, "measure")()
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	require.Len(t, entries, entriesPerLayer+1)
+	runtime.KeepAlive(entries)
+	return after.HeapAlloc - before.HeapAlloc
 }

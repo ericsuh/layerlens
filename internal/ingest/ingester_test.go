@@ -363,3 +363,39 @@ func writeJSON(t *testing.T, path string, v any) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(path, data, 0o600))
 }
+
+// TestReingestUpgradesProvenance is the m8 case that actually bites: an image
+// a registry pull happened to fetch first, then loaded again as a vendored
+// fixture. The blobs are identical, so nothing is re-analyzed — but the
+// pinning is not a property of the blobs, and an unpinned fixture is a fixture
+// the LRU is free to delete.
+func TestReingestUpgradesProvenance(t *testing.T) {
+	s := newStore(t, t.TempDir(), 1<<30)
+	ing := newIngester(s)
+	ctx := context.Background()
+	img := loadExamplePair(t)["example:v1"]
+
+	first, err := ing.Ingest(ctx, img, ingest.Meta{
+		RefNames: []string{"registry.example/example:v1"},
+		Source:   domain.SourceRegistry,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Record.Pinned)
+
+	second, err := ing.Ingest(ctx, img, ingest.Meta{
+		RefNames: []string{"example:v1"},
+		Source:   domain.SourceFixture,
+		Pinned:   true,
+	})
+	require.NoError(t, err)
+	assert.True(t, second.AlreadyPresent, "the analysis is still not redone")
+	assert.Equal(t, 8, second.LayersSkipped)
+	assert.True(t, second.Record.Pinned, "…but the fixture is now safe from the LRU")
+	assert.Equal(t, domain.SourceFixture, second.Record.Source)
+	assert.Equal(t, []string{"registry.example/example:v1", "example:v1"}, second.Record.RefNames,
+		"both names the image is known by survive")
+
+	stored, err := s.Image(ctx, second.Record.ID)
+	require.NoError(t, err)
+	assert.True(t, stored.Pinned, "and it is on disk, not just in the returned copy")
+}

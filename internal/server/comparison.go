@@ -85,8 +85,9 @@ func (c *comparisonCache) get(ctx context.Context, key comparisonKey,
 			return inflight.cmp, inflight.err
 		case <-ctx.Done():
 			// Only this caller gives up: the assembly it was
-			// waiting on runs on a context of its own, so the
-			// other waiters are unaffected.
+			// waiting on runs on a context of its own (see the
+			// WithoutCancel below), so the other waiters are
+			// unaffected.
 			return nil, ctx.Err()
 		}
 	}
@@ -97,7 +98,14 @@ func (c *comparisonCache) get(ctx context.Context, key comparisonKey,
 	if c.onAssembled != nil {
 		c.onAssembled()
 	}
-	cmp, err := assemble(ctx)
+	// Detached deliberately, and here rather than at the call site: one
+	// assembly serves every waiter on the same key, so the client that
+	// happened to arrive first must not be able to cancel work the others
+	// are blocked on by navigating away. Leaving that to the caller made
+	// the comment above true only by luck. The work is bounded (one
+	// comparison) and its result is cached for whoever asks next; values
+	// on the context — deadlines aside — still reach the assembler.
+	cmp, err := assemble(context.WithoutCancel(ctx))
 
 	c.mu.Lock()
 	delete(c.inflight, key)
@@ -169,18 +177,45 @@ func (s *Server) assembleComparison(ctx context.Context, left, right *domain.Ima
 	}, nil
 }
 
-// squash folds an image's first n layers into a cumulative filesystem tree.
+// squash folds an image's first n layers into a cumulative filesystem tree,
+// applying each layer index and dropping it before the next is loaded.
+//
+// That is the difference between §4.6's budget and the sum over layers:
+// analyze.Squash's slice parameter would hold all n indexes resident at once,
+// so a 30-layer image peaked at 30 layer indexes plus the tree. Here the
+// resident set is the cumulative tree plus exactly one index, whatever n is.
 func (s *Server) squash(ctx context.Context, rec *domain.ImageRecord, n int) (*domain.Node, error) {
-	indexes := make([]domain.LayerIndex, 0, n)
+	sq := analyze.NewSquasher()
 	for i := 0; i < n; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		idx, err := s.layers.LayerIndex(ctx, rec.Layers[i].DiffID)
 		if err != nil {
-			return nil, fmt.Errorf("load layer %d of %s: %w", i, rec.ID, err)
+			// Named with the image this layer belongs to: an
+			// evicted-layer 404 has to tell the client WHICH of
+			// the two images to refetch, and both sides run
+			// through here.
+			return nil, &imageError{
+				id:  rec.ID,
+				err: fmt.Errorf("load layer %d of %s: %w", i, rec.ID, err),
+			}
 		}
-		indexes = append(indexes, *idx)
+		// idx dies here: it is scoped to this iteration and the tree
+		// copied everything it keeps, so the next load reuses this
+		// one's memory instead of adding to it.
+		sq.Apply(idx.Entries)
 	}
-	return analyze.Squash(indexes), nil
+	return sq.Tree(), nil
 }
+
+// imageError attributes a failure to one of the two images in a comparison, so
+// the error envelope can name the image the client must refetch rather than
+// always naming the left one.
+type imageError struct {
+	id  domain.Digest
+	err error
+}
+
+func (e *imageError) Error() string { return e.err.Error() }
+func (e *imageError) Unwrap() error { return e.err }

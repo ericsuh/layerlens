@@ -40,7 +40,11 @@ const xattrPrefix = "SCHILY.xattr."
 // is for.
 //
 // The result is independent of the order in which entries are supplied: a copy
-// is sorted by path first, so a layer's digest does not depend on tar ordering.
+// is sorted by (path, kind) first, so a layer's digest does not depend on tar
+// ordering. The kind is part of the sort key because one path can legitimately
+// hold two entries — a filesystem object and its whiteout or opaque marker —
+// and sorting by path alone would leave their relative order to the sort's
+// (unstable) internal choices.
 func ChangesetDigest(entries []domain.Entry) domain.Digest {
 	return changesetDigest(ChangesetSchemeVersion, entries)
 }
@@ -53,8 +57,16 @@ func changesetDigest(version byte, entries []domain.Entry) domain.Digest {
 	for i := range ordered {
 		ordered[i] = i
 	}
-	sort.Slice(ordered, func(a, b int) bool {
-		return entries[ordered[a]].Path < entries[ordered[b]].Path
+	// (Path, Kind), exactly the order indexState.finish writes, so the two
+	// orderings cannot drift apart. sort.SliceStable keeps the result
+	// deterministic even for a caller that supplies two entries identical
+	// in both keys.
+	sort.SliceStable(ordered, func(a, b int) bool {
+		x, y := &entries[ordered[a]], &entries[ordered[b]]
+		if x.Path != y.Path {
+			return x.Path < y.Path
+		}
+		return x.Kind < y.Kind
 	})
 
 	h := sha256.New()

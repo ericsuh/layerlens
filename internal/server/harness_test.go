@@ -152,3 +152,9 @@ func treeURL(left, right domain.Digest, extra url.Values) string {
 func layersURL(left, right domain.Digest) string {
 	return fmt.Sprintf("%s/diff/layers?left=%s&right=%s", server.APIPrefix, left, right)
 }
+
+// emptyUI is the SPA stand-in for a server built around a synthetic store,
+// where no fixture cache is involved.
+func emptyUI() http.Handler {
+	return webui.HandlerFS(fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte(indexHTML)}})
+}

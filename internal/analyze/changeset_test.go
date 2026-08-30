@@ -1,6 +1,7 @@
 package analyze_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -281,4 +282,64 @@ func TestFilterXattrs(t *testing.T) {
 			assert.Equal(t, tc.want, analyze.FilterXattrs(tc.pax))
 		})
 	}
+}
+
+// TestChangesetDigestOrderIndependenceWithMarkers is the case four distinct
+// paths cannot catch: one path holding BOTH a filesystem object and its
+// whiteout marker — the standard overlay representation of "delete x, then
+// recreate x in this same layer". Sorting by path alone leaves their relative
+// order to the sort's internal choices, so the digest of a layer would depend
+// on the order the entries happened to arrive in, contradicting the doc
+// comment and the §3.1 claim that the digest is a property of the changeset.
+func TestChangesetDigestOrderIndependenceWithMarkers(t *testing.T) {
+	t.Parallel()
+
+	object := domain.Entry{Path: "/var/cache/x", Kind: domain.KindFile, Mode: 0o644, Size: 3,
+		ContentSHA: domain.MustDigest("sha256:" + strings.Repeat("ab", 32))}
+	marker := domain.Entry{Path: "/var/cache/x", Kind: domain.KindWhiteout}
+	dir := domain.Entry{Path: "/var/cache", Kind: domain.KindDir, Mode: 0o755}
+	opaque := domain.Entry{Path: "/var/cache", Kind: domain.KindOpaque}
+
+	orders := [][]domain.Entry{
+		{dir, opaque, object, marker},
+		{marker, object, opaque, dir},
+		{opaque, dir, marker, object},
+		{object, dir, marker, opaque},
+	}
+	want := analyze.ChangesetDigest(orders[0])
+	for i, entries := range orders[1:] {
+		assert.Equal(t, want, analyze.ChangesetDigest(entries),
+			"ordering %d of the same changeset must hash the same", i+1)
+	}
+
+	// And the two entries at one path are still distinguished: dropping
+	// the marker must change the digest, or the sort key would be hiding
+	// real content.
+	assert.NotEqual(t, want, analyze.ChangesetDigest([]domain.Entry{dir, opaque, object}))
+}
+
+// TestChangesetDigestIgnoresDirectorySizeAndContent is the §3.2 guarantee made
+// structural: the digest and the diff tree's modified predicate share one
+// field projection, and that projection zeroes a directory's size and content
+// hash. A tar's directory `size` field is meaningless, so a writer that sets it
+// must not be able to make the digest disagree with the predicate — which
+// suppresses the difference either way.
+func TestChangesetDigestIgnoresDirectorySizeAndContent(t *testing.T) {
+	t.Parallel()
+
+	plain := domain.Entry{Path: "/app", Kind: domain.KindDir, Mode: 0o755}
+	noisy := plain
+	noisy.Size = 4096
+	noisy.ContentSHA = domain.MustDigest("sha256:" + strings.Repeat("cd", 32))
+
+	assert.Equal(t, analyze.ChangesetDigest([]domain.Entry{plain}),
+		analyze.ChangesetDigest([]domain.Entry{noisy}),
+		"a directory has neither a size nor a content hash, on either side of the guarantee")
+
+	// The same two fields on a regular file are still load-bearing.
+	file := domain.Entry{Path: "/app", Kind: domain.KindFile, Mode: 0o755}
+	sized := file
+	sized.Size = 4096
+	assert.NotEqual(t, analyze.ChangesetDigest([]domain.Entry{file}),
+		analyze.ChangesetDigest([]domain.Entry{sized}))
 }

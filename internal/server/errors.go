@@ -78,6 +78,14 @@ func imageNotFound(w http.ResponseWriter, id domain.Digest) {
 // Anything unrecognized is an internal error whose detail stays in the log:
 // §6.1 requires a generic message for 500s.
 func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, err error, id domain.Digest) {
+	// A failure that knows which image it belongs to overrides the
+	// caller's guess: a comparison touches two images, and telling a
+	// client to refetch the left one when the right one was evicted sends
+	// it round the loop again.
+	var attributed *imageError
+	if errors.As(err, &attributed) {
+		id = attributed.id
+	}
 	switch {
 	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrNotIndexed):
 		// A layer index that vanished under us means the image was

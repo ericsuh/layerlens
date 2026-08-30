@@ -35,9 +35,10 @@ type tarsumFields struct {
 }
 
 // fieldsOfEntry projects a changeset entry onto the field set. It normalizes
-// nothing beyond the mode mask: the entry is what the tar said.
+// nothing beyond the mode mask and the directory projection below: the entry is
+// otherwise what the tar said.
 func fieldsOfEntry(e *domain.Entry) tarsumFields {
-	return tarsumFields{
+	f := tarsumFields{
 		Kind:       e.Kind,
 		Mode:       e.Mode & domain.ModePermMask,
 		UID:        e.UID,
@@ -51,14 +52,27 @@ func fieldsOfEntry(e *domain.Entry) tarsumFields {
 		Xattrs:     e.Xattrs,
 		ContentSHA: e.ContentSHA,
 	}
+	projectDir(&f)
+	return f
 }
 
-// fieldsOfNode projects a cumulative-tree node onto the same field set.
-//
-// Directories are forced to carry no size and no content hash: a directory has
-// neither, and the tar `size` field of a directory member is meaningless. That
-// keeps a stray header value from ever reading as a directory "modification"
-// (ARCHITECTURE §4.3).
+// projectDir applies the one normalization both projections must share: a
+// directory has neither a size nor a content hash, and the tar `size` field of
+// a directory member is meaningless. Applying it in exactly one place is what
+// makes §3.2's "the digest and the modified predicate cannot disagree"
+// structural rather than a promise kept by two parallel field lists.
+func projectDir(f *tarsumFields) {
+	if f.Kind != domain.KindDir {
+		return
+	}
+	f.Size = 0
+	f.ContentSHA = ""
+}
+
+// fieldsOfNode projects a cumulative-tree node onto the same field set,
+// through the same directory projection, so a stray header value can never
+// read as a directory "modification" on one side of the guarantee and as a
+// digest difference on the other (ARCHITECTURE §3.2, §4.3).
 func fieldsOfNode(n *domain.Node) tarsumFields {
 	f := tarsumFields{
 		Kind:       n.Kind,
@@ -74,10 +88,7 @@ func fieldsOfNode(n *domain.Node) tarsumFields {
 		Xattrs:     n.Xattrs,
 		ContentSHA: n.ContentSHA,
 	}
-	if n.Kind == domain.KindDir {
-		f.Size = 0
-		f.ContentSHA = ""
-	}
+	projectDir(&f)
 	return f
 }
 

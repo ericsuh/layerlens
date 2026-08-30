@@ -641,3 +641,29 @@ func sixLayerStack() []domain.LayerIndex {
 		),
 	}
 }
+
+// TestSquasherMatchesSquash: the incremental API and the slice API are the
+// same fold. Squash's callers (and its own tests) keep working precisely
+// because Squash is now expressed in terms of the squasher rather than
+// duplicating it.
+func TestSquasherMatchesSquash(t *testing.T) {
+	t.Parallel()
+
+	indexes := []domain.LayerIndex{
+		layer(dirEntry("/app"), fileEntry("/app/a", "one"), fileEntry("/app/b", "two")),
+		layer(whiteoutEntry("/app/a"), fileEntry("/app/c", "three")),
+		layer(opaqueEntry("/app"), fileEntry("/app/d", "four")),
+		layer(fileEntry("/app/e/deep", "five")),
+	}
+
+	incremental := analyze.NewSquasher()
+	for i := range indexes {
+		incremental.Apply(indexes[i].Entries)
+	}
+
+	assert.Equal(t, treeLines(analyze.Squash(indexes)), treeLines(incremental.Tree()))
+
+	// Applying nothing is the legal empty filesystem at layer point 0, and
+	// it matches Squash(nil) rather than being a special case.
+	assert.Equal(t, treeLines(analyze.Squash(nil)), treeLines(analyze.NewSquasher().Tree()))
+}

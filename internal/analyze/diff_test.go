@@ -407,6 +407,21 @@ func TestDiffDirectoryStatus(t *testing.T) {
 		assert.Empty(t, x.Children, "a type change hides the subtree below it (§4.3)")
 		assert.Equal(t, domain.KindDir, x.Left.Kind)
 		assert.Equal(t, domain.KindFile, x.Right.Kind)
+
+		// The documented §6.5 exception, pinned so it stays a decision
+		// rather than becoming an accident: the vanished subtree's
+		// bytes are NOT in the side totals. /x/inner's five bytes are
+		// gone from LeftBytes because /x/inner is not a row of this
+		// comparison, and counting them here would put bytes in a
+		// total that no reachable row accounts for — breaking §4.4's
+		// `Agg == Σ children.Agg`, which is what lets a client
+		// reconcile a parent against the page it just expanded.
+		assert.Zero(t, x.Agg.LeftBytes)
+		assert.Zero(t, x.Agg.LeftFiles)
+		assert.Equal(t, int64(len("now a file")), x.Agg.RightBytes)
+		// The client detects the case from the wire and labels the row:
+		// modified, left is a dir, right is not.
+		assert.NotEqual(t, x.Left.Kind, x.Right.Kind)
 	})
 }
 

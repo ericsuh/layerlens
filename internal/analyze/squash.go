@@ -33,17 +33,52 @@ const implicitDirMode uint32 = 0o755
 // The returned tree owns its nodes; the caller may mutate or drop it freely.
 // Whiteout and opaque entries are consumed here and never reach a Node.
 func Squash(indexes []domain.LayerIndex) *domain.Node {
+	s := NewSquasher()
+	for i := range indexes {
+		s.Apply(indexes[i].Entries)
+	}
+	return s.Tree()
+}
+
+// Squasher folds layers into a cumulative tree one at a time.
+//
+// It exists so that a caller loading indexes from the cache can apply each one
+// and drop it before loading the next: Squash's slice parameter forces every
+// index to be resident simultaneously, which makes peak memory the sum over
+// layers instead of ARCHITECTURE §4.6's budgeted "one layer index in flight".
+// A 30-layer image is the difference between hundreds of megabytes and one
+// layer's worth.
+//
+// The entries handed to Apply may be released as soon as it returns: the tree
+// keeps the strings and xattr maps of the paths that survive to the top, which
+// is exactly the retained set the budget accounts for.
+//
+// A Squasher is not safe for concurrent use.
+type Squasher struct {
+	root *domain.Node
+}
+
+// NewSquasher returns a squasher over an empty filesystem — the legal state at
+// layer point 0.
+func NewSquasher() *Squasher {
 	root := newDir(RootPath)
 	// The root is synthetic: no layer can carry an entry for "/" (the
 	// indexer drops root-named members), so its 0755 must never read as a
 	// difference between two images.
 	root.Implicit = true
-
-	for i := range indexes {
-		applyLayer(root, indexes[i].Entries)
-	}
-	return root
+	return &Squasher{root: root}
 }
+
+// Apply folds one layer's changeset into the cumulative tree. Layers must be
+// applied in rootfs order, oldest first.
+func (s *Squasher) Apply(entries []domain.Entry) {
+	applyLayer(s.root, entries)
+}
+
+// Tree returns the cumulative tree. The squasher keeps no other reference the
+// caller has to worry about: the tree owns its nodes and may be mutated or
+// dropped freely, though applying further layers keeps mutating this same tree.
+func (s *Squasher) Tree() *domain.Node { return s.root }
 
 // applyLayer applies one layer's changeset to the cumulative tree.
 func applyLayer(root *domain.Node, entries []domain.Entry) {

@@ -68,6 +68,14 @@ type SideMeta struct {
 	Xattrs     map[string]string
 	LinkTarget string
 	ContentSHA Digest
+	// Implicit mirrors Node.Implicit: this directory was never named by
+	// any layer header and its mode, uid and gid are values squashing
+	// invented so a child could have a parent. It is carried onto the wire
+	// so a client renders "—" rather than a fabricated 0755 (§4.2).
+	//
+	// It is deliberately NOT part of the tarsum-v1 field set: it says
+	// where the metadata came from, not what it is.
+	Implicit bool
 }
 
 // Agg is the bottom-up aggregation over a diff subtree (§4.4). The invariant

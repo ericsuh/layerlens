@@ -192,6 +192,13 @@ func TestRestartPreservesAnalyzedImages(t *testing.T) {
 	var meta server.MetaResponse
 	getAPI(t, base, server.APIPrefix+"/meta", &meta)
 	require.Positive(t, meta.CacheBytesUsed)
+	// §6.6: the UI reads this list to name the registries a pull may
+	// target. An empty list is not "no policy", it is a field the client
+	// cannot use — the plumbing has to reach the binary, not just the
+	// Options struct.
+	assert.NotEmpty(t, meta.AllowedRegistries,
+		"the binary must report the registries it will accept, not an empty list")
+	assert.Contains(t, meta.AllowedRegistries, "ghcr.io")
 
 	stop()
 	waitForRun(t, errCh)

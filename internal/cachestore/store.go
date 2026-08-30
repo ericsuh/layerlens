@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -77,6 +78,26 @@ type Store struct {
 	// by the evictor.
 	inflight map[*Txn]struct{}
 	trashSeq uint64
+
+	// layerLocks is ARCHITECTURE §5's "a mutex per layer digest". PutLayer
+	// is check-then-act — miss, write, reserve, commit, install — and two
+	// transactions putting the same DiffID would both miss, both reserve
+	// and both install, charging the same directory to the accounting
+	// twice. Eviction later subtracts once, so the drift is monotonic and
+	// a long-running server eventually refuses `cache_full` on an empty
+	// disk. Serializing per digest makes the loser see the winner's layer
+	// and do nothing at all.
+	//
+	// Guarded by mu, entries refcounted so the map does not grow with the
+	// number of layers ever seen.
+	layerLocks map[domain.Digest]*layerLock
+}
+
+// layerLock serializes writers of one DiffID. waiters counts the goroutines
+// holding or waiting for it, so the last one out can drop it from the map.
+type layerLock struct {
+	mu      sync.Mutex
+	waiters int
 }
 
 var (
@@ -98,14 +119,15 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("cachestore: resolve root: %w", err)
 	}
 	s := &Store{
-		root:     root,
-		max:      opts.MaxBytes,
-		now:      opts.Now,
-		debounce: opts.TouchDebounce,
-		log:      opts.Logger,
-		layers:   map[domain.Digest]*layerEntry{},
-		images:   map[domain.Digest]*imageEntry{},
-		inflight: map[*Txn]struct{}{},
+		root:       root,
+		max:        opts.MaxBytes,
+		now:        opts.Now,
+		debounce:   opts.TouchDebounce,
+		log:        opts.Logger,
+		layers:     map[domain.Digest]*layerEntry{},
+		images:     map[domain.Digest]*imageEntry{},
+		inflight:   map[*Txn]struct{}{},
+		layerLocks: map[domain.Digest]*layerLock{},
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -507,6 +529,10 @@ func (t *Txn) UseLayer(diffID domain.Digest) (LayerSummary, bool) {
 // PutLayer stores idx unless its DiffID is already indexed, and in either case
 // records the dependency so the layer survives until the image record commits.
 //
+// Concurrent puts of the same DiffID — the normal case once pulls run in
+// parallel — are serialized on that digest, so exactly one of them writes the
+// layer and charges it to the accounting; the rest take the UseLayer path.
+//
 // Returns ErrCacheFull when the image cannot fit under the cap.
 func (t *Txn) PutLayer(idx *domain.LayerIndex) error {
 	if t.done {
@@ -518,6 +544,11 @@ func (t *Txn) PutLayer(idx *domain.LayerIndex) error {
 	if _, err := pathComponent(idx.DiffID); err != nil {
 		return err
 	}
+	// Taken around the WHOLE check-write-commit-install sequence, not just
+	// the check: a lock released before the install would leave exactly the
+	// window it exists to close.
+	unlock := t.s.lockLayer(idx.DiffID)
+	defer unlock()
 	if _, ok := t.UseLayer(idx.DiffID); ok {
 		return nil
 	}
@@ -570,10 +601,48 @@ func (t *Txn) PutLayer(idx *domain.LayerIndex) error {
 		Warnings:        doc.Warnings,
 	}
 	t.s.mu.Lock()
+	// Re-checked under the store lock even though the digest lock is held:
+	// belt and braces against any future path that installs a layer entry
+	// without it. Whoever got there first owns the accounting; ours is
+	// released rather than added, so `accounted` keeps matching the bytes
+	// that are actually on disk.
+	if _, dup := t.s.layers[idx.DiffID]; dup {
+		t.layers[idx.DiffID] = struct{}{}
+		t.s.mu.Unlock()
+		t.s.release(t, total)
+		return nil
+	}
 	t.s.layers[idx.DiffID] = &layerEntry{summary: summary, bytes: total}
 	t.layers[idx.DiffID] = struct{}{}
 	t.s.mu.Unlock()
 	return nil
+}
+
+// lockLayer acquires the per-digest write lock and returns its release.
+//
+// The refcount is what keeps the map bounded: a cache that has seen a million
+// layers over its lifetime holds a mutex only for the ones being written right
+// now.
+func (s *Store) lockLayer(diffID domain.Digest) func() {
+	s.mu.Lock()
+	l, ok := s.layerLocks[diffID]
+	if !ok {
+		l = &layerLock{}
+		s.layerLocks[diffID] = l
+	}
+	l.waiters++
+	s.mu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.mu.Lock()
+		l.waiters--
+		if l.waiters == 0 {
+			delete(s.layerLocks, diffID)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // commitLayer performs the §5 commit order: create the directory, rename the
@@ -612,9 +681,18 @@ func (t *Txn) Commit(rec *domain.ImageRecord) error {
 	if err != nil {
 		return err
 	}
+	// Declared by THIS transaction, not merely present in the cache.
+	// HasLayer would accept a layer nothing holds a reference to, which
+	// the evictor is free to delete between this check and the rename —
+	// producing precisely the record-without-its-layers state the startup
+	// sweep exists to clean up. Membership in t.layers is what pins a
+	// layer against eviction (see layerReferencedLocked), so it is the
+	// only property worth checking.
 	for _, l := range rec.Layers {
-		if !t.s.HasLayer(l.DiffID) {
-			return fmt.Errorf("cachestore: image %s references uncommitted layer %s", rec.ID, l.DiffID)
+		if _, declared := t.layers[l.DiffID]; !declared {
+			return fmt.Errorf(
+				"cachestore: image %s references layer %s, which this ingest never put or used",
+				rec.ID, l.DiffID)
 		}
 	}
 
@@ -670,6 +748,73 @@ func (t *Txn) finish() error {
 		return fmt.Errorf("cachestore: clean staging %s: %w", t.dir, err)
 	}
 	return nil
+}
+
+// Provenance is the part of an image record that describes where the image
+// came from rather than what is in it. It is the only mutable part: the
+// analysis is a pure function of the blobs, but the same image can arrive
+// twice by different routes.
+type Provenance struct {
+	// RefNames are merged into the record's existing list, preserving
+	// order and dropping duplicates.
+	RefNames []string
+	// Source replaces the recorded source when non-empty: the record says
+	// how the image most recently arrived.
+	Source string
+	// Pinned is monotonic — it can be set, never cleared. Pinning says
+	// "this image must survive LRU eviction", and a later unpinned ingest
+	// of the same image is not a reason to make it deletable.
+	Pinned bool
+}
+
+// UpgradeProvenance merges p into the stored record for id and returns the
+// result. It rewrites nothing when the merge is a no-op, which matters because
+// the fixture load runs on every startup: an unconditional rewrite would churn
+// every record file (and its LRU clock) on each boot.
+func (s *Store) UpgradeProvenance(ctx context.Context, id domain.Digest, p Provenance) (*domain.ImageRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	e, ok := s.images[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%w: image %s", domain.ErrNotFound, id)
+	}
+	updated := cloneRecord(&e.rec)
+	changed := false
+	if p.Source != "" && p.Source != updated.Source {
+		updated.Source = p.Source
+		changed = true
+	}
+	if p.Pinned && !updated.Pinned {
+		updated.Pinned = true
+		changed = true
+	}
+	for _, ref := range p.RefNames {
+		if ref == "" || slices.Contains(updated.RefNames, ref) {
+			continue
+		}
+		updated.RefNames = append(updated.RefNames, ref)
+		changed = true
+	}
+	if !changed {
+		out := cloneRecord(&e.rec)
+		s.mu.Unlock()
+		return &out, nil
+	}
+	// Published in memory before the file is rewritten, under the same
+	// lock that guards the table, so a concurrent reader sees old-or-new
+	// and the pin takes effect before the write that could be evicted
+	// against it.
+	e.rec = cloneRecord(&updated)
+	s.mu.Unlock()
+
+	if err := s.writeRecord(&updated); err != nil {
+		return nil, err
+	}
+	out := cloneRecord(&updated)
+	return &out, nil
 }
 
 // Touch implements domain.ImageStore: it bumps the LRU clock, debounced.

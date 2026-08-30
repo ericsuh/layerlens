@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -562,4 +563,165 @@ func sortedStrings(values []string) bool {
 		}
 	}
 	return true
+}
+
+// TestTreeMaxLegalRequestIsBounded is the assertion TestTreeDefaultPageIsBounded
+// could not make: not "the default page is small" but "the LARGEST request the
+// server accepts is small".
+//
+// depth=2 with limit=1000 used to embed min(limit, len(children)) grandchildren
+// under each of 1000 rows — a million rows and a 311 MiB body from one legal
+// request, concurrency-multiplied, against a §4.6 ceiling of 1.5 GiB RSS. The
+// bound is now structural: at most `limit` rows, each with at most
+// MaxEmbeddedChildren embedded children, and at most MaxEmbeddedRows embedded
+// across the whole response.
+//
+// The fan-out fixture is deliberately wider per row than the per-row cap and
+// deliberately has more rows than the budget can serve, so both limits are
+// exercised rather than merely present.
+func TestTreeMaxLegalRequestIsBounded(t *testing.T) {
+	const dirs, children = 1000, 60
+
+	store := newSynthStore()
+	left := store.addImage("fan:v1", fanOutLayer(dirs, children, "v1"))
+	right := store.addImage("fan:v2", fanOutLayer(dirs, children, "v2"))
+	srv := server.New(server.Options{
+		Logger: discardLogger(), UI: emptyUI(), Images: store, Layers: store,
+	})
+
+	target := treeURL(left, right, url.Values{
+		"path":  {"/fan"},
+		"depth": {strconv.Itoa(server.MaxTreeDepth)},
+		"limit": {strconv.Itoa(server.MaxTreeLimit)},
+	})
+	raw := body(t, doOn(t, srv, http.MethodGet, target))
+
+	var page server.TreePage
+	require.NoError(t, json.Unmarshal([]byte(raw), &page))
+
+	embedded := 0
+	for _, row := range page.Rows {
+		assert.LessOrEqual(t, len(row.Children), server.MaxEmbeddedChildren,
+			"no single row may embed more than the per-row cap")
+		assert.Equal(t, children, row.ChildCount, "the count still describes the whole directory")
+		assert.True(t, row.ChildrenTruncated,
+			"a row whose children were cut — to few or to none — must say so")
+		embedded += len(row.Children)
+	}
+	assert.Len(t, page.Rows, server.MaxTreeLimit)
+	assert.LessOrEqual(t, embedded, server.MaxEmbeddedRows,
+		"the embedded rows are budgeted across the response, not per row")
+
+	// The concrete ceiling. Rows are ~250–350 bytes of JSON and the bound
+	// is limit + MaxEmbeddedRows = 3000 of them, so 2 MiB is the budget
+	// with room for a row to grow; the pre-fix body for this same request
+	// was ~18 MiB, and ~311 MiB for a 1000×1000 tree.
+	assert.LessOrEqual(t, len(raw), 2<<20,
+		"the maximum legal request returned %d bytes", len(raw))
+	t.Logf("depth=2&limit=%d over %d dirs × %d children: %d bytes, %d rows + %d embedded",
+		server.MaxTreeLimit, dirs, children, len(raw), len(page.Rows), embedded)
+}
+
+// TestTreeMaxLegalRequestOnWidestFixtureIsBounded is the same bound measured
+// against real ingested data rather than a generated shape.
+func TestTreeMaxLegalRequestOnWidestFixtureIsBounded(t *testing.T) {
+	srv := apiServer(t)
+	raw := body(t, doOn(t, srv, http.MethodGet, treeURL(id(t, "wide:v1"), id(t, "wide:v2"), url.Values{
+		"path":  {"/data/shards"},
+		"depth": {strconv.Itoa(server.MaxTreeDepth)},
+		"limit": {strconv.Itoa(server.MaxTreeLimit)},
+	})))
+
+	assert.LessOrEqual(t, len(raw), 512*1024,
+		"the widest fixture directory at the maximum depth and limit returned %d bytes", len(raw))
+	assert.Greater(t, len(raw), 100*1024, "…while really carrying 1000 rows")
+	t.Logf("wide fixture, depth=2&limit=%d: %d bytes", server.MaxTreeLimit, len(raw))
+}
+
+// TestTreeRejectsSignedNumbers: one parameter value must have exactly one
+// spelling. strconv.Atoi accepts "+1" and "-0", which would make two spellings
+// of the same request — and a leading zero a third.
+func TestTreeRejectsSignedNumbers(t *testing.T) {
+	srv := apiServer(t)
+	left, right := id(t, "example:v1"), id(t, "example:v2")
+
+	for _, values := range []url.Values{
+		{"leftLayers": {"+1"}},
+		{"rightLayers": {"+1"}},
+		{"leftLayers": {"-0"}},
+		{"leftLayers": {"01"}},
+		{"leftLayers": {" 1"}},
+		{"depth": {"+2"}},
+		{"limit": {"+10"}},
+	} {
+		t.Run(values.Encode(), func(t *testing.T) {
+			got := getError(t, srv, treeURL(left, right, values), http.StatusBadRequest)
+			assert.Equal(t, server.CodeBadRequest, got.Error.Code)
+		})
+	}
+}
+
+// TestEvictedLayerNamesTheImageItBelongsTo: a comparison touches two images,
+// and the 404 has to say which one to refetch. It used to name the left one
+// unconditionally, sending a client that lost its RIGHT image round the same
+// loop again.
+func TestEvictedLayerNamesTheImageItBelongsTo(t *testing.T) {
+	store := newSynthStore()
+	left := store.addImage("pair:left", fanOutLayer(2, 2, "l"))
+	right := store.addImage("pair:right", fanOutLayer(2, 2, "r"))
+	store.evictLayer("pair:right", 0)
+
+	srv := server.New(server.Options{
+		Logger: discardLogger(), UI: emptyUI(), Images: store, Layers: store,
+	})
+	got := getError(t, srv, treeURL(left, right, nil), http.StatusNotFound)
+
+	assert.Equal(t, server.CodeImageNotFound, got.Error.Code)
+	assert.Equal(t, string(right), got.Error.Details["id"],
+		"the evicted image is the right one, so that is the id the client must refetch")
+	assert.NotEqual(t, string(left), got.Error.Details["id"])
+}
+
+// TestImplicitDirectoryMetadataIsLabelled: a directory no layer header ever
+// named carries a mode squashing invented. It reached the wire as a plain
+// 0755, indistinguishable from a real one, so an explicit 0700 directory
+// compared against an implicit one rendered as "unchanged, 0700 → 0755" — a
+// difference the client had no way to know was ours.
+func TestImplicitDirectoryMetadataIsLabelled(t *testing.T) {
+	store := newSynthStore()
+	explicit := func() []domain.Entry {
+		return []domain.Entry{
+			{Path: "/d", Kind: domain.KindDir, Mode: 0o700},
+			{Path: "/d/x", Kind: domain.KindFile, Mode: 0o644, Size: 3},
+		}
+	}
+	implicit := func() []domain.Entry {
+		// No header for /d at all: squashing has to invent one.
+		return []domain.Entry{{Path: "/d/x", Kind: domain.KindFile, Mode: 0o644, Size: 3}}
+	}
+	left := store.addImage("implicit:left", explicit)
+	right := store.addImage("implicit:right", implicit)
+	srv := server.New(server.Options{
+		Logger: discardLogger(), UI: emptyUI(), Images: store, Layers: store,
+	})
+
+	var page server.TreePage
+	getJSON(t, srv, treeURL(left, right, url.Values{"path": {"/"}}), &page)
+	require.Len(t, page.Rows, 1)
+	row := page.Rows[0]
+
+	require.NotNil(t, row.Left)
+	require.NotNil(t, row.Right)
+	assert.Equal(t, "unchanged", row.Status,
+		"an invented mode must still never register as a modification (§4.2)")
+	assert.False(t, row.Left.Implicit, "the left directory has a real header")
+	assert.Equal(t, uint32(0o700), row.Left.Mode)
+	assert.True(t, row.Right.Implicit,
+		"the right one does not, and the client needs to know before it renders 0755")
+
+	// The flag is additive and omitted when false, so the common row is
+	// unchanged on the wire.
+	raw := body(t, doOn(t, srv, http.MethodGet, treeURL(left, right, url.Values{"path": {"/"}})))
+	assert.Equal(t, 1, strings.Count(raw, `"implicit":true`))
+	assert.NotContains(t, raw, `"implicit":false`)
 }

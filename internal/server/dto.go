@@ -105,9 +105,15 @@ type LayerGraph struct {
 
 // TreeSideMeta is one side's metadata for a tree row (§6.5).
 type TreeSideMeta struct {
-	Kind       string `json:"kind"`
-	Mode       uint32 `json:"mode"`
-	SizeBytes  int64  `json:"sizeBytes"`
+	Kind      string `json:"kind"`
+	Mode      uint32 `json:"mode"`
+	SizeBytes int64  `json:"sizeBytes"`
+	// Implicit marks a directory no layer header ever named: it exists
+	// only because a child needed a parent, and its mode is the 0755
+	// squashing invents (§4.2). Present so the client can render "—"
+	// instead of a permission string that is ours, not the image's.
+	// Absent means false — a real header supplied these values.
+	Implicit   bool   `json:"implicit,omitempty"`
 	LinkTarget string `json:"linkTarget,omitempty"`
 }
 
@@ -150,8 +156,10 @@ type TreeRow struct {
 	ChildCount  int  `json:"childCount"`
 	// Children is present only for depth=2 requests.
 	Children []TreeRow `json:"children,omitempty"`
-	// ChildrenTruncated says the embedded children were cut at `limit`;
-	// page the rest with a request rooted at this row's path.
+	// ChildrenTruncated says this row has children the response did not
+	// embed — cut at the per-row embedded cap, or by the response-wide
+	// embedded budget, in which case `children` is absent entirely. Page
+	// them with a request rooted at this row's path.
 	ChildrenTruncated bool `json:"childrenTruncated,omitempty"`
 }
 
@@ -273,6 +281,7 @@ func sideMetaOf(m *domain.SideMeta) *TreeSideMeta {
 		Kind:       m.Kind.String(),
 		Mode:       m.Mode,
 		SizeBytes:  m.Size,
+		Implicit:   m.Implicit,
 		LinkTarget: m.LinkTarget,
 	}
 }

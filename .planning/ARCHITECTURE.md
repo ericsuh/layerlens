@@ -337,14 +337,20 @@ entry contributes exactly
  ContentSHA /* regular files only */)
 ```
 
-length-prefixed fields, one record per entry, in Path order. **`MtimeUnix` is the only
+length-prefixed fields, one record per entry, in **(Path, Kind)** order — the same
+order `indexState.finish` writes, and a total one: a path can hold both a filesystem
+object and its whiteout or opaque marker, so Path alone is not a key and sorting by it
+alone leaves those two to the sort's internal choices. **`MtimeUnix` is the only
 excluded field** — matching `v1TarHeaderSelect`, which copies the v0 list "excluding the
 'mtime' header". `Size` is retained even though it is largely redundant with ContentSHA
 for regular files, because tarsum v1 includes it and it carries meaning for entry kinds
 that have no content hash.
 
 Whiteout and opaque entries participate (their Kind and Path are the payload;
-ContentSHA/Mode empty/zero). A digest-scheme version byte prefixes the stream so the
+ContentSHA/Mode empty/zero). A directory's `Size` and `ContentSHA` are projected to
+zero and empty before hashing — a directory has neither, and a tar's directory `size`
+field is meaningless — by the *same* projection §3.2's modification predicate uses, so
+the two cannot disagree about a directory. A digest-scheme version byte prefixes the stream so the
 definition can evolve without silently colliding with old digests.
 
 > **Note on fidelity.** We apply tarsum-v1 *field selection* to layer-tar entries;
@@ -401,7 +407,15 @@ Modification predicate for a path present on both sides: the **tarsum-v1 field s
 — `Kind (typeflag), Mode (12 bits), UID, GID, Uname, Gname, Size, LinkTarget,
 Devmajor, Devminor, Xattrs, ContentSHA` differ ⇒ Modified. Deliberately the same field
 set as the changeset digest, so the diff view and the dotted edges never disagree about
-what "same" means, and both agree with Docker's own build cache.
+what "same" means, and both agree with Docker's own build cache. "Same field set" means
+one projection function, applied by both — including its zeroing of `Size`/`ContentSHA`
+for directories. Two parallel field lists that happened to agree would be a promise;
+one function is a guarantee.
+
+`SideMeta` additionally carries `Implicit`, which is *not* part of the field set and
+never marks a path modified: it records that a directory's metadata was invented by
+squashing rather than read from a header, so the client can say so instead of
+displaying our 0755 as the image's (§4.2, §6.5).
 
 **mtime is the only difference that does not mark a file modified** — which is correct
 and load-bearing: mtime churn is exactly what breaks DiffID equality between two
@@ -448,8 +462,13 @@ IndexLayer(compressed io.Reader, mediaType, declaredDiffID, progress *counter):
       base := path.Base(p)
       switch:
         base == ".wh..wh..opq": entries[dirOf(p)] joins as KindOpaque for dirOf(p)
+        strings.HasPrefix(base, ".wh..wh."):   // aufs metadata (plnk/orph/aufs), NOT a
+            warn and skip                      //   whiteout — as Docker's pkg/archive does
         strings.HasPrefix(base, ".wh."):
-            entries[join(dirOf(p), base[4:])] = Entry{Kind: KindWhiteout}
+            name := base[4:]
+            if name is "", "." or "..": warn and skip   // ".wh.." would path.Join away to
+                                                        //   a whiteout of the PARENT dir
+            entries[join(dirOf(p), name)] = Entry{Kind: KindWhiteout}
         hdr is regular file:
             h := sha256.New()
             n := io.Copy(h, tr)                 // hash while draining; nothing stored
@@ -619,7 +638,14 @@ Budget per assembled comparison, measured in the dominant structures:
 |---|---|---|
 | Two side trees, ≤500k nodes each @ ~300 B (node + name + map slot) | ≤ 2 × 150 MB | transient — freed when Diff returns |
 | Unified DiffNode tree, ≤1M merged nodes @ ~250 B (two SideMeta + Agg) | ≤ 250 MB | retained in comparison LRU |
-| Per-layer index being loaded (streamed JSONL, sorted slice) | ≤ 100 MB | transient per layer |
+| Per-layer index being loaded (streamed JSONL, sorted slice) | ≤ 100 MB | transient per layer — ONE at a time, applied and dropped (`analyze.Squasher`) |
+
+The "one at a time" is load-bearing and structural: `analyze.Squash([]LayerIndex)`
+holds every index at once, so a 30-layer image peaked at Σ over layers (measured
+343 MiB for 30 × 50k entries whose squashed tree holds only 50k paths, ~14 MiB
+once applied and dropped). The server squashes through `analyze.NewSquasher()`,
+which applies each index and releases it before loading the next; `Squash` remains
+for callers that already hold every index.
 
 Peak during assembly ≈ **550–650 MB**; steady state = comparison LRU, capped at
 **2 entries** (configurable), ≈ 500 MB worst case. Stated ceiling: **≤ 1.5 GiB
@@ -671,8 +697,11 @@ has all its layers. Digest-derived path components are validated
 (`^[a-f0-9]{64}$`) before any `filepath.Join` (§7.3).
 
 **Concurrent access**: one process (flock-enforced). Inside the process,
-`cachestore` serializes mutations with a mutex per layer digest + one for the
-image table; reads are lock-free (files are immutable once renamed in — an update
+`cachestore` serializes mutations with a mutex per layer digest (held across
+the whole of `PutLayer` — check, write, reserve, commit and install — because a
+lock released before the install leaves exactly the double-charge window it
+exists to close; refcounted so the map holds only the digests being written
+right now) + one for the image table; reads are lock-free (files are immutable once renamed in — an update
 to `lastUsedAt` rewrites the image record via the same tmp+rename, so a
 concurrent reader sees old-or-new, never torn).
 
@@ -877,7 +906,8 @@ GET /api/v1/diff/tree
     &rightLayers=<0..len(right)>      // selecting a trunk layer ⇒ leftLayers === rightLayers ≤ k
     &path=/usr/lib                    // directory whose CHILDREN are returned; default "/"
     &depth=1|2                        // 1 (default): children only; 2: children + grandchildren
-    &limit=200                        // per-directory page size; max 1000
+    &limit=200                        // per-directory page size; max 1000. Bounds the ROW list
+                                      //   only; embedded grandchildren have their own caps
     &cursor=<opaque>                  // from a previous page of the SAME path
     &filter=all|changed               // changed: only rows whose subtree has any change
     → 200 TreePage | 400 bad_request | 404 image_not_found
@@ -913,8 +943,12 @@ interface TreeRow {
   agg: TreeAgg;
   hasChildren: boolean;               // dirs with ≥1 (post-filter) child
   childCount: number;                 // post-filter direct children (for "N of M shown")
-  children?: TreeRow[];               // only when depth=2; first `limit` per child dir,
-  childrenTruncated?: boolean;        //   page further by re-requesting with path=<child>
+  children?: TreeRow[];               // only when depth=2; at most min(limit, 50) per child
+                                      //   dir, and at most 2000 across the whole response,
+                                      //   spent in row order — so a row past the budget has
+                                      //   NO children field at all
+  childrenTruncated?: boolean;        //   true whenever children were cut (to few, or to
+                                      //   none); page the rest with path=<child>
 }
 
 interface TreePage {
@@ -933,11 +967,24 @@ interface TreePage {
 Contract details:
 
 - **Server-side everything**: the client never receives more than
-  `limit × (1 + limit)` rows per request and never computes aggregates. A row is
+  `limit + 2000` rows per request and never computes aggregates. A row is
   ~250–350 bytes of JSON; the default page (`limit=200, depth=1`) is
-  **≤ ~70 KB**; a deliberately wide directory (10 000 children) is 50 pages, each
-  the same bounded size — the client's virtualized list appends pages as the
-  user scrolls.
+  **≤ ~70 KB**, and the largest request the server accepts
+  (`depth=2, limit=1000`) is **≤ 2 MiB** whatever the tree looks like; a
+  deliberately wide directory (10 000 children) is 50 pages, each the same
+  bounded size — the client's virtualized list appends pages as the user
+  scrolls.
+
+  The bound is two caps on the depth=2 half, both independent of `limit`:
+  **≤ 50 embedded children under any one row** and **≤ 2000 embedded rows
+  across the response**, handed out in row order. The earlier
+  `limit × (1 + limit)` bound could not coexist with the ~70 KB claim above it:
+  `depth=2&limit=1000` against a 1000×1000 directory is a million rows and a
+  311 MiB body from one legal request — `json.Encoder` materializes it in full
+  before writing a byte — which breaks §4.6's 1.5 GiB RSS ceiling on its own
+  and is concurrency-multiplied. Exhausting the embedded budget degrades a
+  prefetch and loses nothing: the row still carries `childCount` and
+  `childrenTruncated`, and the client pages that directory with its own request.
 - Cursor is opaque (base64 of `{section: "dir"|"file", lastName}` plus a
   fingerprint of the query), valid only for the same
   `(left,right,leftLayers,rightLayers,path,filter)` tuple; a stale cursor after
@@ -953,12 +1000,32 @@ Contract details:
 - Everything the UI's tree row needs is present: name, kind, diff status, both
   sides' subtree byte totals and file counts, deltas (derivable), and
   `maxSiblingBytes` for the relative-size bar among siblings.
+- **`implicit` on `TreeSideMeta`**: true for a directory no layer header ever
+  named — it exists only because a child needed a parent, and its `mode` (0755)
+  and ownership are values §4.2's squashing invented. The client renders "—"
+  rather than a permission string that is ours and not the image's. Absent means
+  false. It is not part of the tarsum-v1 field set and never makes a row
+  modified; it says where the metadata came from, not what it is.
+- **The dir↔file exception to `leftBytes`/`rightBytes`**: those fields are
+  subtree regular-file bytes *over the paths this comparison enumerates*. A
+  path that is a directory on one side and something else on the other is a
+  leaf (§4.3, matching what an overlay mount shows), so the vanished subtree's
+  bytes and file counts are in **neither** side's totals — including the root's,
+  which therefore need not equal the image's total bytes. The alternative,
+  folding the hidden bytes into `leftBytes` while leaving them out of the change
+  breakdowns, would put bytes in a total that no reachable row accounts for and
+  break §4.4's `Agg == Σ children.Agg` — the invariant that lets a client
+  reconcile a parent against the page it just expanded. The client detects the
+  case from the wire (`status: "modified"` with `left.kind: "dir"` and a
+  `right.kind` that is not, or the mirror image) and labels the row.
 
 ### 6.6 Misc
 
 ```
 GET /healthz          → 200 "ok" once fixtures are loaded (text/plain; no /api prefix)
 GET /api/v1/meta      → 200 { version, cacheBytesUsed, cacheMaxBytes, allowedRegistries: string[] }
+                        allowedRegistries is the §7.1 host allowlist, supplied by cmd/layerlens
+                        so the UI names the real pull targets rather than reading an empty list
 GET /*                → embedded SPA (index.html fallback for client-routed paths)
 ```
 

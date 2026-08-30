@@ -19,6 +19,25 @@ const (
 	MaxTreeLimit     = 1000
 	DefaultTreeDepth = 1
 	MaxTreeDepth     = 2
+
+	// MaxEmbeddedChildren and MaxEmbeddedRows bound the depth=2 half of a
+	// response independently of `limit`.
+	//
+	// `limit` is the page size of ONE directory listing. Letting it also
+	// size the embedded grandchildren makes the payload quadratic —
+	// depth=2&limit=1000 against a 1000×1000 tree is a million rows and a
+	// 311 MiB body from a single legal request, which no §4.6 RSS ceiling
+	// survives and which json.Encoder materializes in full before writing
+	// a byte. So the second level gets a budget of its own: at most
+	// MaxEmbeddedChildren under any one row, and at most MaxEmbeddedRows
+	// across the whole response, handed out in row order.
+	//
+	// The truncation is already part of the contract — a row that could
+	// not embed everything sets childrenTruncated and the client pages
+	// that directory with its own request — so exhausting the budget
+	// degrades a prefetch, it does not lose data.
+	MaxEmbeddedChildren = 50
+	MaxEmbeddedRows     = 2000
 )
 
 // Tree filters.
@@ -93,16 +112,17 @@ func (s *Server) handleDiffTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmp, err := s.comparisons.get(r.Context(), params.key, func(context.Context) (*comparison, error) {
-		// Deliberately detached from this request: one assembly serves
-		// every waiter on the same key, so the client that happened to
-		// arrive first must not be able to cancel work the others are
-		// blocked on by navigating away. The work is bounded (one
-		// comparison) and its result is cached for whoever asks next.
-		return s.assembleComparison(context.WithoutCancel(r.Context()),
-			left, right, params.key.leftLayers, params.key.rightLayers)
+	// The context handed to the assembler is get's own, detached from this
+	// request: one assembly serves every waiter on the key, so the client
+	// that happened to arrive first must not be able to cancel work the
+	// others are blocked on by navigating away. This handler's context
+	// still governs THIS caller's wait.
+	cmp, err := s.comparisons.get(r.Context(), params.key, func(ctx context.Context) (*comparison, error) {
+		return s.assembleComparison(ctx, left, right, params.key.leftLayers, params.key.rightLayers)
 	})
 	if err != nil {
+		// left.ID is only the fallback: an evicted layer reports the
+		// image it actually belongs to (see imageError).
 		s.writeStoreError(w, r, err, left.ID)
 		return
 	}
@@ -133,8 +153,11 @@ func (s *Server) handleDiffTree(w http.ResponseWriter, r *http.Request) {
 
 	start := pageStart(rows, cur)
 	end := min(start+params.limit, len(rows))
+	// One budget for the whole response, spent left to right: the rows a
+	// user reads first are the ones that get their children prefetched.
+	budget := MaxEmbeddedRows
 	for _, row := range rows[start:end] {
-		page.Rows = append(page.Rows, treeRowOf(row, params.path, params.depth, params.limit, params.filter))
+		page.Rows = append(page.Rows, treeRowOf(row, params.path, params.depth, params.limit, params.filter, &budget))
 	}
 	if end < len(rows) {
 		page.NextCursor = encodeCursor(query, rows[end-1])
@@ -143,7 +166,11 @@ func (s *Server) handleDiffTree(w http.ResponseWriter, r *http.Request) {
 }
 
 // treeRowOf renders one row, including its grandchildren when depth is 2.
-func treeRowOf(node *domain.DiffNode, parent string, depth, limit int, filter string) TreeRow {
+//
+// budget is the response-wide remaining embedded-row allowance and is
+// decremented as children are emitted; it is nil at depth 1, where nothing is
+// embedded.
+func treeRowOf(node *domain.DiffNode, parent string, depth, limit int, filter string, budget *int) TreeRow {
 	rowPath := joinPath(parent, node.Name)
 	children := filterRows(node.Children, filter)
 	row := TreeRow{
@@ -162,14 +189,28 @@ func treeRowOf(node *domain.DiffNode, parent string, depth, limit int, filter st
 	if depth < 2 || len(children) == 0 {
 		return row
 	}
-	embedded := min(limit, len(children))
-	row.Children = make([]TreeRow, 0, embedded)
-	for _, child := range children[:embedded] {
-		// Grandchildren are rendered at depth 1: depth=2 means two
-		// levels, and recursing further would make the payload's bound
-		// depend on tree shape rather than on the request.
-		row.Children = append(row.Children, treeRowOf(child, rowPath, 1, limit, filter))
+	// `limit` still applies — a client asking for a small page gets small
+	// rows — but it is no longer what BOUNDS the response.
+	embedded := min(limit, MaxEmbeddedChildren, len(children))
+	if budget != nil {
+		embedded = min(embedded, *budget)
 	}
+	if embedded > 0 {
+		row.Children = make([]TreeRow, 0, embedded)
+		for _, child := range children[:embedded] {
+			// Grandchildren are rendered at depth 1: depth=2 means
+			// two levels, and recursing further would make the
+			// payload's bound depend on tree shape rather than on
+			// the request.
+			row.Children = append(row.Children, treeRowOf(child, rowPath, 1, limit, filter, nil))
+		}
+		if budget != nil {
+			*budget -= embedded
+		}
+	}
+	// True whenever the client did not receive every child, including the
+	// case where the budget ran out and it received none: either way the
+	// remedy is the same request rooted at this row's path.
 	row.ChildrenTruncated = len(children) > embedded
 	return row
 }
@@ -294,7 +335,7 @@ func parseTreeParams(w http.ResponseWriter, r *http.Request, left, right *domain
 		params.path = clean
 	}
 	if raw := query.Get("depth"); raw != "" {
-		depth, err := strconv.Atoi(raw)
+		depth, err := atoiStrict(raw)
 		if err != nil || depth < 1 || depth > MaxTreeDepth {
 			badRequest(w, "depth must be 1 or %d", MaxTreeDepth)
 			return params, false
@@ -302,7 +343,7 @@ func parseTreeParams(w http.ResponseWriter, r *http.Request, left, right *domain
 		params.depth = depth
 	}
 	if raw := query.Get("limit"); raw != "" {
-		limit, err := strconv.Atoi(raw)
+		limit, err := atoiStrict(raw)
 		if err != nil || limit < 1 || limit > MaxTreeLimit {
 			badRequest(w, "limit must be between 1 and %d", MaxTreeLimit)
 			return params, false
@@ -324,12 +365,33 @@ func parseLayerCount(w http.ResponseWriter, raw, name string, layers int) (int, 
 	if raw == "" {
 		return layers, true
 	}
-	n, err := strconv.Atoi(raw)
+	n, err := atoiStrict(raw)
 	if err != nil || n < 0 || n > layers {
 		badRequest(w, "%s must be a layer count between 0 and %d", name, layers)
 		return 0, false
 	}
 	return n, true
+}
+
+// atoiStrict parses a non-negative decimal integer, rejecting the forms
+// strconv.Atoi accepts but a URL query should not: "+1", "-0", leading zeros
+// and surrounding space. One parameter value must have exactly one spelling —
+// otherwise "limit=+1" and "limit=1" are the same request under two names, and
+// anything that ever keys on the raw query string (a cache, a log-based rate
+// limit) can be made to see two.
+func atoiStrict(raw string) (int, error) {
+	if raw == "" {
+		return 0, strconv.ErrSyntax
+	}
+	if len(raw) > 1 && raw[0] == '0' {
+		return 0, strconv.ErrSyntax
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return 0, strconv.ErrSyntax
+		}
+	}
+	return strconv.Atoi(raw)
 }
 
 // cleanTreePath validates a directory path from the query string.

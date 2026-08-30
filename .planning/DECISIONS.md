@@ -465,6 +465,8 @@ Applied from `REVIEW-phase-001.md` after phase 002 landed.
   `'none'`. Note for phase 007: `style-src 'self'` also forbids `style="…"`
   attributes. If the virtualized tree needs inline transforms, add
   `style-src-attr 'unsafe-inline'` rather than loosening `style-src`.
+  *(Superseded by the Phase 006 delta below: that addition was made in phase
+  006, for Radix's portalled overlays and the measured layer diagram.)*
 
 ### Phase 002 (domain model & streaming layer indexer), 2026-08-29
 
@@ -681,6 +683,189 @@ Applied from `REVIEW-phase-001.md` after phase 002 landed.
 - **`cache_full` maps to HTTP 507** as §6.1's table says; the store's
   `ErrCacheFull` is what carries it up from `internal/cachestore` through
   `internal/ingest`. Phase 008's pull endpoints reuse the same error, unchanged.
+
+### Backend review fixes (phases 002–005), 2026-08-30
+
+Fixes for `REVIEW-backend-002-005.md`. Every wire change is **additive**: one new
+optional field, no rename, removal or reinterpretation of an existing one.
+
+- **ARCHITECTURE §6.5 — the depth=2 payload bound was self-contradictory** (file
+  updated). The spec sanctioned `limit × (1 + limit)` rows per request and, three
+  lines later, "the default page is ≤ ~70 KB". Both could not be true:
+  `depth=2&limit=1000` embedded `min(limit, len(children))` grandchildren under
+  each of 1000 rows — a million rows and a **311 MiB** body from one legal
+  request, materialized whole by `json.Encoder` before a byte is written, against
+  §4.6's 1.5 GiB RSS ceiling, concurrency-multiplied. The embedded half now has
+  caps of its own, independent of `limit`: **≤ 50 children under any one row** and
+  **≤ 2000 embedded rows across the response**, spent in row order. Measured on a
+  1000×60 tree at `depth=2&limit=1000`: **22,014,264 → 1,088,784 bytes**
+  (61,000 → 3,000 rows); the widest fixture directory at the same parameters is
+  290,390 bytes. `childrenTruncated` already meant "page this directory yourself",
+  and now also covers "the budget ran out and you got none", so nothing is lost —
+  only a prefetch is shortened. `TestTreeDefaultPageIsBounded` measured only the
+  *default* page, which is why the spec's own contradiction never failed a test;
+  `TestTreeMaxLegalRequestIsBounded` measures the maximum legal one.
+- **ARCHITECTURE §4.6 — "transient per layer" was not what the code did** (file
+  updated). `Server.squash` loaded every layer index into a slice before calling
+  `analyze.Squash`, so peak was Σ over layers rather than one layer's worth. New
+  `analyze.Squasher` (`NewSquasher`/`Apply`/`Tree`) applies each index and drops
+  it; `analyze.Squash([]LayerIndex)` stays, now expressed in terms of it, for its
+  existing callers and tests. Measured at 50k entries/layer, live heap at the last
+  layer: 5 layers **47 → 14 MiB**, 30 layers **343 → 14 MiB** — flat in the layer
+  count, where one index is ~11 MiB. Both sides of a comparison put the review's
+  512 MiB at roughly 28 MiB.
+- **ARCHITECTURE §5's "a mutex per layer digest" did not exist** (file updated
+  with what it now means). `Txn.PutLayer` was check-then-act: two transactions
+  putting the same DiffID both missed, both reserved, both installed, and one map
+  entry overwrote the other — so the cache was charged twice for one directory and
+  refunded once on eviction. The drift is monotonic and ends in `507 cache_full`
+  on an empty disk. The lock is now held across the *whole* of `PutLayer` (a lock
+  released before the install leaves the same window), refcounted so the map holds
+  only digests being written right now, with a redundant re-check under the store
+  lock that releases the loser's reservation. Unreachable while fixtures ingest
+  sequentially; normal once phase 008 pulls concurrently.
+- **ARCHITECTURE §3.1 — the changeset digest sorts by `(Path, Kind)`** (file
+  updated). It sorted by `Path` alone with an unstable sort, so a layer holding
+  both an object and its whiteout marker at one path — the standard
+  "delete x, then recreate x" representation — hashed differently depending on
+  input order, contradicting its own doc comment. `indexState.finish` already
+  sorted by `(Path, Kind)`, which masked it in production. The digest is now a
+  property of the changeset, as claimed. No fixture digest moves: the indexer was
+  already supplying entries in the new order.
+- **Whiteout parsing rejects `.`/`..` and skips `.wh..wh.`** (ARCHITECTURE §4.1
+  pseudocode updated). `dir/.wh..` trimmed to `"."`, which `path.Join` normalized
+  away into a whiteout of the *parent directory* — one malformed member deleting a
+  whole subtree of every lower layer. And aufs bookkeeping members (`.wh..wh.plnk`,
+  `.wh..wh.orph`, `.wh..wh.aufs`) became phantom whiteouts of `wh.plnk` and
+  friends, inflating `entryCount` and moving the changeset digest of a layer whose
+  filesystem content is unchanged. Docker's `pkg/archive` skips that prefix
+  outright; so do we, after the `.wh..wh..opq` check, which shares it.
+- **ARCHITECTURE §3.2's "structurally impossible" is now structural** (file
+  updated). `fieldsOfNode` zeroed `Size`/`ContentSHA` for directories and
+  `fieldsOfEntry` did not, so the digest and the modification predicate could
+  disagree about a directory. Both now call one `projectDir`. No digest moves in
+  practice — the indexer never sets either field on a directory — but the
+  guarantee is a function rather than two lists that happen to agree.
+- **The dir↔file exception is documented rather than papered over**
+  (ARCHITECTURE §6.5). A path that is a directory on one side and a file on the
+  other is a leaf (§4.3, matching overlay semantics), so the vanished subtree's
+  bytes are in neither side's `leftBytes`/`rightBytes` — and the root total
+  therefore need not equal the image's total bytes. **Chosen: document, not
+  count.** Folding the hidden bytes into `leftBytes` while excluding them from the
+  change breakdowns would put bytes in a total that no reachable row accounts for
+  and break §4.4's `Agg == Σ children.Agg`, which is exactly what lets a client
+  reconcile a parent against the page it just expanded. The client can already
+  detect the case from the wire — `status: "modified"`, `left.kind: "dir"`,
+  `right.kind` something else — and label the row; `diff_test.go` pins the
+  behaviour so it stays a decision.
+- **WIRE (additive): `TreeSideMeta.implicit`** (ARCHITECTURE §3.2/§6.5 updated).
+  A directory no layer header named reached the wire carrying the 0755 `ensureDirs`
+  invents, indistinguishable from a real mode: an explicit `/d` (0700) against an
+  implicit one rendered `unchanged` with `right.mode = 0755`, a value that exists
+  nowhere but in our own bookkeeping. `implicit` is carried from `domain.Node`
+  through `domain.SideMeta` onto `TreeSideMeta`, `omitempty` so absent means false
+  and every existing row is byte-identical. It is deliberately not part of the
+  tarsum-v1 field set and still never marks a row modified.
+- **An evicted-layer 404 names the image it belongs to.** `handleDiffTree` passed
+  `left.ID` to `writeStoreError` unconditionally, so a client whose *right* image
+  was evicted was told to refetch the left one. `squash` now wraps its failure in
+  an `imageError` carrying the record's id, and `writeStoreError` prefers it.
+- **`Txn.Commit` validates "declared by this transaction", not `HasLayer`.**
+  Presence is not the property that matters: only membership in `t.layers` holds a
+  layer against the evictor, so an undeclared-but-present layer could be deleted
+  between the check and the record rename — producing the record-without-its-layers
+  state the startup sweep exists to clean up. Error message changed from
+  "references uncommitted layer" to "which this ingest never put or used".
+- **`Ingest` upgrades provenance instead of returning early** (new
+  `cachestore.Store.UpgradeProvenance` + `cachestore.Provenance`). An image a
+  registry pull fetched first and a fixture load found second stayed unpinned —
+  exactly the image the LRU must not delete. Merge rules: **pinning is monotonic**
+  (set, never cleared — it means "must survive eviction"), `source` records how the
+  image most recently arrived, `refNames` union in order. A merge that changes
+  nothing rewrites nothing, because the fixture load runs on every startup and must
+  not churn ten record files per boot.
+- **`Options.AllowedRegistries` is wired from `cmd/layerlens`** so
+  `/api/v1/meta.allowedRegistries` is no longer permanently `[]` (ARCHITECTURE §6.6
+  updated). The list is §7.1's allowlist, verbatim, as a package-level default in
+  `main.go` — no new flag, no `--allowed-registries` surface to commit to. Phase 008
+  owns the matching rule and the enforcement point; this only makes the field honest.
+- **`comparisonCache.get` detaches the assembly context itself.** Its comment
+  claimed a cancelling waiter could not affect the others, which was true only
+  because `handleDiffTree` happened to pass `context.WithoutCancel`. A caller that
+  honoured the parameter would let one disconnecting client cancel every waiter.
+  `get` now applies `WithoutCancel` around `assemble`, and the handler passes its
+  request context straight through — the code and the comment match, from either
+  direction.
+- **Query integers are parsed strictly.** `strconv.Atoi` accepts `+1`, `-0` and
+  leading zeros, so `limit=+1` and `limit=1` were the same request under different
+  spellings. `atoiStrict` accepts one spelling per value, applied to `depth`,
+  `limit`, `leftLayers` and `rightLayers`.
+
+### Phase 006 (frontend: app shell, selection view, layer comparison), 2026-08-30
+
+- **CSP gains `style-src-attr 'unsafe-inline'`.** This is the option the phase
+  001 note (and the comment in `internal/webui/webui.go`) already recorded as
+  the right one; phase 006 is where it becomes necessary, a phase earlier than
+  predicted. Two things need style *attributes*: Radix positions its portalled
+  popovers and tooltips with inline styles, and the layer diagram places the
+  could-be-shared pills, the selection rules and the relative-size bars from
+  measured card geometry. What did **not** change: `style-src` stays `'self'`,
+  so `style-src-elem` still inherits it and neither a `<style>` element nor a
+  remote stylesheet can be injected; `script-src` stays `'self'`; and
+  `img-src 'self' data:` denies the `url()` fetch that is the main thing a
+  hostile style attribute could otherwise attempt. `internal/webui`'s CSP test
+  now asserts the exact shape rather than a blanket "no unsafe-inline", and
+  `bundle.test.ts` no longer asserts zero `[style]` attributes (it still
+  asserts zero inline `<script>`/`<style>` elements).
+- **The SVG overlay itself needs no style attributes.** Everything it draws is
+  SVG presentation attributes (`d`, `viewBox`, `stroke-*` via CSS classes), so
+  the diagram's geometry is CSP-clean; only the HTML elements layered over it
+  (pills, rules, bars) use inline positioning.
+- **Three ARIA radiogroups, not two.** DESIGN §7 asks for two radiogroups with
+  the trunk cards belonging to both, acknowledging in the same sentence that
+  this must be "one composite widget". A DOM node can only sit in one group, so
+  the shipped structure is: a trunk group labelled "Shared comparison point
+  (sets both images)", plus "Image A comparison point" and "Image B comparison
+  point" for the branches; every trunk card carries `aria-describedby` pointing
+  at "Shared layer — selecting it sets both comparison points". The keyboard
+  map of §7 is implemented across all three as one roving-tabindex composite
+  (↑/↓ within a column and across the trunk/branch boundary, ←/→ between the
+  A and B columns, Home/End, Space/Enter to select). This is a truer rendering
+  of the intent than nesting the same node in two groups would have been.
+- **Docker and Registry tabs render disabled rather than being omitted.** The
+  phase file said the tab bar should show only Analyzed ("no dead placeholder
+  tabs"); the shipped bar shows all three, with the two phase-008 sources
+  `disabled` and carrying a "soon" chip. Reason: DESIGN §4.3 requires the
+  segmented control to be built so phase 008 adds panels "without layout
+  shift", which only holds if the tabs are already at their final size — and a
+  `disabled` control with a status chip is not a dead placeholder, it is an
+  honest "not yet". They are unreachable by pointer and by keyboard.
+- **Layer selection writes the URL with `replace`.** Adjusting a comparison
+  point is a refinement of the same view, not a new destination; without
+  `replace` the browser Back button would walk every card click before leaving
+  the page.
+- **`path` and `filter` round-trip through the codec untouched.** Nothing reads
+  them until phase 007, but `urlstate.ts` parses, normalizes (`//app/` →
+  `/app`) and re-serializes them, and `ComparePage` carries them through every
+  selection change — so a link written today keeps working when the tree lands.
+- **Instruction cleaning is mirrored client-side.** The server already sends a
+  cleaned `instruction`, so `lib/instruction.ts` is a display fallback rather
+  than a second source of truth; its Vitest table covers the same forms as
+  `TestCleanInstruction` in `internal/analyze/history_test.go` so the two
+  cannot drift silently.
+- **New npm dependencies**, all previously named in this document except the
+  last two: `wouter` 3.10.0 (ARCHITECTURE §8), `@radix-ui/react-popover`
+  1.1.23 and `@radix-ui/react-tooltip` 1.2.16 (C2), plus
+  `@testing-library/user-event` 14.6.1 and `@testing-library/jest-dom` 6.9.1 as
+  dev-only test ergonomics. shadcn's CLI was not used: the two primitives we
+  need are thin enough that vendoring them by hand (`components/ui/*.tsx`) is
+  clearer than importing a generator's conventions for two files.
+- **The filesystem-diff column is a designed skeleton, not a stub.** Its panel
+  chrome is real — heading, breadcrumb root, legend, and a comparison line fed
+  by the live selection — with DESIGN state #18's skeleton in the tree body.
+  While the layer graph is still loading it shows *no* layer numbers at all
+  rather than "A @ base", because naming a layer that has not been read yet
+  would be a guess.
 
 
 ## Risks

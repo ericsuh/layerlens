@@ -108,10 +108,25 @@ func (i *Ingester) Ingest(ctx context.Context, img v1.Image, meta Meta) (*Result
 		return nil, fmt.Errorf("ingest: config digest: %w", err)
 	}
 
-	if rec, err := i.store.Image(ctx, id); err == nil {
+	if _, err := i.store.Image(ctx, id); err == nil {
 		// Already analyzed. Re-reading the blobs would produce exactly
-		// the same indexes, so the only sane thing is to do nothing.
-		return &Result{Record: rec, AlreadyPresent: true, LayersSkipped: len(rec.Layers)}, nil
+		// the same indexes, so none of the analysis is redone.
+		//
+		// The provenance, though, is not a property of the blobs: the
+		// same image can arrive by two routes, and the second route
+		// knows things the first did not. A fixture that a registry
+		// pull happened to fetch first is the case that matters — it
+		// would otherwise stay unpinned, which is to say evictable,
+		// which is exactly what pinning a vendored demo image is for.
+		upgraded, err := i.store.UpgradeProvenance(ctx, id, cachestore.Provenance{
+			RefNames: meta.RefNames,
+			Source:   meta.Source,
+			Pinned:   meta.Pinned,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ingest: upgrade provenance of %s: %w", id, err)
+		}
+		return &Result{Record: upgraded, AlreadyPresent: true, LayersSkipped: len(upgraded.Layers)}, nil
 	} else if !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
 	}
