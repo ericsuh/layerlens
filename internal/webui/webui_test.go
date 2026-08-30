@@ -128,10 +128,18 @@ func TestHandlerFSShellCarriesCSP(t *testing.T) {
 	assert.Contains(t, csp, "default-src 'none'")
 	assert.Contains(t, csp, "script-src 'self'")
 	assert.Contains(t, csp, "frame-ancestors 'none'")
-	// Nothing in the bundle is loaded cross-origin, so no external origin and
-	// no unsafe-inline may appear.
-	assert.NotContains(t, csp, "unsafe-inline")
+	// Style *attributes* are allowed (Radix's portalled overlays and the layer
+	// diagram's measured positioning need them, see webui.go), but nothing
+	// else is: script must stay 'self', and style elements/stylesheets are
+	// still governed by the unmodified `style-src 'self'`.
+	assert.Contains(t, csp, "style-src 'self'")
+	assert.Contains(t, csp, "style-src-attr 'unsafe-inline'")
+	assert.NotContains(t, csp, "script-src 'self' 'unsafe-inline'")
+	assert.NotContains(t, csp, "style-src 'self' 'unsafe-inline'")
+	assert.NotContains(t, csp, "style-src-elem")
 	assert.NotContains(t, csp, "unsafe-eval")
+	// Nothing in the bundle is loaded cross-origin, so no external origin
+	// may appear.
 	assert.NotContains(t, csp, "http")
 	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
 }

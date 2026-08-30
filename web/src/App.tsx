@@ -1,51 +1,73 @@
-import { formatBytes } from "./lib/format";
+import { Link, Route, Switch, useSearch } from "wouter";
 
-const SWATCHES = [
-  { label: "shared", className: "bg-shared-tint text-shared" },
-  { label: "added", className: "bg-added-tint text-added-strong" },
-  { label: "removed", className: "bg-removed-tint text-removed-strong" },
-  { label: "modified", className: "bg-modified-tint text-modified-strong" },
-  { label: "image A", className: "bg-image-a-tint text-image-a" },
-  { label: "image B", className: "bg-image-b-tint text-image-b" },
-] as const;
+import { useLayerGraphQuery } from "./api/queries";
+import { ImageChip } from "./components/identity";
+import { EmptyPanel } from "./components/states";
+import { TooltipProvider } from "./components/ui/tooltip";
+import { ComparePage } from "./compare/ComparePage";
+import { parseCompareSearch } from "./lib/urlstate";
+import { SelectPage } from "./select/SelectPage";
+import { ThemeToggle } from "./theme";
 
 /**
- * Placeholder shell for the phase-001 walking skeleton: it proves the bundled
- * React actually executes in the browser and that the Tailwind theme tokens
- * reach the page. The real views land in phases 006–007.
+ * The header's pair of identity chips. They read the same query the compare
+ * page reads, so they cost no extra request and can never disagree with the
+ * diagram about which image is A.
  */
+function HeaderImages() {
+  const search = useSearch();
+  const { left, right } = parseCompareSearch(search);
+  const query = useLayerGraphQuery(left, right);
+  const graph = query.data;
+
+  if (graph === undefined) {
+    return null;
+  }
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <ImageChip side="a" image={graph.left} />
+      <span className="text-text-muted text-[12px]">vs</span>
+      <ImageChip side="b" image={graph.right} />
+      <Link href="/" className="ll-link ml-2">
+        Change images
+      </Link>
+    </div>
+  );
+}
+
 export function App() {
   return (
-    <main className="mx-auto flex max-w-3xl flex-col gap-6 p-8">
-      <header className="flex flex-col gap-2">
-        <h1 className="text-page-title" data-testid="app-title">
-          layerlens
-        </h1>
-        <p className="text-body text-text-muted">
-          Compare container image layers and the filesystems they build up.
-        </p>
-      </header>
+    <TooltipProvider delayDuration={200}>
+      <div className="flex h-full flex-col">
+        <header className="border-border bg-surface flex h-14 flex-none items-center gap-4 border-b px-8">
+          <Link href="/" className="flex items-center gap-2 text-[16px] font-[650] tracking-[-0.01em]">
+            <span
+              className="from-image-a to-image-b h-5 w-5 flex-none rounded-[5px] bg-gradient-to-br"
+              aria-hidden="true"
+            />
+            <span data-testid="app-title">layerlens</span>
+          </Link>
+          <Route path="/compare">
+            <HeaderImages />
+          </Route>
+          <div className="flex-1" />
+          <ThemeToggle />
+        </header>
 
-      <section className="rounded-panel border border-border bg-surface p-4 shadow-panel">
-        <h2 className="text-section">Toolchain check</h2>
-        <p className="text-body text-text-muted mt-2">
-          Rendered by React from the embedded bundle. Example humanized size:{" "}
-          <span className="font-mono" data-testid="sample-size">
-            {formatBytes(15_000_000)}
-          </span>
-          .
-        </p>
-        <ul className="mt-4 flex flex-wrap gap-2">
-          {SWATCHES.map((swatch) => (
-            <li
-              key={swatch.label}
-              className={`rounded-badge px-3 py-1 text-label uppercase ${swatch.className}`}
-            >
-              {swatch.label}
-            </li>
-          ))}
-        </ul>
-      </section>
-    </main>
+        <main className="min-h-0 flex-1 overflow-auto">
+          <Switch>
+            <Route path="/" component={SelectPage} />
+            <Route path="/compare" component={ComparePage} />
+            <Route>
+              <EmptyPanel
+                title="Page not found"
+                detail="That address does not match any layerlens view."
+                action={{ label: "Go to image selection", href: "/" }}
+              />
+            </Route>
+          </Switch>
+        </main>
+      </div>
+    </TooltipProvider>
   );
 }

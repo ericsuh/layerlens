@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { formatBytes } from "./format";
+import {
+  formatByteDelta,
+  formatBytes,
+  formatCompactCount,
+  formatRelativeTime,
+  shortDigest,
+  shortHex,
+} from "./format";
 
 describe("formatBytes", () => {
   it.each([
@@ -73,5 +80,72 @@ describe("formatBytes", () => {
     for (const bytes of [1023, 1024, 15_000_000, 1024 ** 3 - 1]) {
       expect(formatBytes(-bytes)).toBe(`-${formatBytes(bytes)}`);
     }
+  });
+});
+
+describe("formatByteDelta", () => {
+  it.each([
+    [14_985_591, "+14.3 MiB"],
+    [-2_202_010, "−2.1 MiB"],
+    [1, "+1 B"],
+    [-1023, "−1023 B"],
+    [0, "—"],
+  ])("renders %i as %s", (bytes, expected) => {
+    expect(formatByteDelta(bytes)).toBe(expected);
+  });
+
+  it("uses a real minus sign, not a hyphen", () => {
+    expect(formatByteDelta(-1024).startsWith("−")).toBe(true);
+  });
+});
+
+describe("formatCompactCount", () => {
+  it.each([
+    [0, "0"],
+    [999, "999"],
+    [1000, "1.0K"],
+    [1200, "1.2K"],
+    [999_949, "999.9K"],
+    [9_900_000, "9.9M"],
+    [-1200, "−1.2K"],
+  ])("renders %i as %s", (count, expected) => {
+    expect(formatCompactCount(count)).toBe(expected);
+  });
+
+  it("carries into the next unit rather than rendering 1000 of one", () => {
+    // 999,999 rounds to 1000.0K at one decimal, which must promote to M.
+    expect(formatCompactCount(999_999)).toBe("1.0M");
+  });
+});
+
+describe("shortDigest", () => {
+  const digest = `sha256:${"ab34c56".padEnd(60, "0")}9f21`;
+
+  it("keeps the algorithm, the head and the tail", () => {
+    expect(shortDigest(digest)).toBe("sha256:ab34c56…9f21");
+  });
+
+  it("leaves a digest that already fits alone", () => {
+    expect(shortDigest("sha256:abcd")).toBe("sha256:abcd");
+  });
+
+  it("drops the algorithm prefix for tight columns", () => {
+    expect(shortHex(digest)).toBe("ab34…9f21");
+  });
+});
+
+describe("formatRelativeTime", () => {
+  const now = new Date("2026-08-29T12:00:00Z");
+
+  it.each([
+    ["2026-08-29T10:00:00Z", "2 hours ago"],
+    ["2026-08-28T12:00:00Z", "yesterday"],
+    ["2026-08-26T12:00:00Z", "3 days ago"],
+  ])("renders %s as %s", (iso, expected) => {
+    expect(formatRelativeTime(iso, now)).toBe(expected);
+  });
+
+  it("does not invent a time for an unparseable stamp", () => {
+    expect(formatRelativeTime("not-a-date", now)).toBe("unknown");
   });
 });

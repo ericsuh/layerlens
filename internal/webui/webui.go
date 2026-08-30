@@ -52,12 +52,20 @@ const (
 	// directive below is something the app actually uses. `data:` images are
 	// allowed because inline SVG/PNG data URIs are cheap and inert.
 	//
-	// Note for later phases: `style-src 'self'` also forbids `style="…"`
-	// attributes. If the virtualized tree of phase 007 needs inline transforms,
-	// add `style-src-attr 'unsafe-inline'` rather than loosening `style-src`.
+	// `style-src 'self'` also forbids `style="…"` attributes, which the UI does
+	// need: Radix positions its portalled popovers and tooltips with inline
+	// styles, and the layer diagram's could-be-shared pills and selection rules
+	// are placed from measured card geometry. Phase 006 therefore takes the
+	// option this comment already anticipated and adds `style-src-attr
+	// 'unsafe-inline'` — style *attributes* only. `style-src` itself stays
+	// `'self'`, so `style-src-elem` still inherits it and no <style> element or
+	// remote stylesheet can be injected, and `img-src 'self' data:` denies the
+	// `url()` exfiltration that is the main thing a hostile style attribute
+	// could otherwise attempt.
 	shellCSP = "default-src 'none'; " +
 		"script-src 'self'; " +
 		"style-src 'self'; " +
+		"style-src-attr 'unsafe-inline'; " +
 		"img-src 'self' data:; " +
 		"font-src 'self'; " +
 		"connect-src 'self'; " +

@@ -59,13 +59,14 @@ describe("built bundle", () => {
     await expect
       .poll(() => root?.textContent ?? "", { timeout: 5000 })
       .toContain("layerlens");
-    expect(root?.querySelector("[data-testid='sample-size']")?.textContent).toBe("14.3 MiB");
 
     // The shipped Content-Security-Policy is `default-src 'none'` with
-    // `script-src 'self'` and `style-src 'self'`, which also forbids inline
-    // <script>/<style> elements and style="…" attributes. jsdom does not
-    // enforce CSP, so assert the rendered tree stays inside it.
-    expect(document.querySelectorAll("[style]")).toHaveLength(0);
+    // `script-src 'self'` and `style-src 'self'`, which forbids inline
+    // <script> and <style> *elements*. jsdom does not enforce CSP, so assert
+    // the rendered tree stays inside it. Style attributes are deliberately
+    // not asserted against: `style-src-attr 'unsafe-inline'` permits them
+    // (see internal/webui/webui.go and DECISIONS, "Phase 006"), because
+    // portalled overlays and the measured layer diagram need them.
     expect(document.querySelectorAll("script:not([src])")).toHaveLength(0);
     expect(document.querySelectorAll("style")).toHaveLength(0);
   });
